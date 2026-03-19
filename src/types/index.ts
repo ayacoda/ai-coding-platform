@@ -52,3 +52,11 @@ export interface QueueItem {
 export type RightPanelTab = 'code' | 'preview';
 
 export type ModelId = 'gpt-4o' | 'claude-sonnet-4-6' | 'gemini-2.0-flash';
+
+export type StorageMode = 'localstorage' | 'supabase';
+
+export interface ProjectConfig {
+  /** Short unique project ID, e.g. 'p_a1b2c3d4' */
+  id: string;
+  storageMode: StorageMode;
+}

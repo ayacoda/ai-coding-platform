@@ -71,6 +71,11 @@ export default function CodeEditor() {
     // The useEffect above will clear the local draft once `files` updates
   }, [currentFile, localEdits, setFile]);
 
+  const discardCurrentFile = useCallback(() => {
+    if (!currentFile) return;
+    setLocalEdits((prev) => { const n = { ...prev }; delete n[currentFile]; return n; });
+  }, [currentFile]);
+
   // Keep the save ref up to date so the Monaco onMount keybinding can call it
   useEffect(() => { saveRef.current = saveCurrentFile; }, [saveCurrentFile]);
 
@@ -132,7 +137,7 @@ export default function CodeEditor() {
           ))}
         </div>
 
-        {/* Save button — only visible when current file has unsaved changes */}
+        {/* Save — only visible when current file has unsaved changes */}
         {currentIsDirty && (
           <button
             onClick={saveCurrentFile}
@@ -152,9 +157,17 @@ export default function CodeEditor() {
       <div className="flex-1 min-h-0 relative">
         {/* Unsaved changes banner */}
         {currentIsDirty && (
-          <div className="absolute top-0 left-0 right-0 z-10 flex items-center justify-between gap-2 px-4 py-1.5 bg-amber-500/10 border-b border-amber-500/20 text-xs pointer-events-none">
+          <div className="absolute top-0 left-0 right-0 z-10 flex items-center justify-between gap-2 px-4 py-1.5 bg-amber-500/10 border-b border-amber-500/20 text-xs">
             <span className="text-amber-400 font-medium">Unsaved changes · preview won't update until you save</span>
-            <span className="text-amber-500/60">⌘S / Ctrl+S</span>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={discardCurrentFile}
+                className="text-amber-500/70 hover:text-amber-300 transition-colors underline underline-offset-2"
+              >
+                Discard
+              </button>
+              <span className="text-amber-500/60">⌘S / Ctrl+S</span>
+            </div>
           </div>
         )}
         <Editor

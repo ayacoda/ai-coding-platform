@@ -100,6 +100,50 @@ function escapeForScriptTag(str: string): string {
   return str.replace(/<\/script>/gi, '<\\/script>');
 }
 
+export interface PreviewConfig {
+  storageMode?: 'localstorage' | 'supabase' | 's3';
+  projectId?: string;
+  /** API secrets for third-party integrations — injected as window.ENV */
+  apiSecrets?: Record<string, string>;
+}
+
+// Supabase public credentials (anon key is designed to be client-side)
+const SUPABASE_URL = 'https://kuzptrzpacesdneogmaq.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt1enB0cnpwYWNlc2RuZW9nbWFxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA0MTkxMjIsImV4cCI6MjA4NTk5NTEyMn0.yjrT7gcIryOVrv89ooSGsfrnz6wJwsdh3Pss87NX-bY';
+
+/**
+ * Builds inline <script> tags for storage integration (Supabase or S3).
+ */
+function buildStorageScripts(config?: PreviewConfig): string {
+  if (!config || config.storageMode === 'localstorage' || !config.storageMode) return '';
+
+  if (config.storageMode === 'supabase') {
+    // projectId is required for schema isolation — never fall back to public
+    const projectId = config.projectId;
+    if (!projectId) return '';
+    return (
+      '  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"><\/script>\n' +
+      '  <script>\n' +
+      '    window.db = window.supabase.createClient(\n' +
+      '      "' + SUPABASE_URL + '",\n' +
+      '      "' + SUPABASE_ANON_KEY + '",\n' +
+      '      { db: { schema: "' + projectId + '" } }\n' +
+      '    );\n' +
+      // window.uploadFile helper — uploads to Supabase Storage and returns a public URL
+      '    window.uploadFile = async function(file) {\n' +
+      '      var path = "' + projectId + '/" + Date.now() + "_" + file.name;\n' +
+      '      var result = await window.db.storage.from("uploads").upload(path, file, { upsert: true });\n' +
+      '      if (result.error) throw new Error(result.error.message);\n' +
+      '      return window.db.storage.from("uploads").getPublicUrl(result.data.path).data.publicUrl;\n' +
+      '    };\n' +
+      '    console.log("[Supabase] window.db + window.uploadFile ready for project: ' + projectId + '");\n' +
+      '  <\/script>\n'
+    );
+  }
+
+  return '';
+}
+
 /**
  * Builds a sandboxed HTML document for iframe preview.
  *
@@ -110,8 +154,14 @@ function escapeForScriptTag(str: string): string {
  * Code is stored HTML-escaped in a <script type="text/plain"> element to avoid
  * any backtick / template-literal collisions in the outer JS string.
  */
-export function buildPreviewHTML(files: Record<string, string>): string {
+export function buildPreviewHTML(files: Record<string, string>, config?: PreviewConfig): string {
   if (Object.keys(files).length === 0) return getEmptyPreview();
+
+  // Website clone mode: index.html contains the real fetched site — render it directly,
+  // no React sandbox needed. The <base> tag inside it resolves all relative URLs.
+  if (files['index.html']) {
+    return files['index.html'];
+  }
 
   const entries = Object.entries(files);
 
@@ -123,6 +173,13 @@ export function buildPreviewHTML(files: Record<string, string>): string {
     .join('\n\n');
 
   const escapedCode = escapeForScriptTag(transformedCode);
+  const storageScripts = buildStorageScripts(config);
+
+  // Inject API secrets as window.ENV so generated code can access them
+  const envScript =
+    config?.apiSecrets && Object.keys(config.apiSecrets).length > 0
+      ? '  <script>window.ENV = ' + JSON.stringify(config.apiSecrets) + ';<\/script>\n'
+      : '  <script>window.ENV = {};<\/script>\n';
 
   return (
     '<!DOCTYPE html>\n' +
@@ -131,11 +188,13 @@ export function buildPreviewHTML(files: Record<string, string>): string {
     '  <meta charset="UTF-8" />\n' +
     '  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n' +
     '  <title>Preview</title>\n' +
+    envScript +
     '  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin><\/script>\n' +
     '  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin><\/script>\n' +
     // TypeScript compiler instead of Babel — handles ALL TS syntax correctly
     '  <script src="https://unpkg.com/typescript@5/lib/typescript.js"><\/script>\n' +
     '  <script src="https://cdn.tailwindcss.com"><\/script>\n' +
+    storageScripts +
     '  <style>* { box-sizing: border-box; } body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }<\/style>\n' +
     '</head>\n' +
     '<body>\n' +

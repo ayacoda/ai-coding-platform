@@ -4,6 +4,7 @@ type ViewportMode = 'desktop' | 'tablet' | 'mobile';
 import { useStore } from '../store/useStore';
 import { buildPreviewHTML } from '../lib/preview';
 import { sendChatMessage } from '../lib/chat';
+import { saveVersion } from '../lib/versions';
 
 // Stop auto-fixing only when the exact same error repeats this many consecutive times
 // (means we're stuck and can't make progress).
@@ -691,7 +692,7 @@ function TabletFrame({ children }: { children: React.ReactNode }) {
 // ─── Main panel ───────────────────────────────────────────────────────────────
 
 export default function PreviewPanel() {
-  const { files, isGenerating, messages } = useStore();
+  const { files, isGenerating, messages, storageMode, projectConfig, projectSecrets } = useStore();
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [key, setKey] = useState(0);
@@ -719,8 +720,9 @@ export default function PreviewPanel() {
 
   useEffect(() => {
     setPreviewError(null);
-    setKey((k) => k + 1);
-    // Reset fix state on new files / when New is clicked
+    // Do NOT increment key here — srcDoc prop change navigates the iframe without
+    // destroying/recreating the DOM element, so version restores and file updates
+    // are instant with no blank flash. Key is only incremented on manual refresh.
     recentErrors.current = [];
     setFixAttempt(0);
     setIsStuck(false);
@@ -782,6 +784,12 @@ export default function PreviewPanel() {
         setPreviewError(msg);
         setIsStuck(false);
 
+        // Discard any pending version save — don't save a broken version
+        const { pendingVersionSave, setPendingVersionSave } = useStore.getState();
+        if (pendingVersionSave) {
+          setPendingVersionSave(null);
+        }
+
         if (autoFixTimer.current) clearTimeout(autoFixTimer.current);
 
         // Schedule fix — no attempt limit, stop only when stuck (same error N times)
@@ -796,6 +804,14 @@ export default function PreviewPanel() {
         setFixAttempt(0);
         setIsStuck(false);
         setPreviewError(null);
+
+        // Consume and save the pending version snapshot
+        const { pendingVersionSave, setPendingVersionSave } = useStore.getState();
+        if (pendingVersionSave) {
+          setPendingVersionSave(null);
+          const { projectId, userId, files: vFiles, label } = pendingVersionSave;
+          saveVersion(projectId, userId, vFiles, label).catch(() => {});
+        }
       }
     }
     window.addEventListener('message', handleMessage);
@@ -826,14 +842,20 @@ export default function PreviewPanel() {
   const showGeneratingOverlay = isGenerating && !isFixing && !hasFiles;
   const showStatusBar = isGenerating && !isFixing && hasFiles;
 
+  // Memoize srcDoc so it's only rebuilt when files/config/secrets actually change
+  const srcDoc = useMemo(
+    () => buildPreviewHTML(hasFiles ? files : {}, { storageMode, projectId: projectConfig?.id, apiSecrets: projectSecrets }),
+    [files, storageMode, projectConfig?.id, hasFiles, projectSecrets]
+  );
+
   const iframeEl = (
     <iframe
       key={key}
       ref={iframeRef}
       className="w-full h-full border-0"
-      sandbox="allow-scripts allow-same-origin"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
       title="App Preview"
-      srcDoc={buildPreviewHTML(hasFiles ? files : {})}
+      srcDoc={srcDoc}
     />
   );
 
@@ -929,10 +951,6 @@ export default function PreviewPanel() {
           <GeneratingOverlay streamingContent={streamingContent} />
         )}
 
-        {showStatusBar && (
-          <GeneratingStatusBar streamingContent={streamingContent} />
-        )}
-
         {/* Error / fixing overlay — replaces the white iframe when broken */}
         {(previewError || isFixing) && !showGeneratingOverlay && (
           <ErrorOverlay
@@ -945,6 +963,11 @@ export default function PreviewPanel() {
             isGenerating={isGenerating}
             streamingContent={streamingContent}
           />
+        )}
+
+        {/* Status bar rendered after error overlay so it stays visible on top */}
+        {showStatusBar && (
+          <GeneratingStatusBar streamingContent={streamingContent} />
         )}
 
         {viewportMode === 'desktop' ? (

@@ -1,7 +1,9 @@
 import { useState, useRef, useEffect, KeyboardEvent, ClipboardEvent } from 'react';
 import { useStore } from '../store/useStore';
-import { sendChatMessage } from '../lib/chat';
+import { sendChatMessage, sendAskMessage, cancelGeneration } from '../lib/chat';
 import type { Message, ModelId, PipelineStageInfo, ChatAttachment } from '../types';
+import StorageSelector from './StorageSelector';
+import { detectIntegrations, type ServiceKeyDef } from '../lib/integrations';
 
 // ─── Attachment helpers ───────────────────────────────────────────────────────
 
@@ -181,13 +183,25 @@ interface Suggestion {
   prompt: string;
 }
 
+interface PendingKeyRequest {
+  service: string;
+  description: string;
+  keys: ServiceKeyDef[];
+  /** Values being typed — keyed by envName */
+  values: Record<string, string>;
+  /** The original message waiting to be sent */
+  pendingMessage: string;
+  pendingAttachments: ChatAttachment[];
+}
+
 export default function ChatPanel() {
   const {
     messages, isGenerating, hasApiKey,
     selectedModel, setSelectedModel, isAutoMode, setIsAutoMode,
-    files,
+    files, projectSecrets, setProjectSecret,
     promptQueue, queuePaused, addToQueue, removeFromQueue, updateQueueItem, setQueuePaused, clearQueue,
   } = useStore();
+  const [chatMode, setChatMode] = useState<'build' | 'ask'>('build');
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [ideaBatch, setIdeaBatch] = useState<string[]>(() => pickBatch());
@@ -197,6 +211,7 @@ export default function ChatPanel() {
   const [editingQueueValue, setEditingQueueValue] = useState('');
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [confirmClearAll, setConfirmClearAll] = useState(false);
+  const [pendingKeyRequest, setPendingKeyRequest] = useState<PendingKeyRequest | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -230,19 +245,44 @@ export default function ChatPanel() {
     const fileKeys = Object.keys(files);
     if (fileKeys.length === 0) {
       setSuggestions([]);
+      setLoadingSuggestions(false);
       return;
     }
+    const controller = new AbortController();
     setLoadingSuggestions(true);
     fetch('/api/suggest', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ files }),
+      signal: controller.signal,
     })
       .then((r) => r.json())
       .then((data) => setSuggestions(data.suggestions || []))
-      .catch(() => setSuggestions([]))
+      .catch((e) => { if (e.name !== 'AbortError') setSuggestions([]); })
       .finally(() => setLoadingSuggestions(false));
+    return () => controller.abort();
   }, [files]);
+
+  // Re-fetch suggestions when generation finishes (covers cases where files didn't change)
+  const prevIsGenerating = useRef(false);
+  useEffect(() => {
+    const justFinished = prevIsGenerating.current && !isGenerating;
+    prevIsGenerating.current = isGenerating;
+    if (!justFinished || Object.keys(files).length === 0) return;
+    const controller = new AbortController();
+    setLoadingSuggestions(true);
+    fetch('/api/suggest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files }),
+      signal: controller.signal,
+    })
+      .then((r) => r.json())
+      .then((data) => setSuggestions(data.suggestions || []))
+      .catch((e) => { if (e.name !== 'AbortError') setSuggestions([]); })
+      .finally(() => setLoadingSuggestions(false));
+    return () => controller.abort();
+  }, [isGenerating]);
 
   function handleScroll() {
     const el = scrollContainerRef.current;
@@ -276,18 +316,63 @@ export default function ChatPanel() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isGenerating, queuePaused]);
 
+  async function doSend(message: string, atts: ChatAttachment[], mode: 'build' | 'ask' = 'build') {
+    if (mode === 'ask') {
+      if (!isGenerating) {
+        await sendAskMessage(message, atts);
+      }
+      return;
+    }
+    if (isGenerating) {
+      if (message) addToQueue(message);
+    } else {
+      await sendChatMessage(message, { attachments: atts });
+    }
+  }
+
   async function handleSend() {
     const trimmed = input.trim();
     if (!trimmed && attachments.length === 0) return;
+
+    // Check if message requires API keys for third-party integrations
+    const needed = detectIntegrations(trimmed, projectSecrets);
+    if (needed.length > 0 && !isGenerating) {
+      const first = needed[0];
+      setInput('');
+      setAttachments([]);
+      setPendingKeyRequest({
+        service: first.def.service,
+        description: first.def.description,
+        keys: first.missingKeys,
+        values: Object.fromEntries(first.missingKeys.map((k) => [k.envName, ''])),
+        pendingMessage: trimmed,
+        pendingAttachments: [...attachments],
+      });
+      return;
+    }
+
     const currentAttachments = [...attachments];
     setInput('');
     setAttachments([]);
-    if (isGenerating) {
-      // Queue only supports text (attachments dropped with queue)
-      if (trimmed) addToQueue(trimmed);
-    } else {
-      await sendChatMessage(trimmed, { attachments: currentAttachments });
+    await doSend(trimmed, currentAttachments, chatMode);
+  }
+
+  async function handleKeySubmit() {
+    if (!pendingKeyRequest) return;
+    // Store all provided keys
+    for (const [envName, value] of Object.entries(pendingKeyRequest.values)) {
+      if (value.trim()) setProjectSecret(envName, value.trim());
     }
+    const { pendingMessage, pendingAttachments } = pendingKeyRequest;
+    setPendingKeyRequest(null);
+    await doSend(pendingMessage, pendingAttachments, 'build');
+  }
+
+  function handleKeyRequestSkip() {
+    if (!pendingKeyRequest) return;
+    const { pendingMessage, pendingAttachments } = pendingKeyRequest;
+    setPendingKeyRequest(null);
+    doSend(pendingMessage, pendingAttachments, 'build');
   }
 
   function handleKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
@@ -347,7 +432,11 @@ export default function ChatPanel() {
         className="flex-1 overflow-y-auto overflow-x-hidden p-4 space-y-1 scrollbar-thin"
       >
         {messages.map((msg) => (
-          <MessageBubble key={msg.id} message={msg} />
+          <MessageBubble
+            key={msg.id}
+            message={msg}
+            onRePrompt={(content) => { setInput(content); textareaRef.current?.focus(); }}
+          />
         ))}
 
         {showSuggestions && (
@@ -388,8 +477,8 @@ export default function ChatPanel() {
         </div>
       )}
 
-      {/* AI suggestions pills */}
-      {(suggestions.length > 0 || loadingSuggestions) && !isGenerating && (
+      {/* AI suggestions pills — always visible when project has files */}
+      {(suggestions.length > 0 || loadingSuggestions) && (
         <div className="px-4 pt-3 pb-0 border-t border-zinc-800">
           <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-none" style={{ scrollbarWidth: 'none' }}>
             {loadingSuggestions
@@ -573,8 +662,113 @@ export default function ChatPanel() {
         </div>
       )}
 
+      {/* Storage selector */}
+      <div className="flex-shrink-0 border-t border-zinc-800 pb-2">
+        <StorageSelector />
+      </div>
+
+      {/* API Key collection card — shown when a third-party integration is detected */}
+      {pendingKeyRequest && (
+        <div className="mx-4 mb-3 rounded-xl border border-indigo-500/30 bg-indigo-500/5 p-3.5 space-y-3 flex-shrink-0">
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold text-indigo-300">{pendingKeyRequest.service}</span>
+                <span className="text-[10px] text-zinc-500 bg-zinc-800 px-1.5 py-0.5 rounded-full">{pendingKeyRequest.description}</span>
+              </div>
+              <p className="text-[11px] text-zinc-400 mt-0.5">API key required to complete this integration</p>
+            </div>
+            <button
+              onClick={handleKeyRequestSkip}
+              title="Skip and continue without key"
+              className="flex-shrink-0 text-zinc-600 hover:text-zinc-400 transition-colors text-sm leading-none mt-0.5"
+            >
+              ×
+            </button>
+          </div>
+
+          {pendingKeyRequest.keys.map((keyDef) => (
+            <div key={keyDef.envName} className="space-y-1">
+              <label className="text-[11px] font-medium text-zinc-400">{keyDef.name}</label>
+              {keyDef.hint && (
+                <p className="text-[10px] text-zinc-600">{keyDef.hint}</p>
+              )}
+              <input
+                autoFocus
+                type={keyDef.isSecret === false ? 'text' : 'password'}
+                value={pendingKeyRequest.values[keyDef.envName] ?? ''}
+                onChange={(e) =>
+                  setPendingKeyRequest((prev) =>
+                    prev
+                      ? { ...prev, values: { ...prev.values, [keyDef.envName]: e.target.value } }
+                      : prev
+                  )
+                }
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleKeySubmit();
+                  if (e.key === 'Escape') handleKeyRequestSkip();
+                }}
+                placeholder={keyDef.placeholder || ''}
+                className="w-full bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 text-xs text-zinc-200 placeholder-zinc-600 outline-none focus:border-indigo-500/60 font-mono transition-colors"
+              />
+            </div>
+          ))}
+
+          <div className="flex gap-2 pt-0.5">
+            <button
+              onClick={handleKeySubmit}
+              className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition-colors"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M13 10V3L4 14h7v7l9-11h-7z" />
+              </svg>
+              Continue with key
+            </button>
+            <button
+              onClick={handleKeyRequestSkip}
+              className="px-3 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-400 text-xs font-medium transition-colors"
+            >
+              Skip
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Input */}
-      <div className={`p-4 flex-shrink-0 ${suggestions.length === 0 && !loadingSuggestions && promptQueue.length === 0 ? 'border-t border-zinc-800' : ''}`}>
+      <div className="px-4 pb-4 flex-shrink-0">
+        {/* Build / Ask mode toggle */}
+        <div className="flex items-center gap-1 mb-2.5">
+          <button
+            onClick={() => setChatMode('build')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-medium transition-all duration-150 ${
+              chatMode === 'build'
+                ? 'border-indigo-500/60 text-indigo-300 bg-indigo-600/20'
+                : 'border-zinc-700/60 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300 bg-transparent'
+            }`}
+          >
+            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+            </svg>
+            Build
+          </button>
+          <button
+            onClick={() => setChatMode('ask')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-medium transition-all duration-150 ${
+              chatMode === 'ask'
+                ? 'border-amber-500/60 text-amber-300 bg-amber-600/20'
+                : 'border-zinc-700/60 text-zinc-500 hover:border-zinc-500 hover:text-zinc-300 bg-transparent'
+            }`}
+          >
+            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            Ask
+          </button>
+          {chatMode === 'ask' && (
+            <span className="ml-1 text-[10px] text-amber-500/70">answers only · no code changes</span>
+          )}
+        </div>
+
         {/* Model selector */}
         <ModelSelector
           selected={selectedModel}
@@ -646,21 +840,45 @@ export default function ChatPanel() {
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
-            placeholder={isGenerating ? 'Type to add to queue...' : 'Describe what to build, or paste a screenshot...'}
+            placeholder={
+              chatMode === 'ask'
+                ? 'Ask a question about your app or code...'
+                : isGenerating
+                ? 'Type to add to queue...'
+                : 'Describe what to build, or paste a screenshot...'
+            }
             rows={1}
             className="flex-1 bg-transparent text-zinc-100 placeholder-zinc-500 text-sm resize-none outline-none leading-relaxed max-h-40 overflow-y-auto"
           />
+          {/* Stop button — cancels generation and reverts files */}
+          {isGenerating && (
+            <button
+              onClick={() => cancelGeneration()}
+              title="Stop and revert"
+              className="flex-shrink-0 w-8 h-8 rounded-lg bg-red-600/20 hover:bg-red-600/40 border border-red-500/30 flex items-center justify-center transition-all duration-150"
+            >
+              <svg className="w-3.5 h-3.5 text-red-400" fill="currentColor" viewBox="0 0 24 24">
+                <rect x="5" y="5" width="14" height="14" rx="2" />
+              </svg>
+            </button>
+          )}
           <button
             onClick={handleSend}
             disabled={!input.trim() && attachments.length === 0}
-            title={isGenerating ? 'Add to queue' : 'Send'}
+            title={chatMode === 'ask' ? 'Ask' : isGenerating ? 'Add to queue' : 'Send'}
             className={`flex-shrink-0 w-8 h-8 rounded-lg disabled:opacity-40 flex items-center justify-center transition-all duration-150 ${
-              isGenerating
+              chatMode === 'ask'
+                ? 'bg-amber-600 hover:bg-amber-500 disabled:bg-zinc-700'
+                : isGenerating
                 ? 'bg-zinc-700 hover:bg-zinc-600'
                 : 'bg-indigo-600 hover:bg-indigo-500 disabled:bg-zinc-700'
             }`}
           >
-            {isGenerating ? (
+            {chatMode === 'ask' ? (
+              <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+            ) : isGenerating ? (
               <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 4v16m8-8H4" />
               </svg>
@@ -672,7 +890,11 @@ export default function ChatPanel() {
           </button>
         </div>
         <p className="text-zinc-600 text-[11px] mt-2 text-center">
-          {isGenerating ? 'Enter to queue · Shift+Enter for new line' : 'Paste or attach images · Enter to send'}
+          {chatMode === 'ask'
+            ? 'Ask a question · Enter to send'
+            : isGenerating
+            ? 'Enter to queue · Shift+Enter for new line'
+            : 'Paste or attach images · Enter to send'}
         </p>
       </div>
     </div>
@@ -681,11 +903,20 @@ export default function ChatPanel() {
 
 // ─── Message Bubble ───────────────────────────────────────────────────────────
 
-function MessageBubble({ message }: { message: Message }) {
+function MessageBubble({ message, onRePrompt }: { message: Message; onRePrompt?: (content: string) => void }) {
+  const [copied, setCopied] = useState(false);
+
   if (message.role === 'user') {
     const hasImages = message.imageAttachments && message.imageAttachments.length > 0;
+
+    function handleCopy() {
+      navigator.clipboard.writeText(message.content).catch(() => {});
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+
     return (
-      <div className="flex justify-end mb-3 animate-slide-up">
+      <div className="flex justify-end mb-3 animate-slide-up group">
         <div className="max-w-[85%] space-y-1.5">
           {/* Image attachments above the text bubble */}
           {hasImages && (
@@ -706,6 +937,42 @@ function MessageBubble({ message }: { message: Message }) {
               <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.content}</p>
             </div>
           )}
+          {/* Hover actions */}
+          <div className="flex justify-end gap-1">
+            <button
+              onClick={handleCopy}
+              title="Copy prompt"
+              className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 transition-colors"
+            >
+              {copied ? (
+                <>
+                  <svg className="w-3 h-3 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                  </svg>
+                  <span className="text-green-400">Copied</span>
+                </>
+              ) : (
+                <>
+                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                  </svg>
+                  <span>Copy</span>
+                </>
+              )}
+            </button>
+            {onRePrompt && message.content && (
+              <button
+                onClick={() => onRePrompt(message.content)}
+                title="Re-send this prompt"
+                className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 transition-colors"
+              >
+                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                <span>Re-prompt</span>
+              </button>
+            )}
+          </div>
         </div>
       </div>
     );
@@ -722,7 +989,14 @@ function MessageBubble({ message }: { message: Message }) {
 
         {message.error ? (
           <div className="text-sm text-red-400 bg-red-950/30 border border-red-900/40 rounded-xl p-3">
-            <strong>Error: </strong>{message.error}
+            <strong>Error: </strong>{(() => {
+              try {
+                const parsed = JSON.parse(message.error!);
+                return parsed?.error?.message ?? parsed?.message ?? message.error;
+              } catch {
+                return message.error;
+              }
+            })()}
           </div>
         ) : (
           <div className="text-sm text-zinc-200 leading-relaxed">

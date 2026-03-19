@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
-import { FileSystem, Message, ModelId, QueueItem, RightPanelTab } from '../types';
+import { FileSystem, Message, ModelId, QueueItem, RightPanelTab, StorageMode, ProjectConfig } from '../types';
 
 const WELCOME_MESSAGE: Message = {
   id: 'welcome',
@@ -35,7 +35,7 @@ interface AppStore {
   activeFile: string | null;
   setActiveFile: (file: string | null) => void;
   setFile: (filename: string, content: string) => void;
-  setFiles: (files: FileSystem) => void;
+  setFiles: (files: FileSystem, replace?: boolean) => void;
   clearFiles: () => void;
 
   // Messages
@@ -45,7 +45,9 @@ interface AppStore {
   setLastMessageStreaming: (streaming: boolean) => void;
   setLastMessageError: (error: string) => void;
   clearMessages: () => void;
+  setMessages: (messages: Message[]) => void;
   updateLastAssistantPipeline: (pipeline: Message['pipeline']) => void;
+  removeLastMessages: (count: number) => void;
 
   // UI State
   isGenerating: boolean;
@@ -71,6 +73,33 @@ interface AppStore {
   updateQueueItem: (id: string, prompt: string) => void;
   setQueuePaused: (paused: boolean) => void;
   clearQueue: () => void;
+  setQueue: (queue: QueueItem[], paused: boolean) => void;
+
+  // Storage / project config
+  storageMode: StorageMode;
+  setStorageMode: (mode: StorageMode) => void;
+  projectConfig: ProjectConfig | null;
+  setProjectConfig: (config: ProjectConfig | null) => void;
+
+  // Current project identity (set by EditorPage when loading a project)
+  currentProjectId: string | null;
+  currentProjectName: string | null;
+  setCurrentProjectName: (name: string) => void;
+  setProjectMeta: (meta: {
+    projectId: string;
+    projectName: string;
+    storageMode: StorageMode;
+    projectConfig: ProjectConfig | null;
+  }) => void;
+
+  // Pending version snapshot — set after AI generation, consumed only on preview-ready
+  pendingVersionSave: { projectId: string; userId: string; files: Record<string, string>; label: string } | null;
+  setPendingVersionSave: (data: { projectId: string; userId: string; files: Record<string, string>; label: string } | null) => void;
+
+  // API secrets for third-party integrations — stored in memory, injected into preview via window.ENV
+  projectSecrets: Record<string, string>;
+  setProjectSecret: (envName: string, value: string) => void;
+  clearProjectSecrets: () => void;
 }
 
 export const useStore = create<AppStore>()(
@@ -84,16 +113,16 @@ export const useStore = create<AppStore>()(
           files: { ...state.files, [filename]: content },
           activeFile: state.activeFile ?? filename,
         })),
-      setFiles: (files) =>
+      setFiles: (files, replace = false) =>
         set((state) => {
-          const merged = { ...state.files, ...files };
+          const merged = replace ? files : { ...state.files, ...files };
           const firstNew = Object.keys(files)[0];
           return {
             files: merged,
-            activeFile: state.activeFile ?? firstNew ?? null,
+            activeFile: state.activeFile && merged[state.activeFile] ? state.activeFile : (firstNew ?? null),
           };
         }),
-      clearFiles: () => set({ files: {}, activeFile: null }),
+      clearFiles: () => set({ files: {}, activeFile: null, projectConfig: null, projectSecrets: {} }),
 
       messages: [WELCOME_MESSAGE],
       addMessage: (message) =>
@@ -126,6 +155,9 @@ export const useStore = create<AppStore>()(
           return { messages };
         }),
       clearMessages: () => set({ messages: [WELCOME_MESSAGE], promptQueue: [], queuePaused: false }),
+      setMessages: (messages) => set({ messages }),
+      removeLastMessages: (count) =>
+        set((state) => ({ messages: state.messages.slice(0, -count) })),
       updateLastAssistantPipeline: (pipeline) =>
         set((state) => {
           const messages = [...state.messages];
@@ -166,6 +198,26 @@ export const useStore = create<AppStore>()(
         })),
       setQueuePaused: (paused) => set({ queuePaused: paused }),
       clearQueue: () => set({ promptQueue: [] }),
+      setQueue: (queue, paused) => set({ promptQueue: queue, queuePaused: paused }),
+
+      storageMode: 'supabase',
+      setStorageMode: (mode) => set({ storageMode: mode }),
+      projectConfig: null,
+      setProjectConfig: (config) => set({ projectConfig: config }),
+
+      currentProjectId: null,
+      currentProjectName: null,
+      setCurrentProjectName: (name) => set({ currentProjectName: name }),
+      setProjectMeta: ({ projectId, projectName, storageMode, projectConfig }) =>
+        set({ currentProjectId: projectId, currentProjectName: projectName, storageMode, projectConfig }),
+
+      pendingVersionSave: null,
+      setPendingVersionSave: (data) => set({ pendingVersionSave: data }),
+
+      projectSecrets: {},
+      setProjectSecret: (envName, value) =>
+        set((state) => ({ projectSecrets: { ...state.projectSecrets, [envName]: value } })),
+      clearProjectSecrets: () => set({ projectSecrets: {} }),
     }),
     {
       name: 'acp-v1',
@@ -180,6 +232,8 @@ export const useStore = create<AppStore>()(
         rightPanel: state.rightPanel,
         promptQueue: state.promptQueue,
         queuePaused: state.queuePaused,
+        storageMode: state.storageMode,
+        projectConfig: state.projectConfig,
       }),
     }
   )
