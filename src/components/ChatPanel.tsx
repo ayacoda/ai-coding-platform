@@ -212,11 +212,48 @@ export default function ChatPanel() {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [confirmClearAll, setConfirmClearAll] = useState(false);
   const [pendingKeyRequest, setPendingKeyRequest] = useState<PendingKeyRequest | null>(null);
+  const [isListening, setIsListening] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const userScrolledUp = useRef(false);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const recognitionRef = useRef<any>(null);
+
+  const hasSpeechRecognition = typeof window !== 'undefined' && (
+    !!(window as any).SpeechRecognition || !!(window as any).webkitSpeechRecognition
+  );
+
+  function toggleDictation() {
+    if (isListening) {
+      recognitionRef.current?.stop();
+      return;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) return;
+    const recognition = new SR();
+    recognition.lang = 'en-US';
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognitionRef.current = recognition;
+
+    recognition.onstart = () => setIsListening(true);
+    recognition.onend = () => setIsListening(false);
+    recognition.onerror = () => setIsListening(false);
+    recognition.onresult = (e: any) => {
+      let final = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        if (e.results[i].isFinal) final += e.results[i][0].transcript;
+      }
+      if (final) {
+        setInput((prev) => (prev ? prev + ' ' + final : final));
+        textareaRef.current?.focus();
+      }
+    };
+    recognition.start();
+  }
 
   // Re-roll app idea batch whenever the chat is cleared (new project)
   const prevMessageCount = useRef(messages.length);
@@ -423,8 +460,46 @@ export default function ChatPanel() {
 
   const showSuggestions = messages.length <= 1 && !isGenerating;
 
+  // The latest user message — shown as a sticky "working on" banner while generating
+  const activePrompt = isGenerating
+    ? [...messages].reverse().find((m) => m.role === 'user')?.content ?? null
+    : null;
+
   return (
     <div className="flex flex-col h-full bg-zinc-900">
+      {/* Active-prompt banner — always at the very top while generating */}
+      {activePrompt && (
+        <div className="flex-shrink-0 px-3 pt-2 pb-2.5 bg-indigo-950/60 border-b border-indigo-500/30">
+          <div className="flex items-start gap-2.5">
+            <svg
+              className="w-3.5 h-3.5 text-indigo-400 animate-spin flex-shrink-0 mt-0.5"
+              fill="none"
+              viewBox="0 0 24 24"
+            >
+              <circle
+                className="opacity-25"
+                cx="12" cy="12" r="10"
+                stroke="currentColor"
+                strokeWidth="3"
+              />
+              <path
+                className="opacity-90"
+                fill="currentColor"
+                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+              />
+            </svg>
+            <div className="flex-1 min-w-0">
+              <div className="text-[10px] text-indigo-400/80 uppercase tracking-widest font-semibold mb-0.5">
+                Working on
+              </div>
+              <p className="text-xs text-zinc-300 leading-relaxed line-clamp-2 break-words">
+                {activePrompt}
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Messages */}
       <div
         ref={scrollContainerRef}
@@ -436,6 +511,9 @@ export default function ChatPanel() {
             key={msg.id}
             message={msg}
             onRePrompt={(content) => { setInput(content); textareaRef.current?.focus(); }}
+            onFix={(errorText) => {
+              sendChatMessage(`SURGICAL FIX\nError: ${errorText}\n\nFix this error in the current files.`);
+            }}
           />
         ))}
 
@@ -834,6 +912,33 @@ export default function ChatPanel() {
             </svg>
           </button>
 
+          {/* Dictation button */}
+          {hasSpeechRecognition && (
+            <button
+              onClick={toggleDictation}
+              title={isListening ? 'Stop dictation' : 'Dictate (voice to text)'}
+              className={`flex-shrink-0 w-7 h-7 rounded-md flex items-center justify-center transition-all duration-150 mb-0.5 ${
+                isListening
+                  ? 'text-red-400 bg-red-500/15 hover:bg-red-500/25'
+                  : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-700'
+              }`}
+            >
+              {isListening ? (
+                /* Pulsing mic-off icon while recording */
+                <span className="relative flex items-center justify-center">
+                  <span className="absolute w-5 h-5 rounded-full bg-red-500/20 animate-ping" />
+                  <svg className="w-4 h-4 relative" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                  </svg>
+                </span>
+              ) : (
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                </svg>
+              )}
+            </button>
+          )}
+
           <textarea
             ref={textareaRef}
             value={input}
@@ -903,7 +1008,7 @@ export default function ChatPanel() {
 
 // ─── Message Bubble ───────────────────────────────────────────────────────────
 
-function MessageBubble({ message, onRePrompt }: { message: Message; onRePrompt?: (content: string) => void }) {
+function MessageBubble({ message, onRePrompt, onFix }: { message: Message; onRePrompt?: (content: string) => void; onFix?: (errorText: string) => void }) {
   const [copied, setCopied] = useState(false);
 
   if (message.role === 'user') {
@@ -988,15 +1093,39 @@ function MessageBubble({ message, onRePrompt }: { message: Message; onRePrompt?:
         {message.pipeline && <PipelineCard pipeline={message.pipeline} />}
 
         {message.error ? (
-          <div className="text-sm text-red-400 bg-red-950/30 border border-red-900/40 rounded-xl p-3">
-            <strong>Error: </strong>{(() => {
-              try {
-                const parsed = JSON.parse(message.error!);
-                return parsed?.error?.message ?? parsed?.message ?? message.error;
-              } catch {
-                return message.error;
-              }
-            })()}
+          <div className="text-sm text-red-400 bg-red-950/30 border border-red-900/40 rounded-xl p-3 space-y-2.5">
+            <div>
+              <strong>Error: </strong>{(() => {
+                try {
+                  const parsed = JSON.parse(message.error!);
+                  return parsed?.error?.message ?? parsed?.message ?? message.error;
+                } catch {
+                  return message.error;
+                }
+              })()}
+            </div>
+            {onFix && (
+              <button
+                onClick={() => {
+                  const errorText = (() => {
+                    try {
+                      const parsed = JSON.parse(message.error!);
+                      return parsed?.error?.message ?? parsed?.message ?? message.error!;
+                    } catch {
+                      return message.error!;
+                    }
+                  })();
+                  onFix(errorText);
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-600/20 hover:bg-red-600/30 border border-red-500/30 hover:border-red-500/50 text-red-300 hover:text-red-200 text-xs font-medium transition-all duration-150"
+              >
+                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+                Fix this error
+              </button>
+            )}
           </div>
         ) : (
           <div className="text-sm text-zinc-200 leading-relaxed">

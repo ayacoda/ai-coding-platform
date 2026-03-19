@@ -428,10 +428,28 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA "${projectId}" TO anon, authentic
 
     return `
 ━━━ DATABASE & FILE STORAGE (Supabase) ━━━
-This project uses Supabase for both PostgreSQL database and file storage.
-Project schema (FIXED — never change this): "${projectId}"
+This project uses Supabase. ALL data persistence MUST use the database.
 
-window.db is a Supabase client. Use it for ALL data and file operations:
+🚨 SUPABASE MODE OVERRIDES SANDBOX RULES 🚨
+The sandbox rule "localStorage → use useState" is CANCELLED for this project.
+  ❌ localStorage  ❌ sessionStorage  ❌ useState for persistent data
+  ✅ window.db (Supabase) for EVERYTHING that needs to be stored or retrieved
+
+WHAT GOES IN useState (UI-only, non-persistent):
+  ✅ current page / active tab
+  ✅ modal open/close
+  ✅ form input values while typing
+  ✅ loading / error flags
+
+WHAT MUST GO IN window.db (persistent data — NEVER useState):
+  ❌→✅ lists of records (tasks, users, products, orders, notes, etc.)
+  ❌→✅ settings or preferences that should survive a page reload
+  ❌→✅ counters, scores, or any numeric data that must persist
+  ❌→✅ file references / uploaded URLs
+
+Project schema (FIXED — never change): "${projectId}"
+
+window.db is a Supabase client. Use it for ALL data operations:
 
 DATABASE:
   const { data, error } = await window.db.from('tableName').select('*')
@@ -443,14 +461,14 @@ DATABASE:
 FILE UPLOADS:
   const url = await window.uploadFile(file)  // returns a public URL instantly
 
-✅ USE window.db for ALL data — this is a real database, not static arrays
-✅ USE window.uploadFile for file uploads — returns a public URL instantly
+✅ window.db for ALL data — real database, not in-memory arrays or state
+✅ window.uploadFile for file uploads — returns a public URL instantly
 ✅ Always generate/update schema.sql with new tables when adding features
-✅ Handle loading states, errors, and fetch on mount
+✅ Handle loading states, errors, and fetch data on component mount
 ✅ Use UUIDs for IDs: crypto.randomUUID() or let Supabase generate them
 ❌ Do NOT import supabase — window.db is already available globally
-❌ Do NOT use static data arrays for data that should persist
-❌ Do NOT use localStorage for database-driven features
+❌ Do NOT use static data arrays or useState for data that needs to persist
+❌ NEVER use localStorage or sessionStorage under ANY circumstance in this project
 
 ${schemaBlock}
 
@@ -864,7 +882,7 @@ app.post('/api/ask', async (req, res) => {
       ).join('') + '\n'
     : '';
 
-  const askStorageContext = buildStorageContext(storageMode, projectConfig);
+  const askStorageContext = buildStorageContext(storageMode, projectConfig, currentFiles);
 
   const ASK_SYSTEM_PROMPT =
     `You are an expert developer assistant helping with a React/TypeScript web app.\n` +
