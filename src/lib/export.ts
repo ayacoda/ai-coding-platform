@@ -119,7 +119,7 @@ dist
 
   'README.md': `# My App
 
-Generated with [Vibe](https://github.com/ayacoda/ai-coding-platform) — an AI vibe coding platform.
+Generated with AYACODA AI Studio — an AI-powered app builder.
 
 ---
 

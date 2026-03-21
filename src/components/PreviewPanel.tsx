@@ -6,9 +6,23 @@ import { buildPreviewHTML } from '../lib/preview';
 import { sendChatMessage } from '../lib/chat';
 import { saveVersion } from '../lib/versions';
 
-// Stop auto-fixing only when the exact same error repeats this many consecutive times
-// (means we're stuck and can't make progress).
-const STUCK_THRESHOLD = 3;
+// Maximum total repair attempts per generation (NOT reset by file changes from repair itself).
+// Only 2 attempts: attempt 1 is targeted (suspect files), attempt 2 sends ALL files.
+// After 2 attempts, we stop — looping never fixes structural code issues.
+const MAX_FIX_ATTEMPTS = 2;
+// Stop immediately if the same error fingerprint repeats consecutively.
+const STUCK_THRESHOLD = 2;
+
+/** Normalize an error string so minor variations (line numbers, token values) don't defeat stuck detection. */
+function normalizeError(msg: string): string {
+  return msg
+    .replace(/line\s+\d+/gi, 'line N')      // line 42 → line N
+    .replace(/col(?:umn)?\s+\d+/gi, 'col N') // col 7 → col N
+    .replace(/at\s+\S+:\d+:\d+/g, '')        // at file:1:2 → (removed)
+    .replace(/'\S+'|"\S+"/g, "'X'")          // 'foo' → 'X'  (variable identifiers)
+    .slice(0, 120)
+    .trim();
+}
 
 // ─── Generating overlay ───────────────────────────────────────────────────────
 
@@ -343,9 +357,13 @@ function ErrorOverlay({
             </svg>
           </div>
           <div>
-            <p className="text-zinc-100 text-sm font-semibold">Runtime Error</p>
+            <p className="text-zinc-100 text-sm font-semibold">
+              {isStuck ? 'Auto-fix stopped' : 'Runtime Error'}
+            </p>
             <p className="text-zinc-500 text-xs mt-0.5">
-              {isStuck ? `Stuck after ${fixAttempt} attempts` : 'Auto-fix will start shortly…'}
+              {isStuck
+                ? `${fixAttempt} attempts couldn't resolve this — describe the fix in chat`
+                : 'Auto-fix will start shortly…'}
             </p>
           </div>
         </div>
@@ -370,7 +388,7 @@ function ErrorOverlay({
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M13 10V3L4 14h7v7l9-11h-7z" />
             </svg>
-            {isStuck ? 'Retry Fix' : 'Fix Now'}
+            {isStuck ? 'Try Again' : 'Fix Now'}
           </button>
           <button
             onClick={onDismiss}
@@ -708,6 +726,10 @@ export default function PreviewPanel() {
   // Track last N error messages to detect "stuck" loops
   const recentErrors = useRef<string[]>([]);
   const autoFixTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Persistent repair counter — NOT reset when repair outputs new files, only on genuine new builds
+  const globalRepairCount = useRef(0);
+  // Flag: was the last file update caused by a repair? If so, don't reset the global counter.
+  const fileChangeFromRepair = useRef(false);
 
   useEffect(() => { filesRef.current = files; }, [files]);
   useEffect(() => { isFixingRef.current = isFixing; }, [isFixing]);
@@ -720,56 +742,262 @@ export default function PreviewPanel() {
 
   useEffect(() => {
     setPreviewError(null);
-    // Do NOT increment key here — srcDoc prop change navigates the iframe without
-    // destroying/recreating the DOM element, so version restores and file updates
-    // are instant with no blank flash. Key is only incremented on manual refresh.
     recentErrors.current = [];
-    setFixAttempt(0);
-    setIsStuck(false);
     setIsFixing(false);
     isFixingRef.current = false;
     if (autoFixTimer.current) {
       clearTimeout(autoFixTimer.current);
       autoFixTimer.current = null;
     }
+    if (fileChangeFromRepair.current) {
+      // Files changed because a repair ran — keep the global count, don't reset UI attempt counter
+      fileChangeFromRepair.current = false;
+    } else {
+      // Genuine new build — fully reset repair state
+      globalRepairCount.current = 0;
+      setFixAttempt(0);
+      setIsStuck(false);
+    }
   }, [files]);
 
   function doFix(error: string) {
     if (isFixingRef.current || isGeneratingRef.current) return;
 
-    // Track recent errors. If the last STUCK_THRESHOLD are all identical → we're stuck.
-    recentErrors.current = [...recentErrors.current.slice(-(STUCK_THRESHOLD - 1)), error];
+    // Hard cap using persistent ref — not bypassed by file changes from repairs.
+    globalRepairCount.current += 1;
+    const attemptNumber = globalRepairCount.current;
+    if (attemptNumber > MAX_FIX_ATTEMPTS) {
+      setIsStuck(true);
+      return;
+    }
+
+    // Fuzzy stuck detection — normalize errors before comparing.
+    const fingerprint = normalizeError(error);
+    recentErrors.current = [...recentErrors.current.slice(-(STUCK_THRESHOLD - 1)), fingerprint];
     if (
       recentErrors.current.length >= STUCK_THRESHOLD &&
-      recentErrors.current.every((e) => e === recentErrors.current[recentErrors.current.length - 1])
+      recentErrors.current.every((e) => e === fingerprint)
     ) {
       setIsStuck(true);
       return;
     }
 
     const currentFiles = filesRef.current;
-    const filesSummary = Object.entries(currentFiles)
-      .map(([name, code]) => `\`\`\`tsx ${name}\n${code}\n\`\`\``)
-      .join('\n\n');
+
+    // Detect if the error is "X is not defined" where X is a TypeScript interface
+    // (the #1 crash pattern: interface named same as a JSX component).
+    const errorSymbol = error.match(/[`'"]?(\w+)[`'"]? is not defined/i)?.[1]
+      ?? error.match(/Cannot read propert(?:y|ies) of (?:null|undefined).*?'(\w+)'/i)?.[1]
+      ?? '';
+
+    // Detect "Invalid left-hand side expression in prefix operation" — typically CSS variable names
+    // in style objects like `--myVar: value` (the `:` or `--` syntax is invalid JS in object keys).
+    const isInvalidLhsCrash = /invalid left-hand side.*(?:prefix|postfix|assignment)/i.test(error) ||
+      /invalid assignment target/i.test(error);
+
+    const isInterfaceAsComponentCrash = errorSymbol
+      ? Object.values(currentFiles).some((code) =>
+          new RegExp(`\\binterface\\s+${errorSymbol}\\b`).test(code) ||
+          new RegExp(`\\btype\\s+${errorSymbol}\\s*[={<]`).test(code)
+        )
+      : false;
+
+    // Detect Supabase createClient crash — needs cross-file fix (remove all supabase imports)
+    const isSupabaseCrash = errorSymbol === 'createClient' ||
+      Object.values(currentFiles).some((code) =>
+        /import.*createClient.*from.*@supabase/.test(code) ||
+        /import.*from.*@supabase\/supabase-js/.test(code)
+      );
+
+    // "Illegal return statement" — a bare `return` exists at file/module top level (outside any function).
+    // The sandbox eval() runs at script scope so top-level returns are illegal.
+    // We don't know which file has it, so we must send ALL files.
+    const isIllegalReturnCrash = /illegal return statement/i.test(error);
+
+    // Schema name used as a JS variable — e.g. "proj_default is not defined" or "p_04f247bf is not defined".
+    // Happens when the AI uses the Supabase schema name as a bare JS identifier instead of a string.
+    // The fix: find every occurrence of that identifier in .tsx/.ts files and replace with window.db.from() calls.
+    const isSchemaNameCrash = errorSymbol
+      ? /^proj_default$/.test(errorSymbol) || /^p_[0-9a-f]{6,10}$/.test(errorSymbol)
+      : false;
+
+    // For interface-as-component or Supabase crashes, send ALL files — fix must be cross-file consistent.
+    // For other errors, only send suspect files to keep context small.
+    const suspectFiles = new Set<string>();
+    suspectFiles.add('App.tsx');
+    if (!isInterfaceAsComponentCrash && !isSupabaseCrash && !isIllegalReturnCrash && !isInvalidLhsCrash && !isSchemaNameCrash && errorSymbol) {
+      for (const [fname, code] of Object.entries(currentFiles)) {
+        if (code.includes(errorSymbol)) suspectFiles.add(fname);
+      }
+    }
+
+    // Attempt 2: escalate to ALL files regardless of error type (broader context for the fix).
+    // Never rewrite the whole app — that just regenerates the same broken code.
+    const needsAllFiles = isInterfaceAsComponentCrash || isSupabaseCrash || isIllegalReturnCrash ||
+      isInvalidLhsCrash || isSchemaNameCrash || attemptNumber >= 2;
+    const allFilesLabel = isInterfaceAsComponentCrash ? 'interface-as-component rename'
+      : isSupabaseCrash ? 'Supabase import fix'
+      : isIllegalReturnCrash ? 'illegal return — must scan every file'
+      : isInvalidLhsCrash ? 'invalid LHS — must find JS syntax error in style/expression'
+      : isSchemaNameCrash ? 'schema-name-as-variable — must replace in all files'
+      : `attempt ${attemptNumber} — full context`;
+    const filesSummary = needsAllFiles
+      ? `### READ-ONLY CONTEXT — ${allFilesLabel}\nDO NOT re-output files you did not change. Only output the specific files where you made edits.\n\n` +
+        Object.entries(currentFiles).map(([name, code]) => `\`\`\`tsx ${name}\n${code}\n\`\`\``).join('\n\n')
+      : `### READ-ONLY CONTEXT — only these files are relevant\nDO NOT re-output files you did not change. Only output the specific files where you made edits.\n\n` +
+        Object.entries(currentFiles).map(([name, code]) => {
+          if (suspectFiles.has(name)) return `\`\`\`tsx ${name}\n${code}\n\`\`\``;
+          return `• ${name} (read-only — do NOT re-output unless you changed it)`;
+        }).join('\n\n');
 
     setPreviewError(null);
     setIsFixing(true);
     setIsStuck(false);
     isFixingRef.current = true;
-    setFixAttempt((n) => n + 1);
+    setFixAttempt(attemptNumber);
+    // Mark that the next file change will come from this repair, not a new user build
+    fileChangeFromRepair.current = true;
+
+    // Always use Opus for all repair attempts — best quality, fewest follow-up errors.
+    const overrideModel = 'claude-opus-4-6';
+
+    // Build a targeted hint based on the error type.
+    const e = error.toLowerCase();
+    let extraHint = '';
+    if (/unexpected token|invalid or unexpected|syntaxerror|unexpected end|unterminated/i.test(error)) {
+      extraHint = `\n• SYNTAX error — check: unclosed template literals (\`), mismatched brackets {}/(), invalid JSX, illegal characters in strings, missing closing tags.`;
+    } else if (/is not defined/i.test(error)) {
+      const name = error.match(/(\w+) is not defined/i)?.[1] ?? '';
+      const isSupabaseCrash = name === 'createClient' ||
+        Object.values(currentFiles).some((code) =>
+          new RegExp(`import\\s+.*?${name}.*?from\\s+['\"]@supabase`).test(code) ||
+          (name !== 'createClient' && /import.*createClient.*from.*@supabase/.test(code))
+        );
+      if (isInterfaceAsComponentCrash) {
+        extraHint = `\n⚠️ ROOT CAUSE: "${name}" is a TypeScript INTERFACE — interfaces are erased at runtime and cannot be used as JSX components.\n` +
+          `REQUIRED FIX (must update ALL files consistently):\n` +
+          `  1. Keep interface ${name} in types.ts as-is (don't rename the type).\n` +
+          `  2. Find every component function named "${name}" → rename it to "${name}Card" (or ${name}Row / ${name}Item)\n` +
+          `  3. Find every JSX usage <${name} ... /> or <${name}> → change to <${name}Card ... />\n` +
+          `  4. Output EVERY file that contains "${name}" as a JSX element or function component — the rename must be 100% consistent.\n` +
+          `  DO NOT just remove imports. Rename the component function AND all JSX usages.`;
+      } else if (isSupabaseCrash || name === 'createClient') {
+        extraHint = `\n⚠️ ROOT CAUSE: "createClient" is from '@supabase/supabase-js' which is NOT available as an import in the sandbox.\n` +
+          `REQUIRED FIX:\n` +
+          `  1. DELETE any lib/supabase.ts or utils/supabase.ts file that calls createClient.\n` +
+          `  2. Replace ALL Supabase client usage with window.db (already configured).\n` +
+          `  3. Change: const { data } = await supabase.from('x')  →  const { data } = await window.db.from('x')\n` +
+          `  4. Change: supabase.auth.signIn(...)  →  window.db.auth.signInWithPassword(...)\n` +
+          `  5. Remove ALL imports of createClient, SupabaseClient, or anything from @supabase/supabase-js.\n` +
+          `  window.db is pre-configured globally — use it everywhere, no import needed.`;
+      } else {
+        extraHint = `\n• "${name} is not defined" — MOST LIKELY CAUSES:\n` +
+          `  1. Missing import: check every file that uses "${name}" has an import statement for it.\n` +
+          `  2. TypeScript interface/type named "${name}" used as JSX — rename the component to "${name}Card" or "${name}Item".\n` +
+          `  3. Wrong import path: the file path in the import doesn't match the actual filename.\n` +
+          `  → Fix: add the missing import, or rename the component to differ from the interface.`;
+      }
+    } else if (/cannot read propert|cannot read prop|null|undefined/i.test(error)) {
+      extraHint = `\n• Null/undefined crash — MOST LIKELY CAUSES:\n` +
+        `  1. useState initialized as null or undefined, then methods called on it. Fix: initialize as [] or {} or the correct empty value.\n` +
+        `  2. Async data not yet loaded when component renders. Fix: add a loading check or ?. optional chaining.\n` +
+        `  → Fix: change null/undefined initializations to safe defaults, add optional chaining (?.) where needed.`;
+    } else if (/is not a function/i.test(error)) {
+      extraHint = `\n• "X is not a function" — check: imported value is actually a function, not an object/array. Check the export matches the import (default vs named).`;
+    } else if (/maximum update depth|too many re-renders/i.test(error)) {
+      extraHint = `\n• Infinite re-render loop — check: setState being called directly in render body (not inside handler/useEffect), or useEffect missing dependency array.`;
+    } else if (isSchemaNameCrash) {
+      extraHint = `\n⚠️ ROOT CAUSE: "${errorSymbol}" is a Supabase PostgreSQL schema name that was accidentally used as a JavaScript variable.\n` +
+        `The schema name only belongs in schema.sql — it must NEVER appear as a JS identifier in .tsx or .ts files.\n` +
+        `REQUIRED FIX — search ALL .tsx and .ts files for every occurrence of "${errorSymbol}" used as a bare identifier:\n` +
+        `  1. window.db.from(${errorSymbol} + '.tableName') → window.db.from('tableName')\n` +
+        `  2. window.db.from(\`\${${errorSymbol}}.tableName\`) → window.db.from('tableName')\n` +
+        `  3. window.db.schema(${errorSymbol}).from('tableName') → window.db.from('tableName')\n` +
+        `  4. const x = ${errorSymbol} or similar → remove entirely\n` +
+        `  window.db is already scoped to the correct schema — just call window.db.from('tableName') with only the table name.\n` +
+        `✅ Output EVERY file you changed as a full code block.`;
+    } else if (isIllegalReturnCrash) {
+      extraHint = `\n⚠️ ROOT CAUSE: A bare \`return\` statement exists OUTSIDE any function at the top level of a file.\n` +
+        `The sandbox evaluates all files as a script (not a module), so top-level \`return\` is illegal.\n` +
+        `REQUIRED FIX (check ALL files):\n` +
+        `  1. Search every file for \`return\` statements that are NOT inside a function, class, or arrow function.\n` +
+        `  2. Common patterns to remove: trailing \`return;\` after a component definition, \`return null;\` at file end, \`return\` inside switch/if at module scope.\n` +
+        `  3. Delete any such bare return statements.\n` +
+        `✅ Output EVERY file you changed as a full code block.`;
+    } else if (isInvalidLhsCrash) {
+      extraHint = `\n⚠️ ROOT CAUSE: "Invalid left-hand side expression" is a JavaScript SYNTAX error — something that is not a valid JS lvalue is on the left of an assignment or increment.\n` +
+        `MOST COMMON CAUSES in React style objects:\n` +
+        `  1. CSS variable names as unquoted keys: \`{ --myColor: 'red' }\` → WRONG. Fix: \`{ '--myColor': 'red' }\` (CSS variable keys MUST be quoted).\n` +
+        `  2. Hyphens in property names: \`{ font-size: 14 }\` → WRONG. Fix: \`{ fontSize: 14 }\` or \`{ 'font-size': 14 }\`.\n` +
+        `  3. Decrement operator misused: \`--someVar\` when someVar is an object/string, not a number.\n` +
+        `  4. Template literals or method calls used as assignment targets.\n` +
+        `REQUIRED FIX:\n` +
+        `  → Search ALL style={} objects for unquoted hyphenated keys or \`--\` prefixed keys. Quote them or convert to camelCase.\n` +
+        `  → Example: \`style={{ '--gradient-color': '#fff', fontSize: 14 }}\`\n` +
+        `✅ Output EVERY file you changed as a full code block.`;
+    }
+
+    const fixInstruction = isInterfaceAsComponentCrash
+      ? `INTERFACE-COMPONENT COLLISION FIX:\n` +
+        `'${errorSymbol}' is declared as a TypeScript interface AND used as JSX <${errorSymbol} />.\n` +
+        `TypeScript interfaces are erased at runtime — so <${errorSymbol} /> crashes because no JavaScript value named '${errorSymbol}' exists.\n\n` +
+        `DO THESE STEPS IN ORDER:\n` +
+        `1. Search ALL files for 'interface ${errorSymbol}' and 'type ${errorSymbol}'. Rename to '${errorSymbol}Data' EVERYWHERE.\n` +
+        `2. Update ALL TypeScript type annotations: ': ${errorSymbol}' → ': ${errorSymbol}Data', '${errorSymbol}[]' → '${errorSymbol}Data[]', 'Array<${errorSymbol}>' → 'Array<${errorSymbol}Data>', etc.\n` +
+        `3. Check if a component function named '${errorSymbol}' EXISTS (function ${errorSymbol}() or const ${errorSymbol} = ...):\n` +
+        `   - If it EXISTS: you are done — the interface rename fixed the collision.\n` +
+        `   - If it DOES NOT exist: create a simple React component function named '${errorSymbol}' that renders the correct UI based on how <${errorSymbol} /> is used.\n` +
+        `✅ Output ALL changed files as full code blocks.\n` +
+        `🚫 DO NOT rename the JSX <${errorSymbol} /> usages — fix the interface name instead.`
+      : isSupabaseCrash
+      ? `SUPABASE IMPORT FIX REQUIRED — output ALL files that import from '@supabase/supabase-js'.\n` +
+        `✅ Delete any lib/supabase.ts or utils/supabase.ts that calls createClient.\n` +
+        `✅ Replace every "supabase.from(...)" with "window.db.from(...)" in all files.\n` +
+        `✅ Replace every "supabase.auth.*" with "window.db.auth.*" in all files.\n` +
+        `✅ Remove ALL imports from '@supabase/supabase-js' — use window.db everywhere.\n` +
+        `✅ Output each changed file as a full code block.`
+      : isIllegalReturnCrash
+      ? `ILLEGAL RETURN FIX REQUIRED — scan ALL files for bare \`return\` statements at module/file top level.\n` +
+        `✅ Delete any \`return\` statement that is not inside a function, class, or arrow function.\n` +
+        `✅ Output EVERY file you changed as a full code block.`
+      : isInvalidLhsCrash
+      ? `INVALID SYNTAX FIX REQUIRED — scan ALL style={} objects and expressions for invalid JS syntax.\n` +
+        `✅ Quote any CSS variable keys (e.g. '--my-var' not --my-var).\n` +
+        `✅ Convert hyphenated CSS property names to camelCase (e.g. fontSize not font-size).\n` +
+        `✅ Remove any \`--\` decrement operators applied to non-numeric values.\n` +
+        `✅ Output EVERY file you changed as a full code block.`
+      : isSchemaNameCrash
+      ? `SCHEMA-NAME-AS-VARIABLE FIX REQUIRED — the Supabase schema name "${errorSymbol}" was used as a JavaScript identifier.\n` +
+        `The schema name ONLY belongs in schema.sql — it must NEVER appear as a JS variable in .tsx or .ts files.\n` +
+        `Search ALL .tsx and .ts files and replace every occurrence:\n` +
+        `  ❌ window.db.from(${errorSymbol} + '.tableName')       →  ✅ window.db.from('tableName')\n` +
+        `  ❌ window.db.from(\`\${${errorSymbol}}.tableName\`)    →  ✅ window.db.from('tableName')\n` +
+        `  ❌ window.db.schema(${errorSymbol}).from('tableName')  →  ✅ window.db.from('tableName')\n` +
+        `  ❌ const x = ${errorSymbol}                            →  ✅ remove entirely\n` +
+        `window.db is already configured with the correct schema — use ONLY the table name in .from().\n` +
+        `✅ Output EVERY .tsx/.ts file you changed as a full code block.`
+      : `STRICT REPAIR MODE — you are fixing ONE specific runtime error. Follow this protocol exactly:\n` +
+        `1. Read the error carefully.\n` +
+        `2. Trace the REAL root cause: check imports, exports, variable names, props, state initialization, async logic, and function calls.\n` +
+        `3. Apply the SMALLEST possible fix for that specific error ONLY.\n` +
+        `🚫 DO NOT add new features.\n` +
+        `🚫 DO NOT redesign or restyle anything.\n` +
+        `🚫 DO NOT refactor unrelated code.\n` +
+        `🚫 DO NOT rewrite large sections — patch only the broken line(s).\n` +
+        `🚫 DO NOT re-output files marked "(unchanged, do NOT re-output)"\n` +
+        `✅ Output ONLY the single file containing the fix as a code block: \`\`\`tsx filename.tsx\n// fixed code\n\`\`\`\n` +
+        `✅ Never guess — verify the root cause in the file before changing anything.`;
 
     sendChatMessage(
-      `The preview has this runtime error:\n\`\`\`\n${error}\n\`\`\`\n\n` +
-      `Current files:\n${filesSummary}\n\n` +
-      `SURGICAL FIX — important instructions:\n` +
-      `• Identify exactly which file(s) contain the bug\n` +
-      `• Output ONLY the file(s) that need to change — do NOT re-output files that are already correct\n` +
-      `• Unchanged files will be preserved automatically\n` +
-      `• ALWAYS output the fixed file(s) as code blocks using this exact format:\n` +
-      `\`\`\`tsx filename.tsx\n// fixed code here\n\`\`\``,
+      `You are in STRICT REPAIR MODE. Fix the runtime error below using the smallest possible change.\n\n` +
+      `ERROR:\n\`\`\`\n${error}\n\`\`\`\n\n` +
+      `${filesSummary}\n\n` +
+      fixInstruction +
+      extraHint,
       {
         isolatedContext: true,
         displayContent: `🔧 Auto-fixing: ${error.split('\n')[0]}`,
+        ...(overrideModel ? { overrideModel } : {}),
       }
     ).finally(() => {
       setIsFixing(false);
@@ -782,7 +1010,6 @@ export default function PreviewPanel() {
       if (e.data?.type === 'preview-error') {
         const msg: string = e.data.message;
         setPreviewError(msg);
-        setIsStuck(false);
 
         // Discard any pending version save — don't save a broken version
         const { pendingVersionSave, setPendingVersionSave } = useStore.getState();
@@ -792,15 +1019,23 @@ export default function PreviewPanel() {
 
         if (autoFixTimer.current) clearTimeout(autoFixTimer.current);
 
-        // Schedule fix — no attempt limit, stop only when stuck (same error N times)
-        autoFixTimer.current = setTimeout(() => {
-          if (!isFixingRef.current && !isGeneratingRef.current) {
-            doFix(msg);
-          }
-        }, 1500);
+        // Only schedule auto-fix if we haven't exhausted attempts.
+        // Never auto-fix once stuck — prevents infinite loops.
+        if (globalRepairCount.current < MAX_FIX_ATTEMPTS) {
+          setIsStuck(false);
+          autoFixTimer.current = setTimeout(() => {
+            if (!isFixingRef.current && !isGeneratingRef.current) {
+              doFix(msg);
+            }
+          }, 1500);
+        } else {
+          // Attempts exhausted — show stuck state so user knows to re-prompt manually
+          setIsStuck(true);
+        }
       } else if (e.data?.type === 'preview-ready') {
-        // Successfully rendered — reset everything
+        // Successfully rendered — reset everything including the persistent repair counter
         recentErrors.current = [];
+        globalRepairCount.current = 0;
         setFixAttempt(0);
         setIsStuck(false);
         setPreviewError(null);
@@ -830,7 +1065,8 @@ export default function PreviewPanel() {
 
   function handleManualRetry() {
     if (previewError) {
-      recentErrors.current = []; // clear stuck state
+      recentErrors.current = [];      // clear stuck error fingerprints
+      globalRepairCount.current = 0;  // reset attempt counter so retry actually fires
       setIsStuck(false);
       doFix(previewError);
     }

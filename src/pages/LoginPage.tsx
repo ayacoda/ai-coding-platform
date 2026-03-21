@@ -59,7 +59,7 @@ export default function LoginPage() {
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
           </svg>
         </div>
-        <span className="font-semibold text-[15px] text-zinc-100">Ayacoda</span>
+        <span className="font-semibold text-[15px] text-zinc-100">AYACODA AI Studio</span>
       </Link>
 
       <div className="w-full max-w-sm">

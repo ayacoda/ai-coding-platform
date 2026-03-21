@@ -179,6 +179,78 @@ const STORAGE_LABELS: Record<string, { label: string; color: string }> = {
   s3: { label: 'S3', color: 'text-sky-400 bg-sky-500/10 border-sky-500/30' },
 };
 
+// Deterministic color themes — vivid, fully distinct per project (inline styles to avoid Tailwind purge)
+const PROJECT_THEMES = [
+  {
+    cardStyle: { background: 'linear-gradient(135deg, #1e1b4b 0%, #2e1065 100%)', borderColor: '#6d28d9' },
+    iconStyle: { background: 'rgba(109,40,217,0.25)', borderColor: 'rgba(139,92,246,0.5)' },
+    iconColor: '#a78bfa',
+    accentColor: '#a78bfa',
+  },
+  {
+    cardStyle: { background: 'linear-gradient(135deg, #022c22 0%, #064e3b 100%)', borderColor: '#059669' },
+    iconStyle: { background: 'rgba(5,150,105,0.25)', borderColor: 'rgba(16,185,129,0.5)' },
+    iconColor: '#34d399',
+    accentColor: '#34d399',
+  },
+  {
+    cardStyle: { background: 'linear-gradient(135deg, #1c0a00 0%, #7c2d12 100%)', borderColor: '#ea580c' },
+    iconStyle: { background: 'rgba(234,88,12,0.25)', borderColor: 'rgba(251,146,60,0.5)' },
+    iconColor: '#fb923c',
+    accentColor: '#fb923c',
+  },
+  {
+    cardStyle: { background: 'linear-gradient(135deg, #0a1628 0%, #0c4a6e 100%)', borderColor: '#0284c7' },
+    iconStyle: { background: 'rgba(2,132,199,0.25)', borderColor: 'rgba(56,189,248,0.5)' },
+    iconColor: '#38bdf8',
+    accentColor: '#38bdf8',
+  },
+  {
+    cardStyle: { background: 'linear-gradient(135deg, #1f0010 0%, #831843 100%)', borderColor: '#e11d48' },
+    iconStyle: { background: 'rgba(225,29,72,0.25)', borderColor: 'rgba(251,113,133,0.5)' },
+    iconColor: '#fb7185',
+    accentColor: '#fb7185',
+  },
+  {
+    cardStyle: { background: 'linear-gradient(135deg, #0a1a00 0%, #14532d 100%)', borderColor: '#16a34a' },
+    iconStyle: { background: 'rgba(22,163,74,0.25)', borderColor: 'rgba(74,222,128,0.5)' },
+    iconColor: '#4ade80',
+    accentColor: '#4ade80',
+  },
+  {
+    cardStyle: { background: 'linear-gradient(135deg, #27040a 0%, #7f1d1d 100%)', borderColor: '#dc2626' },
+    iconStyle: { background: 'rgba(220,38,38,0.25)', borderColor: 'rgba(248,113,113,0.5)' },
+    iconColor: '#f87171',
+    accentColor: '#f87171',
+  },
+  {
+    cardStyle: { background: 'linear-gradient(135deg, #1a0020 0%, #4c1d95 100%)', borderColor: '#c026d3' },
+    iconStyle: { background: 'rgba(192,38,211,0.25)', borderColor: 'rgba(232,121,249,0.5)' },
+    iconColor: '#e879f9',
+    accentColor: '#e879f9',
+  },
+  {
+    cardStyle: { background: 'linear-gradient(135deg, #001a1a 0%, #134e4a 100%)', borderColor: '#0d9488' },
+    iconStyle: { background: 'rgba(13,148,136,0.25)', borderColor: 'rgba(45,212,191,0.5)' },
+    iconColor: '#2dd4bf',
+    accentColor: '#2dd4bf',
+  },
+  {
+    cardStyle: { background: 'linear-gradient(135deg, #1a1500 0%, #78350f 100%)', borderColor: '#d97706' },
+    iconStyle: { background: 'rgba(217,119,6,0.25)', borderColor: 'rgba(252,211,77,0.5)' },
+    iconColor: '#fcd34d',
+    accentColor: '#fcd34d',
+  },
+];
+
+function getProjectTheme(id: string) {
+  const hash = id.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+  return PROJECT_THEMES[hash % PROJECT_THEMES.length];
+}
+
+// Keep for loading skeletons
+const PROJECT_PALETTES = PROJECT_THEMES;
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function DashboardPage() {
@@ -200,7 +272,7 @@ export default function DashboardPage() {
       .from('projects')
       .select('*')
       .eq('user_id', user!.id)
-      .order('updated_at', { ascending: false });
+      .order('created_at', { ascending: false });
 
     if (error) {
       if (error.code === '42P01' || error.message?.includes('does not exist')) {
@@ -214,7 +286,7 @@ export default function DashboardPage() {
               .from('projects')
               .select('*')
               .eq('user_id', user!.id)
-              .order('updated_at', { ascending: false });
+              .order('created_at', { ascending: false });
             if (!retry.error) {
               setProjects((retry.data as DbProject[]) || []);
               setLoading(false);
@@ -313,7 +385,7 @@ export default function DashboardPage() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
                 </svg>
               </div>
-              <span className="text-[13px] font-semibold text-zinc-100">Ayacoda</span>
+              <span className="text-[13px] font-semibold text-zinc-100">AYACODA AI Studio</span>
             </Link>
             <span className="text-zinc-700 text-lg font-light">/</span>
             <span className="text-[13px] text-zinc-400">Dashboard</span>
@@ -376,7 +448,11 @@ export default function DashboardPage() {
         {loading ? (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             {[...Array(3)].map((_, i) => (
-              <div key={i} className="h-[140px] rounded-2xl border border-[#1f1f1f] bg-[#0d0d0d] animate-pulse" />
+              <div
+                key={i}
+                className="h-[140px] rounded-2xl border animate-pulse"
+                style={PROJECT_PALETTES[i % PROJECT_PALETTES.length].cardStyle}
+              />
             ))}
           </div>
         ) : projects.length === 0 ? (
@@ -401,17 +477,22 @@ export default function DashboardPage() {
             {projects.map((project) => {
               const fileCount = Object.keys(project.files || {}).length;
               const storageInfo = STORAGE_LABELS[project.storage_mode] || STORAGE_LABELS.localstorage;
+              const theme = getProjectTheme(project.id);
 
               return (
                 <div
                   key={project.id}
-                  className="group relative rounded-2xl border border-[#1f1f1f] bg-[#0d0d0d] hover:border-zinc-700 hover:bg-zinc-900/50 transition-all p-5 flex flex-col gap-3 cursor-pointer"
+                  className="group relative rounded-2xl border transition-all p-5 flex flex-col gap-3 cursor-pointer hover:brightness-110"
+                  style={theme.cardStyle}
                   onClick={() => navigate(`/project/${project.id}`)}
                 >
                   {/* Project icon */}
                   <div className="flex items-start justify-between">
-                    <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500/20 to-violet-500/20 border border-indigo-500/20 flex items-center justify-center">
-                      <svg className="w-4 h-4 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <div
+                      className="w-9 h-9 rounded-xl border flex items-center justify-center"
+                      style={theme.iconStyle}
+                    >
+                      <svg className="w-4 h-4" style={{ color: theme.iconColor }} fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
                       </svg>
                     </div>
@@ -419,7 +500,7 @@ export default function DashboardPage() {
                     <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
                       <button
                         onClick={() => { setEditingId(project.id); setEditingName(project.name); }}
-                        className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-white/[0.08] text-zinc-600 hover:text-zinc-300 transition-colors"
+                        className="w-7 h-7 flex items-center justify-center rounded-lg bg-white/10 hover:bg-white/20 text-white/80 hover:text-white transition-colors"
                         title="Rename"
                       >
                         <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -429,7 +510,7 @@ export default function DashboardPage() {
                       <button
                         onClick={() => setConfirmDeleteProject(project)}
                         disabled={deletingId === project.id}
-                        className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-red-500/10 text-zinc-600 hover:text-red-400 transition-colors"
+                        className="w-7 h-7 flex items-center justify-center rounded-lg bg-white/10 hover:bg-red-500/30 text-white/80 hover:text-red-300 transition-colors"
                         title="Delete"
                       >
                         {deletingId === project.id ? (

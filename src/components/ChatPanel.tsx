@@ -168,12 +168,43 @@ const APP_IDEAS = [
   'Create a night-sky star chart viewer',
 ];
 
-function pickBatch(): string[] {
-  const pool = [...APP_IDEAS];
+const IMPROVEMENT_IDEAS = [
+  'Add dark mode / light mode toggle',
+  'Make the layout fully responsive for mobile',
+  'Add smooth animations and transitions',
+  'Add loading states and skeleton screens',
+  'Add error handling and empty states',
+  'Improve the color scheme and typography',
+  'Add a search or filter feature',
+  'Add keyboard shortcuts',
+  'Add drag-and-drop support',
+  'Add toast notifications',
+  'Add data export (CSV or JSON)',
+  'Add a settings / preferences panel',
+  'Add undo / redo functionality',
+  'Add pagination or infinite scroll',
+  'Add charts or data visualizations',
+  'Improve accessibility with ARIA labels',
+  'Add a confirmation dialog for destructive actions',
+  'Add a sidebar navigation',
+  'Add breadcrumbs for navigation',
+  'Add a print-friendly view',
+  'Add multi-language / i18n support',
+  'Add a onboarding walkthrough',
+  'Refactor with a cleaner component structure',
+  'Add input validation and inline error messages',
+  'Add a collapsible/expandable section',
+  'Add a progress indicator or stepper',
+  'Add a date/time picker',
+  'Add shareable links or deep linking',
+];
+
+function pickBatch(pool: string[] = APP_IDEAS): string[] {
+  const available = [...pool];
   const batch: string[] = [];
-  for (let i = 0; i < 10 && pool.length > 0; i++) {
-    const idx = Math.floor(Math.random() * pool.length);
-    batch.push(pool.splice(idx, 1)[0]);
+  for (let i = 0; i < 8 && available.length > 0; i++) {
+    const idx = Math.floor(Math.random() * available.length);
+    batch.push(available.splice(idx, 1)[0]);
   }
   return batch;
 }
@@ -200,11 +231,14 @@ export default function ChatPanel() {
     selectedModel, setSelectedModel, isAutoMode, setIsAutoMode,
     files, projectSecrets, setProjectSecret,
     promptQueue, queuePaused, addToQueue, removeFromQueue, updateQueueItem, setQueuePaused, clearQueue,
+    clearVisibleMessages,
   } = useStore();
   const [chatMode, setChatMode] = useState<'build' | 'ask'>('build');
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
-  const [ideaBatch, setIdeaBatch] = useState<string[]>(() => pickBatch());
+  const [ideaBatch, setIdeaBatch] = useState<string[]>(() =>
+    pickBatch(Object.keys(useStore.getState().files).length > 0 ? IMPROVEMENT_IDEAS : APP_IDEAS)
+  );
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [loadingSuggestions, setLoadingSuggestions] = useState(false);
   const [editingQueueId, setEditingQueueId] = useState<string | null>(null);
@@ -213,6 +247,9 @@ export default function ChatPanel() {
   const [confirmClearAll, setConfirmClearAll] = useState(false);
   const [pendingKeyRequest, setPendingKeyRequest] = useState<PendingKeyRequest | null>(null);
   const [isListening, setIsListening] = useState(false);
+  const [isShuffling, setIsShuffling] = useState(false);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [isRewriting, setIsRewriting] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -224,6 +261,7 @@ export default function ChatPanel() {
   const hasSpeechRecognition = typeof window !== 'undefined' && (
     !!(window as any).SpeechRecognition || !!(window as any).webkitSpeechRecognition
   );
+  const hasFiles = Object.keys(files).length > 0;
 
   function toggleDictation() {
     if (isListening) {
@@ -255,13 +293,39 @@ export default function ChatPanel() {
     recognition.start();
   }
 
-  // Re-roll app idea batch whenever the chat is cleared (new project)
-  const prevMessageCount = useRef(messages.length);
-  useEffect(() => {
-    if (messages.length === 0 && prevMessageCount.current > 0) {
-      setIdeaBatch(pickBatch());
+  async function rewritePrompt() {
+    const trimmed = input.trim();
+    if (!trimmed || isRewriting) return;
+    setIsRewriting(true);
+    try {
+      const res = await fetch('/api/rewrite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: trimmed, files }),
+      });
+      const data = await res.json();
+      if (data.rewritten && data.rewritten !== trimmed) {
+        setInput(data.rewritten);
+        setTimeout(() => textareaRef.current?.focus(), 0);
+      }
+    } catch {
+      // silently fail — leave input unchanged
+    } finally {
+      setIsRewriting(false);
     }
-  }, [messages.length]);
+  }
+
+  // Re-roll idea batch whenever project state changes (new vs. existing project)
+  const prevMessageCount = useRef(messages.length);
+  const prevHasFiles = useRef<boolean | null>(null); // null = not yet initialized
+  useEffect(() => {
+    const justCleared = messages.length === 0 && prevMessageCount.current > 0;
+    const projectTypeChanged = prevHasFiles.current !== null && hasFiles !== prevHasFiles.current;
+    if (justCleared || projectTypeChanged) {
+      setIdeaBatch(pickBatch(hasFiles ? IMPROVEMENT_IDEAS : APP_IDEAS));
+    }
+    prevHasFiles.current = hasFiles;
+  }, [messages.length, hasFiles]);
 
   // When a new message is sent (not streaming content), always scroll to bottom
   useEffect(() => {
@@ -458,7 +522,20 @@ export default function ChatPanel() {
     setAttachments((prev) => prev.filter((a) => a.id !== id));
   }
 
-  const showSuggestions = messages.length <= 1 && !isGenerating;
+  // Visible messages are those not hidden (hidden = archived as AI memory after a clear)
+  const visibleMessages = messages.filter((m) => !m.hidden);
+  const showSuggestions = visibleMessages.length <= 1 && !isGenerating;
+  // Once an app has been built, change the welcome message to reflect that
+  const displayMessages = visibleMessages.map((m) =>
+    m.id === 'welcome' && hasFiles
+      ? {
+          ...m,
+          content: `👋 Your app is ready! Ask me to make changes, add features, fix bugs, or anything else.`,
+        }
+      : m
+  );
+  // Hidden messages count — shown as an indicator when context memory is active
+  const hiddenCount = messages.filter((m) => m.hidden).length;
 
   // The latest user message — shown as a sticky "working on" banner while generating
   const activePrompt = isGenerating
@@ -506,7 +583,7 @@ export default function ChatPanel() {
         onScroll={handleScroll}
         className="flex-1 overflow-y-auto overflow-x-hidden p-4 space-y-1 scrollbar-thin"
       >
-        {messages.map((msg) => (
+        {displayMessages.map((msg) => (
           <MessageBubble
             key={msg.id}
             message={msg}
@@ -514,29 +591,57 @@ export default function ChatPanel() {
             onFix={(errorText) => {
               sendChatMessage(`SURGICAL FIX\nError: ${errorText}\n\nFix this error in the current files.`);
             }}
+            onImplement={(text) => { setChatMode('build'); setInput(text); textareaRef.current?.focus(); }}
           />
         ))}
 
         {showSuggestions && (
           <div className="pt-4 space-y-2 animate-fade-in">
+            <style>{`
+              @keyframes pill-in {
+                from { opacity: 0; transform: translateY(8px); }
+                to   { opacity: 1; transform: translateY(0); }
+              }
+              .pill-animate {
+                opacity: 0;
+                animation: pill-in 0.22s ease-out forwards;
+              }
+            `}</style>
             <div className="flex items-center justify-between px-1 pb-1">
-              <span className="text-[10px] text-zinc-600 uppercase tracking-widest font-medium">Ideas</span>
+              <span className="text-[10px] text-zinc-600 uppercase tracking-widest font-medium">
+                {hasFiles ? 'Suggestions' : 'Ideas'}
+              </span>
               <button
-                onClick={() => setIdeaBatch(pickBatch())}
+                onClick={() => {
+                  setIsShuffling(true);
+                  setTimeout(() => {
+                    setIdeaBatch(pickBatch(hasFiles ? IMPROVEMENT_IDEAS : APP_IDEAS));
+                    setIsShuffling(false);
+                  }, 400);
+                }}
+                disabled={isShuffling}
                 title="Shuffle ideas"
-                className="flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 transition-colors"
+                className="flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 transition-colors disabled:opacity-60"
               >
-                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                </svg>
+                {isShuffling ? (
+                  <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 00-8 8h4z" />
+                  </svg>
+                ) : (
+                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                )}
                 Shuffle
               </button>
             </div>
-            {ideaBatch.map((s) => (
+            {ideaBatch.map((s, i) => (
               <button
                 key={s}
                 onClick={() => { setInput(s); textareaRef.current?.focus(); }}
-                className="w-full text-left px-3 py-2.5 text-sm text-zinc-400 hover:text-zinc-200 border border-zinc-800 hover:border-zinc-600 rounded-xl bg-zinc-900 hover:bg-zinc-800 transition-all duration-150"
+                className="pill-animate w-full text-left px-3 py-2.5 text-sm text-zinc-400 hover:text-zinc-200 border border-zinc-800 hover:border-zinc-600 rounded-xl bg-zinc-900 hover:bg-zinc-800 transition-all duration-150"
+                style={{ animationDelay: `${i * 40}ms` }}
               >
                 {s}
               </button>
@@ -815,7 +920,7 @@ export default function ChatPanel() {
       {/* Input */}
       <div className="px-4 pb-4 flex-shrink-0">
         {/* Build / Ask mode toggle */}
-        <div className="flex items-center gap-1 mb-2.5">
+        <div className="flex items-center gap-1 mb-2.5 relative">
           <button
             onClick={() => setChatMode('build')}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-medium transition-all duration-150 ${
@@ -845,7 +950,59 @@ export default function ChatPanel() {
           {chatMode === 'ask' && (
             <span className="ml-1 text-[10px] text-amber-500/70">answers only · no code changes</span>
           )}
+          {/* Spacer */}
+          <div className="flex-1" />
+          {/* Memory indicator */}
+          {hiddenCount > 0 && (
+            <span
+              title={`${hiddenCount} message${hiddenCount === 1 ? '' : 's'} kept as AI memory`}
+              className="flex items-center gap-1 text-[10px] text-violet-400/70 px-1.5 py-0.5 rounded-md bg-violet-900/20 border border-violet-800/30"
+            >
+              <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+              </svg>
+              {hiddenCount} in memory
+            </span>
+          )}
+          {/* Clear conversation button */}
+          {visibleMessages.length > 1 && !isGenerating && (
+            <button
+              onClick={() => setShowClearConfirm(true)}
+              title="Clear conversation"
+              className="flex items-center justify-center w-6 h-6 rounded-md text-zinc-600 hover:text-zinc-400 hover:bg-zinc-800 transition-colors"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+              </svg>
+            </button>
+          )}
         </div>
+        {/* Clear confirmation dialog */}
+        {showClearConfirm && (
+          <div className="mb-3 p-3 rounded-xl bg-zinc-800/80 border border-zinc-700/60 backdrop-blur-sm">
+            <p className="text-xs text-zinc-300 mb-0.5 font-medium">Clear conversation?</p>
+            <p className="text-[11px] text-zinc-500 mb-3 leading-relaxed">
+              The chat will be cleared but the AI will keep this conversation as memory for future prompts.
+            </p>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => {
+                  clearVisibleMessages();
+                  setShowClearConfirm(false);
+                }}
+                className="flex-1 py-1.5 rounded-lg bg-red-600/80 hover:bg-red-600 text-white text-xs font-medium transition-colors"
+              >
+                Clear chat
+              </button>
+              <button
+                onClick={() => setShowClearConfirm(false)}
+                className="flex-1 py-1.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-zinc-300 text-xs font-medium transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Model selector */}
         <ModelSelector
@@ -955,6 +1112,30 @@ export default function ChatPanel() {
             rows={1}
             className="flex-1 bg-transparent text-zinc-100 placeholder-zinc-500 text-sm resize-none outline-none leading-relaxed max-h-40 overflow-y-auto"
           />
+          {/* Rewrite prompt button — shown when there's text in the input */}
+          {input.trim() && chatMode === 'build' && (
+            <button
+              onClick={rewritePrompt}
+              disabled={isRewriting}
+              title="Improve my prompt with AI"
+              className={`flex-shrink-0 w-7 h-7 rounded-md flex items-center justify-center transition-all duration-150 mb-0.5 ${
+                isRewriting
+                  ? 'text-violet-400 bg-violet-500/15'
+                  : 'text-zinc-500 hover:text-violet-400 hover:bg-violet-500/15'
+              }`}
+            >
+              {isRewriting ? (
+                <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+              ) : (
+                <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6L12 2z" />
+                </svg>
+              )}
+            </button>
+          )}
           {/* Stop button — cancels generation and reverts files */}
           {isGenerating && (
             <button
@@ -1008,8 +1189,9 @@ export default function ChatPanel() {
 
 // ─── Message Bubble ───────────────────────────────────────────────────────────
 
-function MessageBubble({ message, onRePrompt, onFix }: { message: Message; onRePrompt?: (content: string) => void; onFix?: (errorText: string) => void }) {
+function MessageBubble({ message, onRePrompt, onFix, onImplement }: { message: Message; onRePrompt?: (content: string) => void; onFix?: (errorText: string) => void; onImplement?: (text: string) => void }) {
   const [copied, setCopied] = useState(false);
+  const isGenerating = useStore((s) => s.isGenerating);
 
   if (message.role === 'user') {
     const hasImages = message.imageAttachments && message.imageAttachments.length > 0;
@@ -1129,10 +1311,15 @@ function MessageBubble({ message, onRePrompt, onFix }: { message: Message; onReP
           </div>
         ) : (
           <div className="text-sm text-zinc-200 leading-relaxed">
-            {!message.content && message.isStreaming ? (
-              !message.pipeline ? <TypingIndicator /> : null
+            {!message.content && message.isStreaming && isGenerating ? (
+              <TypingIndicator />
             ) : (
-              <MarkdownContent content={message.content} isStreaming={!!message.isStreaming} />
+              <MarkdownContent
+                content={message.content}
+                isStreaming={!!message.isStreaming}
+                onImplement={message.pipeline ? undefined : onImplement}
+                hideCode={!message.isStreaming && (!!message.pipeline || !!message.isRepairMessage)}
+              />
             )}
           </div>
         )}
@@ -1197,13 +1384,17 @@ function parseContent(text: string): Segment[] {
 
 // ─── Markdown Renderer ────────────────────────────────────────────────────────
 
-function MarkdownContent({ content, isStreaming }: { content: string; isStreaming: boolean }) {
+function MarkdownContent({ content, isStreaming, onImplement, hideCode }: { content: string; isStreaming: boolean; onImplement?: (text: string) => void; hideCode?: boolean }) {
   const segments = parseContent(content);
+
+  // When code is hidden, collect all code segments to show as file chips
+  const codeSegments = hideCode ? segments.filter((s): s is CodeSegment => s.type === 'code' && !!s.filename) : [];
 
   return (
     <div className="space-y-1">
       {segments.map((seg, i) => {
         if (seg.type === 'code') {
+          if (hideCode) return null;
           return (
             <CodeBlock
               key={i}
@@ -1215,8 +1406,30 @@ function MarkdownContent({ content, isStreaming }: { content: string; isStreamin
             />
           );
         }
-        return <TextBlock key={i} text={seg.content} />;
+        return <TextBlock key={i} text={seg.content} onImplement={onImplement} />;
       })}
+      {/* After generation: show compact file chips instead of full code blocks */}
+      {hideCode && codeSegments.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 pt-1">
+          {codeSegments.map((seg, i) => {
+            const langColor: Record<string, string> = {
+              tsx: 'text-cyan-400/70 bg-cyan-400/8 border-cyan-500/20',
+              ts: 'text-blue-400/70 bg-blue-400/8 border-blue-500/20',
+              css: 'text-pink-400/70 bg-pink-400/8 border-pink-500/20',
+              json: 'text-orange-400/70 bg-orange-400/8 border-orange-500/20',
+            };
+            const color = langColor[seg.lang.toLowerCase()] ?? 'text-zinc-500 bg-zinc-800/60 border-zinc-700/40';
+            return (
+              <span key={i} className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[10px] font-mono ${color}`}>
+                <svg className="w-2.5 h-2.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                {seg.filename || seg.lang}
+              </span>
+            );
+          })}
+        </div>
+      )}
       {/* Blinking cursor at the end while streaming */}
       {isStreaming && segments.length > 0 && segments[segments.length - 1].type === 'text' && (
         <span className="inline-block w-0.5 h-4 bg-indigo-400 ml-0.5 animate-pulse align-middle" />
@@ -1225,21 +1438,165 @@ function MarkdownContent({ content, isStreaming }: { content: string; isStreamin
   );
 }
 
-function TextBlock({ text }: { text: string }) {
+/** Render inline markdown: **bold**, *italic*, _italic_, `code` */
+function renderInline(text: string): React.ReactNode[] {
+  return text.split(/(\*\*[^*]+\*\*|\*[^*]+\*|_[^_]+_|`[^`]+`)/g).map((seg, i) => {
+    if (seg.startsWith('**') && seg.endsWith('**') && seg.length > 4)
+      return <strong key={i} className="text-zinc-100 font-semibold">{seg.slice(2, -2)}</strong>;
+    if (seg.startsWith('*') && seg.endsWith('*') && seg.length > 2)
+      return <span key={i}>{seg.slice(1, -1)}</span>;
+    if (seg.startsWith('_') && seg.endsWith('_') && seg.length > 2)
+      return <em key={i} className="italic text-zinc-300">{seg.slice(1, -1)}</em>;
+    if (seg.startsWith('`') && seg.endsWith('`') && seg.length > 2)
+      return <code key={i} className="px-1.5 py-0.5 rounded bg-zinc-800 text-indigo-300 font-mono text-xs">{seg.slice(1, -1)}</code>;
+    return seg;
+  });
+}
+
+function TextBlock({ text, onImplement }: { text: string; onImplement?: (text: string) => void }) {
   if (!text.trim()) return null;
-  return (
-    <div className="whitespace-pre-wrap text-zinc-300 leading-relaxed">
-      {text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).map((seg, i) => {
-        if (seg.startsWith('**') && seg.endsWith('**')) {
-          return <strong key={i} className="text-zinc-100 font-semibold">{seg.slice(2, -2)}</strong>;
-        }
-        if (seg.startsWith('`') && seg.endsWith('`') && seg.length > 2) {
-          return <code key={i} className="px-1.5 py-0.5 rounded bg-zinc-800 text-indigo-300 font-mono text-xs">{seg.slice(1, -1)}</code>;
-        }
-        return seg;
-      })}
-    </div>
-  );
+
+  const lines = text.split('\n');
+  const elements: React.ReactNode[] = [];
+  let idx = 0;
+
+  while (idx < lines.length) {
+    const line = lines[idx];
+
+    // Horizontal rule
+    if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line.trim())) {
+      elements.push(<hr key={idx} className="border-zinc-700/60 my-3" />);
+      idx++;
+      continue;
+    }
+
+    // Headings
+    const h3 = line.match(/^### (.+)/);
+    const h2 = line.match(/^## (.+)/);
+    const h1 = line.match(/^# (.+)/);
+    if (h3) {
+      elements.push(
+        <p key={idx} className="text-zinc-100 font-semibold text-[13px] mt-3 mb-1 first:mt-0">
+          {renderInline(h3[1])}
+        </p>
+      );
+      idx++; continue;
+    }
+    if (h2) {
+      elements.push(
+        <p key={idx} className="text-zinc-100 font-semibold text-sm mt-4 mb-1.5 first:mt-0">
+          {renderInline(h2[1])}
+        </p>
+      );
+      idx++; continue;
+    }
+    if (h1) {
+      elements.push(
+        <p key={idx} className="text-zinc-100 font-bold text-base mt-4 mb-2 first:mt-0">
+          {renderInline(h1[1])}
+        </p>
+      );
+      idx++; continue;
+    }
+
+    // Unordered list — collect consecutive items
+    if (/^[*-] /.test(line)) {
+      const items: string[] = [];
+      while (idx < lines.length && /^[*-] /.test(lines[idx])) {
+        items.push(lines[idx].slice(2));
+        idx++;
+      }
+      elements.push(
+        <ul key={`ul-${idx}`} className="space-y-1 my-1.5">
+          {items.map((item, j) => {
+            // Strip markdown bold/inline for the plain implement text
+            const plainItem = item.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/\*([^*]+)\*/g, '$1').replace(/_([^_]+)_/g, '$1').replace(/`([^`]+)`/g, '$1').replace(/^["'"']|["'"']$/g, '').trim();
+            return (
+              <li key={j} className="flex items-start gap-2 text-zinc-300 leading-relaxed">
+                <span className="text-indigo-400 shrink-0 mt-px">•</span>
+                <span className="flex-1">{renderInline(item)}</span>
+                {onImplement && (
+                  <button
+                    onClick={() => onImplement(plainItem)}
+                    title="Build this feature"
+                    className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-indigo-400 hover:text-white hover:bg-indigo-600 border border-indigo-500/30 hover:border-indigo-500 shrink-0 font-medium transition-colors"
+                  >
+                    <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+                    </svg>
+                    Build
+                  </button>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      );
+      continue;
+    }
+
+    // Ordered list — collect consecutive items
+    if (/^\d+\.\s/.test(line)) {
+      const items: string[] = [];
+      let num = 1;
+      while (idx < lines.length && /^\d+\.\s/.test(lines[idx])) {
+        items.push(lines[idx].replace(/^\d+\.\s/, ''));
+        idx++;
+      }
+      elements.push(
+        <ol key={`ol-${idx}`} className="space-y-1 my-1.5">
+          {items.map((item, j) => {
+            const plainItem = item.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/_([^_]+)_/g, '$1').replace(/`([^`]+)`/g, '$1').split(' — ')[0];
+            return (
+              <li key={j} className="flex items-start gap-2 text-zinc-300 leading-relaxed">
+                <span className="text-indigo-400 font-mono text-xs shrink-0 w-4 text-right mt-0.5">{num++}.</span>
+                <span className="flex-1">{renderInline(item)}</span>
+                {onImplement && (
+                  <button
+                    onClick={() => onImplement(plainItem)}
+                    title="Build this feature"
+                    className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-indigo-400 hover:text-white hover:bg-indigo-600 border border-indigo-500/30 hover:border-indigo-500 shrink-0 font-medium transition-colors"
+                  >
+                    <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+                    </svg>
+                    Build
+                  </button>
+                )}
+              </li>
+            );
+          })}
+        </ol>
+      );
+      continue;
+    }
+
+    // Blockquote
+    if (line.startsWith('> ')) {
+      elements.push(
+        <blockquote key={idx} className="border-l-2 border-indigo-500/40 pl-3 text-zinc-400 italic my-1">
+          {renderInline(line.slice(2))}
+        </blockquote>
+      );
+      idx++; continue;
+    }
+
+    // Empty line — small spacer
+    if (!line.trim()) {
+      elements.push(<div key={idx} className="h-1.5" />);
+      idx++; continue;
+    }
+
+    // Regular paragraph
+    elements.push(
+      <p key={idx} className="text-zinc-300 leading-relaxed">
+        {renderInline(line)}
+      </p>
+    );
+    idx++;
+  }
+
+  return <div className="space-y-0.5">{elements}</div>;
 }
 
 const LANG_COLORS: Record<string, string> = {
@@ -1343,18 +1700,21 @@ function CodeBlock({
 
 function TypingIndicator() {
   return (
-    <div className="flex gap-1 items-center py-1">
-      {[0, 1, 2].map((i) => (
-        <div
-          key={i}
-          className="w-1.5 h-1.5 rounded-full bg-zinc-500"
-          style={{ animation: `bounce 1.2s ease-in-out ${i * 0.2}s infinite` }}
-        />
-      ))}
+    <div className="flex items-center gap-2 py-1">
+      <span className="text-xs text-indigo-400 font-medium">Thinking</span>
+      <div className="flex gap-1 items-center">
+        {[0, 1, 2].map((i) => (
+          <div
+            key={i}
+            className="w-1.5 h-1.5 rounded-full bg-indigo-400"
+            style={{ animation: `thinkBounce 1.2s ease-in-out ${i * 0.18}s infinite` }}
+          />
+        ))}
+      </div>
       <style>{`
-        @keyframes bounce {
-          0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
-          30% { transform: translateY(-4px); opacity: 1; }
+        @keyframes thinkBounce {
+          0%, 60%, 100% { transform: translateY(0); opacity: 0.3; }
+          30% { transform: translateY(-5px); opacity: 1; }
         }
       `}</style>
     </div>
@@ -1388,8 +1748,9 @@ const STAGE_DISPLAY: Record<string, string> = {
 
 const MODEL_SHORT: Record<string, string> = {
   'gpt-4o':            'GPT-4o',
+  'claude-opus-4-6':   'Claude Opus',
   'claude-sonnet-4-6': 'Claude',
-  'gemini-2.0-flash':  'Gemini',
+  'gemini-2.5-flash':  'Gemini',
 };
 
 function StagePill({ stage }: { stage: PipelineStageInfo }) {
@@ -1509,7 +1870,7 @@ const MODELS: { id: ModelId; label: string; role: string; activeClass: string; d
     dotClass: 'bg-indigo-400',
   },
   {
-    id: 'gemini-2.0-flash',
+    id: 'gemini-2.5-flash',
     label: 'Gemini',
     role: 'Fast Experiments',
     activeClass: 'border-sky-500/60 text-sky-300 bg-sky-600/20',

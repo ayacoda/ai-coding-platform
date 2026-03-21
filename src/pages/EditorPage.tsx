@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useStore } from '../store/useStore';
 import { supabase } from '../lib/supabase';
 import type { DbProject } from '../lib/supabase';
-import { cancelGeneration } from '../lib/chat';
+import { cancelGeneration, sanitizeGeneratedFiles } from '../lib/chat';
 import type { Message } from '../types';
 import Header from '../components/Header';
 import ChatPanel from '../components/ChatPanel';
@@ -127,15 +127,38 @@ export default function EditorPage() {
     }
 
     const project = data as DbProject;
+
+    // If a supabase project has no project_config (newly created), generate one immediately
+    // and persist it so the AI always gets a real schema name instead of 'proj_default'.
+    let resolvedConfig = project.project_config as typeof projectConfig;
+    if (!resolvedConfig && project.storage_mode === 'supabase') {
+      const hex = Math.random().toString(16).slice(2, 10);
+      const newId = `p_${hex}`;
+      resolvedConfig = { id: newId, storageMode: 'supabase' } as typeof projectConfig;
+      // Persist immediately — fire-and-forget, non-blocking
+      supabase
+        .from('projects')
+        .update({ project_config: resolvedConfig })
+        .eq('id', id)
+        .then(() => console.log('[editor] auto-provisioned project_config:', newId));
+      // Also notify the Supabase backend to provision the schema
+      fetch('/api/provision/supabase', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId: newId }),
+      }).catch(() => {});
+    }
+
     setProjectMeta({
       projectId: id,
       projectName: project.name,
       storageMode: project.storage_mode as 'localstorage' | 'supabase',
-      projectConfig: project.project_config as typeof projectConfig,
+      projectConfig: resolvedConfig,
     });
 
     if (project.files && Object.keys(project.files).length > 0) {
-      setFiles(project.files, true);
+      const sanitized = sanitizeGeneratedFiles(project.files as Record<string, string>);
+      setFiles(sanitized, true);
     } else {
       setFiles({}, true);
     }

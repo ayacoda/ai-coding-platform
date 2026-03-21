@@ -26,7 +26,7 @@ interface Props {
 }
 
 export default function VersionHistoryPanel({ projectId, show, onClose, onRestored }: Props) {
-  const { setFiles } = useStore();
+  const { setFiles, setMessages } = useStore();
   const [versions, setVersions] = useState<ProjectVersion[]>([]);
   const [loading, setLoading] = useState(false);
   const [restoringId, setRestoringId] = useState<string | null>(null);
@@ -52,11 +52,40 @@ export default function VersionHistoryPanel({ projectId, show, onClose, onRestor
     // 1. Set files directly in the store (instant, no AI involved)
     setFiles(version.files, true);
 
-    // 2. Immediately persist restored files to the projects table
-    //    Don't rely on EditorPage's 1.5s auto-save debounce
+    // 2. Trim chat messages to the point this version was created.
+    //    version.label = first 80 chars of the user prompt that triggered this snapshot.
+    //    Walk the messages array backwards to find that user message, then keep only
+    //    messages up to and including the assistant response that followed it.
+    const { messages: currentMessages } = useStore.getState();
+    let trimmedMessages = currentMessages;
+
+    if (version.label && currentMessages.length > 0) {
+      const label80 = version.label.slice(0, 80);
+      let matchIdx = -1;
+      for (let i = currentMessages.length - 1; i >= 0; i--) {
+        const m = currentMessages[i];
+        if (m.role === 'user' && m.content.slice(0, 80) === label80) {
+          matchIdx = i;
+          break;
+        }
+      }
+      if (matchIdx !== -1) {
+        // Keep up to the user message + its immediate assistant response
+        const keepCount = Math.min(matchIdx + 2, currentMessages.length);
+        trimmedMessages = currentMessages.slice(0, keepCount);
+      }
+    }
+
+    setMessages(trimmedMessages);
+
+    // 3. Immediately persist restored files + trimmed messages to the projects table
     await supabase
       .from('projects')
-      .update({ files: version.files, updated_at: new Date().toISOString() })
+      .update({
+        files: version.files,
+        messages: trimmedMessages,
+        updated_at: new Date().toISOString(),
+      })
       .eq('id', projectId);
 
     setRestoringId(null);

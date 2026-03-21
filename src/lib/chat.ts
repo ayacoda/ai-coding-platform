@@ -9,34 +9,102 @@ export function genId() {
   return `msg_${Date.now()}_${++idCounter}`;
 }
 
-/** Extract the app name from generated files (sidebar brand text or APP_NAME constant). */
-function extractAppName(files: Record<string, string>): string | null {
-  // 1. App.tsx — sidebar brand span with tracking-tight class
-  const appTsx = files['App.tsx'] || '';
-  const sidebarBrand = appTsx.match(/tracking-tight[^>]*>\s*([A-Za-z][^<]{1,40}?)\s*<\/span>/);
-  if (sidebarBrand?.[1]) {
-    const name = sidebarBrand[1].trim();
-    if (name.length >= 2 && name.length <= 40 && !name.includes('{')) return name;
+/**
+ * Post-generation sanitizer — runs deterministically after files are parsed.
+ *
+ * Problems fixed:
+ *  1. Interface-as-component crash: "interface Project" + "<Project />" → crashes because
+ *     TypeScript interfaces are erased at runtime. Auto-renames the JSX usages to ProjectCard.
+ *  2. Ensures no two component files export the same function name (shadow guard).
+ */
+export function sanitizeGeneratedFiles(
+  files: Record<string, string>,
+  contextFiles: Record<string, string> = {}
+): Record<string, string> {
+  // Use full context (existing + new files) for collision detection.
+  // For surgical fixes, 'files' may only be 1-2 changed files while
+  // 'contextFiles' holds the rest (e.g. types.ts with "interface Project").
+  const allCode = Object.values({ ...contextFiles, ...files }).join('\n');
+
+  // ── 1. Collect all interface/type names (PascalCase) ────────────────────────
+  const interfaceNames = new Set<string>();
+  const ifaceRe = /\binterface\s+([A-Z][A-Za-z0-9]*)\b|\btype\s+([A-Z][A-Za-z0-9]*)\s*[={<(]/g;
+  let m: RegExpExecArray | null;
+  while ((m = ifaceRe.exec(allCode)) !== null) {
+    interfaceNames.add(m[1] ?? m[2]);
   }
 
-  // 2. constants.ts — APP_NAME / appName constant
-  const constants = files['constants.ts'] || '';
-  const constMatch = constants.match(/(?:APP_NAME|appName|app_name)\s*[=:]\s*['"`]([^'"`]+)['"`]/i);
-  if (constMatch?.[1]) return constMatch[1].trim();
-
-  // 3. data.ts — explicit brand-name constants only (avoid generic 'name' fields in records)
-  const dataTsContent = files['data.ts'] || '';
-  const dataMatch = dataTsContent.match(/(?:SITE_NAME|siteName|brandName|companyName|COMPANY_NAME|APP_NAME|appName)\s*[=:]\s*['"`]([^'"`]{2,50})['"`]/i);
-  if (dataMatch?.[1]) return dataMatch[1].trim();
-
-  const spans = [...appTsx.matchAll(/>([A-Z][a-zA-Z][a-zA-Z\s]{1,24})</g)];
-  for (const m of spans) {
-    const text = m[1].trim();
-    if (text.split(' ').length <= 3 && !text.includes('{') && text.length >= 3) return text;
+  // ── 2. Find collisions: interface name also used as a JSX tag with no component impl ──
+  // Strategy: rename the INTERFACE to NameData everywhere, then inject a stub component
+  // so the JSX <Name /> never crashes at runtime.
+  const collisions = new Set<string>();
+  const implRe = (n: string) =>
+    new RegExp(`(function\\s+${n}[\\s(<]|const\\s+${n}[\\s:=]|class\\s+${n}[\\s{(])`);
+  for (const name of interfaceNames) {
+    const usedAsJSX = new RegExp(`<${name}[\\s/>]`).test(allCode) ||
+      new RegExp(`createElement\\(${name}[,\\s)]`).test(allCode);
+    if (!usedAsJSX) continue;
+    // A real component impl: function Name( | const Name = | class Name
+    const hasImpl = implRe(name).test(allCode);
+    if (hasImpl) continue;
+    // Interface used as JSX with no component impl — add to collisions list.
+    collisions.add(name);
   }
 
-  return null;
+  if (collisions.size === 0) return files;
+
+  console.log('[sanitize] fixing interface-as-component collisions:', [...collisions].join(', '));
+
+  // ── 3. For each collision: rename the interface declaration and inject a stub component ──
+  const allFiles = { ...contextFiles, ...files };
+  const result: Record<string, string> = { ...files }; // always preserve AI-returned files
+
+  for (const name of collisions) {
+    const dataName = `${name}Data`;
+
+    // a) Rename interface/type declarations and type annotations across all files
+    for (const [fname, code] of Object.entries(allFiles)) {
+      let c = code;
+      // Rename interface/type declarations
+      c = c.replace(new RegExp(`\\binterface\\s+${name}\\b`, 'g'), `interface ${dataName}`);
+      c = c.replace(new RegExp(`\\btype\\s+${name}\\b`, 'g'), `type ${dataName}`);
+      // Rename type annotations: ': Name', ': Name[]', ': Name |'
+      // Cosmetic (TypeScript erases types at runtime) but reduces TS warnings.
+      // Fixed-width patterns only — variable-length lookbehinds are unsupported in Firefox/Safari.
+      c = c.replace(new RegExp(`(:\\s*)\\b${name}\\b`, 'g'), `$1${dataName}`);
+      c = c.replace(new RegExp(`\\b${name}(?=\\s*[\\[|&])`, 'g'), dataName);
+      if (c !== code) {
+        result[fname] = c;
+      }
+    }
+
+    // b) Inject a stub component function into App.tsx (or the first file that uses the JSX)
+    //    so <Name /> never crashes at runtime. The stub renders a visible placeholder.
+    const stubFn =
+      `\n// Auto-stub: '${name}' was a TypeScript interface used as JSX — stub renders a placeholder\n` +
+      `function ${name}(props: any) {\n` +
+      `  return React.createElement('div', {\n` +
+      `    style: { color: '#f87171', border: '1px dashed #ef4444', padding: '4px 8px',\n` +
+      `             borderRadius: 4, fontSize: 12, fontFamily: 'monospace', display: 'inline-block' }\n` +
+      `  }, '[stub: ${name}]');\n` +
+      `}\n`;
+
+    // Find the file that uses <Name /> JSX — prefer App.tsx, then any file with the JSX
+    // Use merged view: result has updated versions; fall back to allFiles for unmodified context files
+    const mergedView = { ...allFiles, ...result };
+    const jsxFileEntry = Object.entries(mergedView).find(([fname, code]) =>
+      fname === 'App.tsx' || new RegExp(`<${name}[\\s/>]`).test(code)
+    );
+    if (jsxFileEntry) {
+      const [jsxFile, jsxCode] = jsxFileEntry;
+      result[jsxFile] = stubFn + jsxCode;
+    }
+  }
+
+  return result;
 }
+
+/** Extract the app name from generated files (sidebar brand text or APP_NAME constant). */
 
 // Module-level abort controller — one generation at a time
 let currentAbortController: AbortController | null = null;
@@ -49,11 +117,91 @@ export function cancelGeneration(suppressRevert = false) {
 }
 
 /**
+ * Called when the main generation stream ends without an App.tsx (token exhaustion).
+ * Fires a silent follow-up to /api/chat asking Claude to complete the missing files.
+ * Parsed files are merged into the store — no pipeline UI, no new chat messages.
+ */
+async function triggerCompletionContinuation(
+  missingFiles: string[],
+  currentFiles: Record<string, string>
+): Promise<void> {
+  const { setFiles, updateLastAssistantMessage, messages } = useStore.getState();
+
+  // Abbreviated context: just filenames + first 300 chars of each file
+  const fileContext = Object.entries(currentFiles)
+    .map(([name, code]) =>
+      `\`\`\`tsx ${name}\n${code.slice(0, 300)}${code.length > 300 ? '\n// ...' : ''}\n\`\`\``
+    )
+    .join('\n\n');
+
+  const prompt =
+    `The app generation was cut short before completing. These files are still MISSING:\n` +
+    missingFiles.map(f => `• ${f}`).join('\n') +
+    `\n\nFiles already generated (abbreviated):\n${fileContext}\n\n` +
+    `Complete the build now — output EACH missing file as a full, complete code block. ` +
+    `App.tsx is the most critical — output it last after all components and pages.`;
+
+  try {
+    const response = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: prompt }],
+        model: 'claude-opus-4-6',
+      }),
+    });
+    if (!response.ok) {
+      console.warn('[chat] completion continuation: server error', response.status);
+      return;
+    }
+
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let fullContent = '';
+    let buffer = '';
+
+    // Stream continuation — append text to the existing last assistant message
+    const lastMsg = messages[messages.length - 1];
+    const baseContent = lastMsg?.role === 'assistant' ? (lastMsg.content ?? '') : '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') break;
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.text) {
+            fullContent += parsed.text;
+            // Append continuation text to the existing message so user sees progress
+            updateLastAssistantMessage(baseContent + '\n\n---\n*Completing remaining files…*\n\n' + fullContent);
+          }
+        } catch { /* ignore parse errors */ }
+      }
+    }
+
+    const continuationFiles = parseFilesFromResponse(fullContent);
+    console.log('[chat] continuation files:', Object.keys(continuationFiles));
+    if (Object.keys(continuationFiles).length > 0) {
+      const sanitized = sanitizeGeneratedFiles(continuationFiles, currentFiles);
+      setFiles(sanitized);
+    }
+  } catch (e) {
+    console.warn('[chat] completion continuation failed:', e);
+  }
+}
+
+/**
  * Picks the best model for repair (surgical fix) scenarios.
  * Claude is best at careful, targeted fixes.
  */
 function pickRepairModel(isAutoMode: boolean, selectedModel: ModelId): ModelId {
-  return isAutoMode ? 'claude-sonnet-4-6' : selectedModel;
+  return isAutoMode ? 'claude-opus-4-6' : selectedModel;
 }
 
 /**
@@ -86,12 +234,21 @@ export async function sendAskMessage(userInput: string, attachments?: ChatAttach
   currentAbortController = new AbortController();
   const { signal } = currentAbortController;
 
-  // Build history (exclude welcome message, exclude the empty assistant placeholder)
-  const history = useStore
+  // Build history — exclude welcome, skip empty-content messages (e.g. from previous errors),
+  // and deduplicate consecutive same-role messages (keep the last of each run) so the API
+  // always receives a valid alternating user/assistant sequence.
+  const rawHistory = useStore
     .getState()
     .messages.slice(0, -1)
-    .filter((m) => m.id !== 'welcome')
-    .map((m) => ({ role: m.role, content: m.content }));
+    .filter((m) => m.id !== 'welcome' && m.content.trim() !== '')
+    .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+
+  const history: typeof rawHistory = [];
+  for (let i = 0; i < rawHistory.length; i++) {
+    // If the next message has the same role, skip this one (keep last in consecutive run)
+    if (rawHistory[i + 1]?.role === rawHistory[i].role) continue;
+    history.push(rawHistory[i]);
+  }
 
   try {
     const { storageMode, projectConfig } = useStore.getState();
@@ -169,6 +326,8 @@ export async function sendChatMessage(
     displayContent?: string;
     /** File/image attachments to include with this message. */
     attachments?: ChatAttachment[];
+    /** Force a specific model for this request (bypasses auto-mode, used for repair escalation). */
+    overrideModel?: string;
   }
 ) {
   const store = useStore.getState();
@@ -233,6 +392,7 @@ export async function sendChatMessage(
     content: '',
     isStreaming: true,
     pipeline: isRepair ? undefined : { stages: [] },
+    isRepairMessage: isRepair ? true : undefined,
   });
 
   setIsGenerating(true);
@@ -246,18 +406,25 @@ export async function sendChatMessage(
   if (isRepair) {
     history = [{ role: 'user', content: userContent, ...(images ? { images } : {}) }];
   } else {
-    // Build from store messages (slice off the empty assistant placeholder we just added)
-    const storeHistory = useStore
+    // Build from store messages — skip empty-content messages and deduplicate consecutive
+    // same-role entries so the API always receives a valid alternating sequence.
+    const raw = useStore
       .getState()
       .messages.slice(0, -1)
-      .filter((m) => m.id !== 'welcome')
+      .filter((m) => m.id !== 'welcome' && m.content.trim() !== '')
       .map((m): HistoryMsg => ({ role: m.role, content: m.content }));
 
+    const deduped: HistoryMsg[] = [];
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i + 1]?.role === raw[i].role) continue;
+      deduped.push(raw[i]);
+    }
+
     // Replace the last message (current user message) with full content + images
-    if (storeHistory.length > 0) {
-      const last = { ...storeHistory[storeHistory.length - 1], content: userContent };
+    if (deduped.length > 0) {
+      const last = { ...deduped[deduped.length - 1], content: userContent };
       if (images) (last as HistoryMsg).images = images;
-      history = [...storeHistory.slice(0, -1), last];
+      history = [...deduped.slice(0, -1), last];
     } else {
       history = [{ role: 'user', content: userContent, ...(images ? { images } : {}) }];
     }
@@ -268,9 +435,9 @@ export async function sendChatMessage(
     let body: Record<string, unknown>;
 
     if (isRepair) {
-      const repairModel = pickRepairModel(isAutoMode, selectedModel);
+      const repairModel = options?.overrideModel ?? pickRepairModel(isAutoMode, selectedModel);
       endpoint = '/api/chat';
-      body = { messages: history, model: repairModel, storageMode, projectConfig, currentFiles: useStore.getState().files };
+      body = { messages: history, model: repairModel, storageMode, projectConfig, currentFiles: useStore.getState().files, isRepairMode: true };
     } else {
       endpoint = '/api/build';
       body = {
@@ -309,6 +476,7 @@ export async function sendChatMessage(
     let buffer = '';
 
     let pipelineState: Message['pipeline'] = isRepair ? undefined : { stages: [] };
+    let capturedManifest: string[] | null = null;
 
     function updatePipeline(update: Partial<NonNullable<Message['pipeline']>>) {
       if (!pipelineState) return;
@@ -372,6 +540,15 @@ export async function sendChatMessage(
                   updateStage('planning', 'done');
                 }
                 updatePipeline({ plan: parsed.plan });
+                // Rename project using plan title (most reliable path — plan always arrives for new_app)
+                if (parsed.plan?.title && pipelineState?.requestType === 'new_app') {
+                  const { currentProjectId, setCurrentProjectName } = useStore.getState();
+                  if (currentProjectId) {
+                    setCurrentProjectName(parsed.plan.title as string);
+                    supabase.from('projects').update({ name: parsed.plan.title }).eq('id', currentProjectId)
+                      .then(({ error }) => { if (error) console.warn('[chat] rename (plan) failed:', error.message); });
+                  }
+                }
                 break;
               }
               case 'generating': {
@@ -387,6 +564,12 @@ export async function sendChatMessage(
               case 'polishing': {
                 updateStage('generating', 'done');
                 updateStage('polishing', 'running');
+                break;
+              }
+              case 'manifest': {
+                // Server-derived list of files the generator must produce.
+                // Stored so we can detect truncation after the stream ends.
+                capturedManifest = parsed.files as string[];
                 break;
               }
             }
@@ -408,23 +591,50 @@ export async function sendChatMessage(
       });
     }
 
-    const newFiles = parseFilesFromResponse(fullContent);
+    const rawFiles = parseFilesFromResponse(fullContent);
+    // Pass existing files as context so collision detection works for surgical fixes
+    // (e.g. interface Project in types.ts seen even when only App.tsx was returned).
+    const existingFiles = useStore.getState().files;
+    const newFiles = sanitizeGeneratedFiles(rawFiles, existingFiles);
     console.log('[chat] parsed files:', Object.keys(newFiles), '| content length:', fullContent.length);
-    if (Object.keys(newFiles).length > 0) {
+
+    // Truncation detection: if this was a new_app, we got some files but App.tsx is absent,
+    // the model hit the token limit before finishing. Auto-trigger a completion continuation.
+    const isNewApp = pipelineState?.requestType === 'new_app';
+    const hasSomeFiles = Object.keys(rawFiles).length > 2;
+    const isTruncated = !isRepair && isNewApp && hasSomeFiles && !rawFiles['App.tsx'];
+    if (isTruncated) {
+      console.warn('[chat] App.tsx missing — token limit hit, firing completion continuation');
+      // Flush partial files first so user sees progress
+      if (Object.keys(newFiles).length > 0) {
+        setFiles(newFiles);
+        setRightPanel('preview');
+      }
+      const allFilesNow = { ...existingFiles, ...newFiles };
+      const missingFiles = (capturedManifest ?? ['App.tsx']).filter(f => !rawFiles[f]);
+      await triggerCompletionContinuation(missingFiles, allFilesNow);
+    } else if (Object.keys(newFiles).length > 0) {
       setFiles(newFiles);
       setRightPanel('preview');
 
-      // Auto-rename project on first generation (when project had no files before)
-      const wasNewApp = Object.keys(filesSnapshot).length === 0;
-      if (wasNewApp) {
-        const { currentProjectId, setCurrentProjectName } = useStore.getState();
-        const generatedName = extractAppName(newFiles);
-        if (generatedName && currentProjectId) {
-          setCurrentProjectName(generatedName); // update UI immediately
-          supabase.from('projects').update({ name: generatedName }).eq('id', currentProjectId)
-            .then(({ error }) => { if (error) console.warn('[chat] rename failed:', error.message); });
+      // Fallback rename: if this was a new_app and the plan rename didn't fire (e.g. planner JSON
+      // parse failed), extract a title from the generated files' <title> tag or document.title call.
+      if (!isRepair) {
+        const { currentProjectId, currentProjectName, setCurrentProjectName } = useStore.getState();
+        if (currentProjectId && (!currentProjectName || currentProjectName === 'Untitled Project')) {
+          // Try <title>...</title> from index.html or App.tsx
+          const allCode = Object.values(newFiles).join('\n');
+          const titleMatch = allCode.match(/<title>([^<]{3,60})<\/title>/i)
+            ?? allCode.match(/document\.title\s*=\s*['"`]([^'"`]{3,60})['"`]/i);
+          if (titleMatch) {
+            const extracted = titleMatch[1].trim();
+            setCurrentProjectName(extracted);
+            supabase.from('projects').update({ name: extracted }).eq('id', currentProjectId)
+              .then(({ error }) => { if (error) console.warn('[chat] fallback rename failed:', error.message); });
+          }
         }
       }
+
 
       // Auto-apply schema.sql when storage mode is supabase
       if (storageMode === 'supabase' && newFiles['schema.sql']) {

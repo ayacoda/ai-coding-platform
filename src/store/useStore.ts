@@ -46,6 +46,7 @@ interface AppStore {
   setLastMessageError: (error: string) => void;
   clearMessages: () => void;
   setMessages: (messages: Message[]) => void;
+  clearVisibleMessages: () => void;
   updateLastAssistantPipeline: (pipeline: Message['pipeline']) => void;
   removeLastMessages: (count: number) => void;
 
@@ -99,6 +100,7 @@ interface AppStore {
   // API secrets for third-party integrations — stored in memory, injected into preview via window.ENV
   projectSecrets: Record<string, string>;
   setProjectSecret: (envName: string, value: string) => void;
+  removeProjectSecret: (envName: string) => void;
   clearProjectSecrets: () => void;
 }
 
@@ -156,6 +158,16 @@ export const useStore = create<AppStore>()(
         }),
       clearMessages: () => set({ messages: [WELCOME_MESSAGE], promptQueue: [], queuePaused: false }),
       setMessages: (messages) => set({ messages }),
+      // Hides all visible messages (preserves them as AI memory) and resets the welcome screen
+      clearVisibleMessages: () =>
+        set((state) => ({
+          messages: [
+            ...state.messages
+              .filter((m) => m.id !== 'welcome')
+              .map((m) => ({ ...m, hidden: true })),
+            { ...WELCOME_MESSAGE },
+          ],
+        })),
       removeLastMessages: (count) =>
         set((state) => ({ messages: state.messages.slice(0, -count) })),
       updateLastAssistantPipeline: (pipeline) =>
@@ -217,6 +229,12 @@ export const useStore = create<AppStore>()(
       projectSecrets: {},
       setProjectSecret: (envName, value) =>
         set((state) => ({ projectSecrets: { ...state.projectSecrets, [envName]: value } })),
+      removeProjectSecret: (envName) =>
+        set((state) => {
+          const next = { ...state.projectSecrets };
+          delete next[envName];
+          return { projectSecrets: next };
+        }),
       clearProjectSecrets: () => set({ projectSecrets: {} }),
     }),
     {

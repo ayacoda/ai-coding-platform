@@ -37,11 +37,15 @@ export interface Message {
   imageAttachments?: { dataUrl: string; name: string }[];
   isStreaming?: boolean;
   error?: string;
+  /** When true, hidden from the chat UI but still included in AI history as memory */
+  hidden?: boolean;
   pipeline?: {
     stages: PipelineStageInfo[];
     plan?: PipelinePlan;
     requestType?: 'new_app' | 'feature_add' | 'redesign' | 'bug_fix';
   };
+  /** True for auto-repair (error-fix) messages — code blocks should be hidden when done */
+  isRepairMessage?: boolean;
 }
 
 export interface QueueItem {
@@ -51,7 +55,7 @@ export interface QueueItem {
 
 export type RightPanelTab = 'code' | 'preview';
 
-export type ModelId = 'gpt-4o' | 'claude-sonnet-4-6' | 'gemini-2.0-flash';
+export type ModelId = 'gpt-4o' | 'claude-opus-4-6' | 'claude-sonnet-4-6' | 'gemini-2.5-flash';
 
 export type StorageMode = 'localstorage' | 'supabase';
 

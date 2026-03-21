@@ -113,35 +113,76 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 
 /**
  * Builds inline <script> tags for storage integration (Supabase or S3).
+ * Supabase CDN is ALWAYS loaded so window.db.auth works in every mode.
  */
 function buildStorageScripts(config?: PreviewConfig): string {
-  if (!config || config.storageMode === 'localstorage' || !config.storageMode) return '';
+  const projectId = config?.projectId;
+  const isSupabaseMode = config?.storageMode === 'supabase' && !!projectId;
 
-  if (config.storageMode === 'supabase') {
-    // projectId is required for schema isolation — never fall back to public
-    const projectId = config.projectId;
-    if (!projectId) return '';
-    return (
-      '  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"><\/script>\n' +
-      '  <script>\n' +
+  // Always inject Supabase so window.db.auth (authentication) works in every mode.
+  // In supabase mode: full client with project schema for data + auth.
+  // In localstorage mode: auth-only client (no schema restriction).
+  const clientInit = isSupabaseMode
+    ? (
       '    window.db = window.supabase.createClient(\n' +
       '      "' + SUPABASE_URL + '",\n' +
       '      "' + SUPABASE_ANON_KEY + '",\n' +
       '      { db: { schema: "' + projectId + '" } }\n' +
-      '    );\n' +
-      // window.uploadFile helper — uploads to Supabase Storage and returns a public URL
+      '    );\n'
+    )
+    : (
+      '    // Auth-only client — data storage uses localStorage in this mode\n' +
+      '    window.db = window.supabase.createClient("' + SUPABASE_URL + '", "' + SUPABASE_ANON_KEY + '");\n'
+    );
+
+  const uploadHelper = isSupabaseMode
+    ? (
       '    window.uploadFile = async function(file) {\n' +
       '      var path = "' + projectId + '/" + Date.now() + "_" + file.name;\n' +
       '      var result = await window.db.storage.from("uploads").upload(path, file, { upsert: true });\n' +
       '      if (result.error) throw new Error(result.error.message);\n' +
       '      return window.db.storage.from("uploads").getPublicUrl(result.data.path).data.publicUrl;\n' +
       '    };\n' +
-      '    console.log("[Supabase] window.db + window.uploadFile ready for project: ' + projectId + '");\n' +
-      '  <\/script>\n'
+      '    console.log("[Supabase] window.db + window.uploadFile ready for project: ' + projectId + '");\n'
+    )
+    : (
+      '    console.log("[Supabase] window.db ready (auth mode)");\n'
     );
-  }
 
-  return '';
+  // Shims so AI-generated code that imports supabase helpers still works.
+  // import { createClient } from '@supabase/supabase-js' → stripped → createClient undefined
+  // These globals intercept the call and return the pre-configured window.db.
+  const shims =
+    '    // Shims: AI code that calls createClient() or references supabase directly\n' +
+    '    window.createClient = function(url, key, opts) {\n' +
+    '      // Return pre-configured client (schema already set); ignore args to avoid wrong schema\n' +
+    '      if (opts && opts.db && opts.db.schema && opts.db.schema !== "' + (projectId || '') + '") {\n' +
+    '        return window.supabase.createClient(url || "' + SUPABASE_URL + '", key || "' + SUPABASE_ANON_KEY + '", opts);\n' +
+    '      }\n' +
+    '      return window.db;\n' +
+    '    };\n' +
+    '    // Expose supabase as an alias so "const { data } = await supabase.from(...)" works\n' +
+    '    if (typeof supabase === "undefined") { window.supabaseClient = window.db; }\n' +
+    '    // Expose URL/key constants in case AI-generated code references them\n' +
+    '    window.SUPABASE_URL = "' + SUPABASE_URL + '";\n' +
+    '    window.SUPABASE_ANON_KEY = "' + SUPABASE_ANON_KEY + '";\n' +
+    // PROACTIVE ALIAS: if AI uses the project schema name as a bare JS variable (e.g. p_48711bbc.from(...)),
+    // this makes it work by aliasing it to window.db (which is already scoped to that schema).
+    // This runs BEFORE any user code so the variable is always defined — no crash, no retry needed.
+    (isSupabaseMode && projectId
+      ? '    // Schema name alias — prevents "p_xxxxx is not defined" if AI uses schema name as JS var\n' +
+        '    window["' + projectId + '"] = window.db;\n' +
+        '    window["proj_default"] = window.db;\n'
+      : '    window["proj_default"] = window.db;\n');
+
+  return (
+    '  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"><\/script>\n' +
+    '  <script>\n' +
+    clientInit +
+    uploadHelper +
+    shims +
+    '  <\/script>\n'
+  );
 }
 
 /**
@@ -168,12 +209,68 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
   // Sort: root .ts files first (types/data/utils), then by depth, App.tsx last
   entries.sort(([a], [b]) => sortKey(a).localeCompare(sortKey(b)));
 
-  const transformedCode = entries
+  let transformedCode = entries
     .map(([, code]) => transformCode(code))
     .join('\n\n');
 
+  // ── Interface-as-component guard ─────────────────────────────────────────
+  // The AI sometimes names a TypeScript interface the same as a JSX component.
+  // Interfaces are erased at runtime → "X is not defined" crash.
+  // For each interface/type name that appears as a JSX tag but has NO function/class
+  // definition with that name, inject a visible error stub so it never hard-crashes.
+  {
+    const ifaceNames = new Set<string>();
+    const ifaceRe = /\binterface\s+([A-Z]\w*)\b|\btype\s+([A-Z]\w*)\s*[={<]/g;
+    let m: RegExpExecArray | null;
+    while ((m = ifaceRe.exec(transformedCode)) !== null) {
+      ifaceNames.add(m[1] ?? m[2]);
+    }
+    const stubs: string[] = [];
+    for (const name of ifaceNames) {
+      // Check for JSX usage OR direct createElement(Name, ...) call
+      const usedAsJSX = new RegExp(`<${name}[\\s/>]`).test(transformedCode) ||
+        new RegExp(`\\bcreateElement\\(${name}[,\\s)]`).test(transformedCode);
+      const hasImpl = new RegExp(`(function\\s+${name}[\\s(<]|const\\s+${name}[\\s:=]|class\\s+${name}[\\s{(])`).test(transformedCode);
+      if (usedAsJSX && !hasImpl) {
+        stubs.push(
+          `function ${name}(props: any) {` +
+          ` return React.createElement('div', {` +
+          ` style:{color:'#f87171',background:'#1c1917',border:'1px solid #ef4444',` +
+          ` borderRadius:'6px',padding:'8px 12px',fontSize:'12px',fontFamily:'monospace',margin:'4px'} },` +
+          ` '"${name}" is a TypeScript interface, not a component. Rename the component to ${name}Card.');` +
+          ` }`
+        );
+      }
+    }
+    if (stubs.length > 0) {
+      transformedCode = stubs.join('\n') + '\n\n' + transformedCode;
+    }
+  }
+
+  // ── Schema-name-as-variable guard ────────────────────────────────────────
+  // The AI sometimes uses the Supabase project schema name (e.g. "p_48711bbc") as a
+  // bare JavaScript identifier instead of a quoted string.  This is always a bug —
+  // but instead of crashing, we prepend `var p_xxx = window.db` declarations so the
+  // code runs correctly (window.db is already scoped to that schema).
+  // We scan the ACTUAL generated code so the alias always matches what was generated,
+  // regardless of any projectConfig/timing mismatch.
+  {
+    const schemaVarRe = /\b(p_[0-9a-f]{4,12}|proj_default)\b/g;
+    const schemaNames = new Set<string>();
+    let sm: RegExpExecArray | null;
+    while ((sm = schemaVarRe.exec(transformedCode)) !== null) {
+      schemaNames.add(sm[1]);
+    }
+    if (schemaNames.size > 0) {
+      const aliases = [...schemaNames]
+        .map((n) => `var ${n} = window.db; // auto-alias: schema name used as JS var`)
+        .join('\n');
+      transformedCode = aliases + '\n\n' + transformedCode;
+    }
+  }
+
   const escapedCode = escapeForScriptTag(transformedCode);
-  const storageScripts = buildStorageScripts(config);
+  const storageScripts = buildStorageScripts(config); // always injects Supabase for auth
 
   // Inject API secrets as window.ENV so generated code can access them
   const envScript =
@@ -290,21 +387,63 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '          \'    showError("No App component","Export a default function named App from App.tsx");\\n\' +\n' +
     '          \'  }\\n\' +\n' +
     '          \'})();\';\n' +
-    '        eval(result.outputText + renderCall);\n' +
+    // Shim CommonJS globals so the app doesn't crash if AI accidentally uses require/exports.
+    // Also shim Supabase helpers: if AI wrote `const db = createClient(...)`, createClient returns window.db.
+    '        var shim = "var exports = {}; var module = { exports: {} }; var require = function(m) {" +\n' +
+    '          "if (m === \'react\') return React;" +\n' +
+    '          "if (m === \'react-dom\') return ReactDOM;" +\n' +
+    '          "if (m === \'@supabase/supabase-js\') return { createClient: window.createClient };" +\n' +
+    '          "return {};" +\n' +
+    '          "};";\n' +
+    // Runtime auto-stub loop — handles any number of "X is not defined" errors:
+    //   • PascalCase (interface used as JSX component) → stub as visible error div
+    //   • p_xxxxx / proj_default (schema name as JS var) → alias to window.db
+    // Loops up to 20 times so ALL missing names in one code bundle are resolved before
+    // we give up and show a real error. This eliminates the auto-fixer loop entirely
+    // for these two error classes.
+    '        var evalCode = shim + result.outputText + renderCall;\n' +
+    '        var _autoStubsLeft = 20;\n' +
+    '        (function _run() {\n' +
+    '          try {\n' +
+    '            eval(evalCode);\n' +
+    '          } catch(e) {\n' +
+    '            var msg = e.message || String(e);\n' +
+    '            var schemaMatch = msg.match(/^\'?(p_[0-9a-f]{4,12}|proj_default)\'? is not defined/);\n' +
+    '            var componentMatch = !schemaMatch && msg.match(/^\'?([A-Z]\\w*)\'? is not defined/);\n' +
+    '            if (_autoStubsLeft > 0 && schemaMatch) {\n' +
+    '              _autoStubsLeft--;\n' +
+    '              window[schemaMatch[1]] = window.db;\n' +
+    '              console.warn("[preview] schema alias:", schemaMatch[1], "→ window.db");\n' +
+    '              _run();\n' +
+    '            } else if (_autoStubsLeft > 0 && componentMatch) {\n' +
+    '              _autoStubsLeft--;\n' +
+    '              var _n = componentMatch[1];\n' +
+    '              window[_n] = function(p) { return React.createElement("div", {\n' +
+    '                style:{color:"#f87171",border:"1px solid #ef4444",padding:"4px 8px",\n' +
+    '                       borderRadius:"4px",fontSize:"12px",fontFamily:"monospace",display:"inline-block",margin:"2px"}\n' +
+    '              }, "[missing component: " + _n + "]"); };\n' +
+    '              console.warn("[preview] stub:", _n);\n' +
+    '              _run();\n' +
+    '            } else {\n' +
+    '              if (msg.includes("Cannot read properties of null") || msg.includes("Cannot read properties of undefined")) {\n' +
+    '                msg += "\\n\\nHint: state was initialized as null/undefined. Use [] for arrays, {} for objects, or add a null check before accessing properties.";\n' +
+    '              } else if (msg.includes("is not a function")) {\n' +
+    '                msg += "\\n\\nHint: the value is not callable — it may be undefined (initialized too late) or a naming conflict with an injected React global.";\n' +
+    '              } else if (msg.includes("is not defined")) {\n' +
+    '                var _u = msg.split(" ")[0];\n' +
+    '                msg += "\\n\\nHint: \'" + _u + "\' is not in scope. Check file sort order or naming conflicts with React globals.";\n' +
+    '              } else if (msg.includes("Cannot access") && msg.includes("before initialization")) {\n' +
+    '                msg += "\\n\\nHint: a const/let is referenced before its file is evaluated. Move utility functions to utils/ and data to data.ts.";\n' +
+    '              } else if (msg.includes("Illegal return statement")) {\n' +
+    '                msg += "\\n\\nHint: a bare return statement exists outside any function at the top level of a file. The auto-fixer will scan all files and remove it.";\n' +
+    '              }\n' +
+    '              showError("Runtime Error", msg);\n' +
+    '            }\n' +
+    '          }\n' +
+    '        })();\n' +
     '      } catch(e) {\n' +
     '        var msg = e.message || String(e);\n' +
-    // Enrich common error messages with actionable hints
-    '        if (msg.includes("Cannot read properties of null") || msg.includes("Cannot read properties of undefined")) {\n' +
-    '          msg += "\\n\\nHint: state was initialized as null/undefined. Use [] for arrays, {} for objects, or add a null check before accessing properties.";\n' +
-    '        } else if (msg.includes("is not a function")) {\n' +
-    '          msg += "\\n\\nHint: the value is not callable — it may be undefined (initialized too late) or a naming conflict with an injected React global.";\n' +
-    '        } else if (msg.includes("is not defined")) {\n' +
-    '          var name = msg.split(" ")[0];\n' +
-    '          msg += "\\n\\nHint: \'" + name + "\' is not in scope. Check file sort order or naming conflicts with React globals.";\n' +
-    '        } else if (msg.includes("Cannot access") && msg.includes("before initialization")) {\n' +
-    '          msg += "\\n\\nHint: a const/let is referenced before its file is evaluated. Move utility functions to utils/ and data to data.ts.";\n' +
-    '        }\n' +
-    '        showError("Runtime Error", msg);\n' +
+    '        showError("Compile Error", msg);\n' +
     '      }\n' +
     '    });\n' +
     '  <\/script>\n' +

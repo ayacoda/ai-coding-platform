@@ -64,6 +64,12 @@ export default function StorageSelector() {
 
     const id = projectConfig?.id || genProjectId();
 
+    // Set projectConfig immediately (synchronously) so any chat message fired right after
+    // project load sees the correct schema ID — not null or 'proj_default'.
+    if (!projectConfig?.id) {
+      setProjectConfig({ id, storageMode: mode });
+    }
+
     try {
       if (mode === 'supabase') {
         await fetch('/api/provision/supabase', {
@@ -71,14 +77,12 @@ export default function StorageSelector() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ projectId: id }),
         }).catch(() => {});
-        setProjectConfig({ id, storageMode: mode });
       }
       setProvisionStatus('done');
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setProvisionError(msg);
       setProvisionStatus('error');
-      setProjectConfig({ id, storageMode: mode });
     }
   }
 

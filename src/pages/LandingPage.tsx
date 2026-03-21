@@ -66,7 +66,7 @@ export default function LandingPage() {
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
               </svg>
             </div>
-            <span className="font-semibold text-[14px] tracking-tight">Ayacoda</span>
+            <span className="font-semibold text-[14px] tracking-tight">AYACODA AI Studio</span>
           </div>
           <div className="flex items-center gap-3">
             {user ? (
@@ -120,13 +120,13 @@ export default function LandingPage() {
           <div className="flex items-center justify-center gap-4 flex-wrap">
             <Link
               to="/login?tab=signup"
-              className="h-11 px-8 bg-indigo-600 hover:bg-indigo-500 text-white text-[14px] font-semibold rounded-xl transition-all shadow-lg shadow-indigo-600/25 hover:shadow-indigo-600/40"
+              className="inline-flex items-center justify-center h-11 px-8 bg-indigo-600 hover:bg-indigo-500 text-white text-[14px] font-semibold rounded-xl transition-all shadow-lg shadow-indigo-600/30 hover:shadow-indigo-500/40 hover:-translate-y-px"
             >
               Start building for free
             </Link>
             <Link
               to="/login"
-              className="h-11 px-8 bg-white/[0.06] hover:bg-white/[0.10] border border-white/[0.10] text-zinc-200 text-[14px] font-medium rounded-xl transition-colors"
+              className="inline-flex items-center justify-center h-11 px-8 bg-transparent hover:bg-white/[0.06] border border-zinc-600 hover:border-zinc-500 text-zinc-300 hover:text-white text-[14px] font-medium rounded-xl transition-all"
             >
               Sign in
             </Link>
@@ -264,7 +264,7 @@ export default function LandingPage() {
         <div className="max-w-6xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-2">
             <div className="w-5 h-5 rounded-md bg-gradient-to-br from-indigo-500 to-violet-600" />
-            <span className="text-[13px] font-medium text-zinc-500">Ayacoda</span>
+            <span className="text-[13px] font-medium text-zinc-500">AYACODA AI Studio</span>
           </div>
           <p className="text-[12px] text-zinc-700">AI-powered app builder</p>
         </div>

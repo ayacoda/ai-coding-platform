@@ -5,7 +5,7 @@ import OpenAI from 'openai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createClient } from '@supabase/supabase-js';
 import { config } from 'dotenv';
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import pkg from 'pg';
@@ -65,15 +65,15 @@ function getTextContent(msg) {
   return typeof msg.content === 'string' ? msg.content : '';
 }
 
-const anthropicClient = new Anthropic({
+let anthropicClient = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-const openaiClient = new OpenAI({
+let openaiClient = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-const geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+let geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
@@ -86,7 +86,23 @@ const supabaseAdmin = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
 
 const UPLOADS_BUCKET = 'uploads';
 
-const SYSTEM_PROMPT = `You are a world-class product engineer. You build pixel-perfect, complete SaaS dashboards and websites in React/TypeScript. When cloning a real website, you reproduce it exactly — same text, same colors, same structure. You write production-grade code with exquisite attention to detail.
+const SYSTEM_PROMPT = `You are a world-class product engineer. You build pixel-perfect, complete SaaS dashboards and websites in React/TypeScript that work flawlessly on EVERY device — mobile (320px), tablet (768px), and desktop (1280px+). When cloning a real website, you reproduce it exactly — same text, same colors, same structure. You write production-grade code with exquisite attention to detail.
+
+🚨 MOBILE-FIRST IS NON-NEGOTIABLE 🚨
+Every single app MUST be fully responsive from the start. No fixed widths that overflow. No desktop-only layouts. Hamburger menu on mobile. Responsive grids. Overflow-safe tables. This is required, not optional.
+
+🚨 ALWAYS CONFIRM WHAT YOU UNDERSTOOD 🚨
+Before generating code, start with 1 sentence describing what you'll build/change.
+Example: "I'll add a date range filter to the transactions table."
+Exception: In SURGICAL FIX mode, skip the confirmation entirely — go straight to the fix.
+
+🚨 EVERY PAGE AND FEATURE MUST BE FULLY IMPLEMENTED 🚨
+When building a new app, EVERY page listed in the sidebar navigation MUST be fully built — not stubbed, not empty, not "coming soon".
+NEVER leave a page as a placeholder. NEVER render an empty <div> or "Page coming soon" or "Under construction" for any page.
+EVERY nav item = a COMPLETE, content-rich page with real UI, real data, and real interactivity.
+EVERY button, form, modal, and interactive element MUST work — no non-functional controls.
+If a feature is in the nav or mentioned in the UI, it MUST be fully implemented.
+Incomplete pages, stub components, and broken features are REJECTED.
 
 🚨 ABSOLUTE NON-NEGOTIABLE RULE 🚨
 You MUST ALWAYS respond with code blocks. NEVER tell the user to edit, update, or modify files themselves.
@@ -106,11 +122,40 @@ The preview concatenates ALL files into one eval(). Critical constraints:
    • React Router or any routing lib → use useState for navigation
    • fetch/axios/HTTP requests → use static data arrays in data.ts
    • localStorage/sessionStorage → use useState
-   • dynamic import() or require()
+   • dynamic import() or require() — NEVER use require(), it crashes with "exports is not defined"
+   • CommonJS syntax: no require(), no module.exports, no exports.X = ... — ONLY ES module imports
    • class decorators, process.env, const enum, namespace
    • export { X as default } patterns
    • Utility functions called at TOP LEVEL of data.ts during initialization
      ✓ price: '$12,400' not price: formatCurrency(12400)
+   • import { createClient } from '@supabase/supabase-js' — CRASH: createClient stripped, undefined
+     Use window.db directly — it is already configured with the correct project and schema
+   • DO NOT create lib/supabase.ts or utils/supabase.ts — window.db is already ready to use
+
+🔴 INTERFACES ≠ COMPONENTS — #1 CRASH CAUSE — READ THIS CAREFULLY:
+   TypeScript interface/type declarations are COMPLETELY ERASED at runtime.
+   If you write "interface Project" AND render <Project /> anywhere → INSTANT CRASH: "Project is not defined"
+   This crash cannot be auto-fixed easily because it often spans multiple files.
+
+   ✗ BANNED PATTERN (causes crash loops you cannot fix):
+      interface Project { ... }   // in types.ts
+      <Project key={p.id} ... />  // CRASH — "Project is not defined"
+      {tasks.map(t => <Task />)}  // CRASH — "Task is not defined"
+      {users.map(u => <User />)}  // CRASH — "User is not defined"
+
+   SIMPLE RULE: if you have 'interface X {}', then NEVER write '<X />' or 'React.createElement(X'. Period.
+   Always use a DIFFERENT name for the component than for the interface/type.
+
+   ✅ MANDATORY NAMING RULE — NO EXCEPTIONS:
+      interface Project { ... }  → component MUST be ProjectCard, ProjectRow, ProjectItem, ProjectTile
+      interface Task { ... }     → component MUST be TaskCard, TaskRow, TaskItem, TaskTile
+      interface User { ... }     → component MUST be UserCard, UserRow, UserItem
+      interface Product { ... }  → component MUST be ProductCard, ProductRow, ProductItem
+      The component name MUST differ from the interface name. Adding "Card", "Row", "Item", "Tile" is required.
+
+   CHECKLIST before outputting files:
+   ① For every interface/type X in types.ts: is there any <X /> or .map(x => <X />) in any file? If yes → RENAME the component.
+   ② Search all JSX for single-word tags matching an interface name (Project, Task, User, Item, Product, etc.) → rename them all.
 
 🚫 STATE CRASHES — NEVER do this:
    useState<Item[] | null>(null) then call .filter() → CRASH
@@ -118,35 +163,72 @@ The preview concatenates ALL files into one eval(). Critical constraints:
 ✅ ALWAYS: useState<Item[]>([])  •  useState<Data>({ rows: [], cols: [] })
    Use optional chaining for nullable: value?.prop ?? fallback
 
-━━━ FILE STRUCTURE ━━━
-types.ts → interfaces  |  constants.ts → tokens  |  data.ts → 20+ realistic records
-utils/format.ts → helpers  |  components/*.tsx → one component per file  |  App.tsx → last
+━━━ CRASH PREVENTION — NON-NEGOTIABLE ━━━
+🔴 IMPORTS: Every <Component /> used in JSX must be imported as a function/class. NEVER render <X /> if X is only a TypeScript interface — "X is not defined" crash. Missing import = crash.
+🔴 FILE COMPLETENESS: Every file you import must also be output as a code block in this response. Never import a file you don't output.
+🔴 NULL SAFETY: useState<Item[]>([]) not useState(null). Call methods only on initialized values. Use optional chaining: items?.map(...) ?? []
+🔴 NO TOP-LEVEL ASYNC: All async/await inside useEffect or handlers only. Never at top of a file.
+🔴 UNIQUE COMPONENT NAMES: No two files can export a component with the same name — they shadow each other.
+🔴 VALID JSX: Close every tag. Wrap multiple returns in <>. Use {expr} in JSX, not bare expressions.
+
+━━━ DETERMINISTIC FILE GENERATION PIPELINE ━━━
+Generate files in EXACTLY this order — dependencies always come before the files that use them:
+
+  LAYER 0 — Contracts (no deps):
+    types.ts          ← ALL interfaces/types defined here. ONCE. Referenced everywhere.
+    constants.ts      ← Design tokens, labels, config values
+
+  LAYER 1 — Data (depends on types only):
+    data.ts           ← 20+ realistic records typed with Layer 0 interfaces
+
+  LAYER 2 — Utilities (depends on types + data):
+    utils/format.ts   ← Pure helper functions (format, sort, filter)
+
+  LAYER 3 — Components (depends on types + utils):
+    components/XCard.tsx   ← ONE component per file. Names MUST differ from interface names.
+    components/XForm.tsx   ← Form components
+    components/XTable.tsx  ← Table/list components
+
+  LAYER 4 — Pages (depends on components):
+    pages/XPage.tsx   ← Each nav item = one fully-implemented page
+
+  LAYER 5 — Root:
+    App.tsx           ← Wires pages + navigation. ALWAYS last.
+
+WHY THIS ORDER MATTERS:
+→ types.ts defines "interface Task". components/TaskCard.tsx uses Task as a TYPE, not a component.
+→ If you define TaskCard.tsx before types.ts, the type isn't available yet.
+→ The sandbox evaluates files in this order — generation order = evaluation order.
 
 ━━━ IMPORTS ━━━
 ✅ import { useState } from 'react'  •  import type { X } from './types'  •  relative paths
 ❌ NO npm packages (no lucide-react, recharts, framer-motion, etc.)
+❌ NEVER use require() or module.exports — the sandbox has NO CommonJS. Using require() will crash with "exports is not defined". Use ES import syntax ONLY.
 ✅ Icons: use inline SVG with real heroicon/phosphor path data — never emoji as icons
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🏆 UI QUALITY — STUDY THESE EXACT PATTERNS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-YOUR APP SHELL — copy this structure exactly:
+YOUR APP SHELL — copy this structure exactly (responsive with mobile sidebar):
 \`\`\`tsx
+const [sidebarOpen, setSidebarOpen] = useState(false);
+// ...
 <div className="flex h-screen bg-[#0a0a0a] overflow-hidden font-sans">
-  <Sidebar active={page} onNavigate={setPage} />
+  {sidebarOpen && <div className="fixed inset-0 z-20 bg-black/60 lg:hidden" onClick={() => setSidebarOpen(false)} />}
+  <Sidebar active={page} onNavigate={setPage} open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
   <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-    <Header />
-    <main className="flex-1 overflow-y-auto bg-[#0a0a0a]">
+    <Header onMenuClick={() => setSidebarOpen(!sidebarOpen)} />
+    <main className="flex-1 overflow-y-auto bg-[#0a0a0a] p-4 md:p-6">
       {/* page content */}
     </main>
   </div>
 </div>
 \`\`\`
 
-SIDEBAR — must look exactly like this:
+SIDEBAR — must look exactly like this (responsive: hidden on mobile, slides in when open):
 \`\`\`tsx
-<aside className="w-[220px] bg-[#111111] border-r border-[#1f1f1f] flex flex-col shrink-0">
+<aside className={\`fixed lg:static inset-y-0 left-0 z-30 w-[220px] bg-[#111111] border-r border-[#1f1f1f] flex flex-col shrink-0 transform transition-transform duration-200 \${open ? 'translate-x-0' : '-translate-x-full'} lg:translate-x-0\`}>
   {/* Logo */}
   <div className="h-14 flex items-center gap-2.5 px-4 border-b border-[#1f1f1f]">
     <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-indigo-600 flex items-center justify-center shrink-0">
@@ -192,30 +274,36 @@ SIDEBAR — must look exactly like this:
 </aside>
 \`\`\`
 
-HEADER BAR:
+HEADER BAR — always include hamburger for mobile (lg:hidden):
 \`\`\`tsx
-<header className="h-14 border-b border-[#1f1f1f] bg-[#111111] flex items-center justify-between px-6 shrink-0">
-  <div>
-    <h1 className="text-[15px] font-semibold text-zinc-100 tracking-tight">{pageTitle}</h1>
-    <p className="text-[12px] text-zinc-600">{pageSubtitle}</p>
+<header className="h-14 border-b border-[#1f1f1f] bg-[#111111] flex items-center justify-between px-4 md:px-6 shrink-0">
+  <div className="flex items-center gap-3">
+    {/* Hamburger — mobile only, toggles sidebar */}
+    <button onClick={onMenuClick} className="lg:hidden w-8 h-8 flex items-center justify-center rounded-lg hover:bg-white/[0.08] text-zinc-400">
+      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16"/></svg>
+    </button>
+    <div>
+      <h1 className="text-[14px] md:text-[15px] font-semibold text-zinc-100 tracking-tight">{pageTitle}</h1>
+      <p className="text-[11px] md:text-[12px] text-zinc-600 hidden sm:block">{pageSubtitle}</p>
+    </div>
   </div>
   <div className="flex items-center gap-2">
-    {/* Search */}
-    <div className="relative">
+    {/* Search — hidden on small mobile */}
+    <div className="relative hidden sm:block">
       <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
       </svg>
-      <input className="h-8 pl-8 pr-3 bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[12px] text-zinc-300 placeholder-zinc-600 outline-none focus:border-zinc-600 w-52 transition-colors" placeholder="Search…" />
+      <input className="h-8 pl-8 pr-3 bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[12px] text-zinc-300 placeholder-zinc-600 outline-none focus:border-zinc-600 w-40 md:w-52 transition-colors" placeholder="Search…" />
     </div>
     {/* Bell */}
     <button className="relative w-8 h-8 flex items-center justify-center rounded-lg hover:bg-white/[0.06] text-zinc-500 hover:text-zinc-300 transition-colors">
       <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
       <span className="absolute top-1.5 right-1.5 w-1.5 h-1.5 bg-indigo-500 rounded-full" />
     </button>
-    {/* CTA */}
-    <button className="flex items-center gap-1.5 h-8 px-3.5 bg-indigo-600 hover:bg-indigo-500 text-white text-[12px] font-medium rounded-lg transition-colors">
+    {/* CTA — text hidden on small mobile */}
+    <button className="flex items-center gap-1.5 h-8 px-3 md:px-3.5 bg-indigo-600 hover:bg-indigo-500 text-white text-[12px] font-medium rounded-lg transition-colors">
       <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 4v16m8-8H4"/></svg>
-      New {entityName}
+      <span className="hidden sm:inline">New {entityName}</span>
     </button>
   </div>
 </header>
@@ -285,12 +373,13 @@ STATUS BADGE COLORS — use these exact combos:
   error/failed:    bg-red-500/10     text-red-400     border border-red-500/20      dot: bg-red-400
   inactive/draft:  bg-zinc-500/10    text-zinc-400    border border-zinc-500/20     dot: bg-zinc-500
 
-MODAL / SLIDE-OVER — always use this pattern:
+MODAL / SLIDE-OVER — always use this responsive pattern (full-width on mobile, fixed-width on desktop):
 \`\`\`tsx
 {selectedItem && (
   <div className="fixed inset-0 z-50 flex">
     <div className="flex-1 bg-black/60 backdrop-blur-sm" onClick={() => setSelectedItem(null)} />
-    <div className="w-[420px] bg-[#111111] border-l border-[#1f1f1f] flex flex-col shadow-2xl">
+    {/* w-full on mobile, fixed width on sm+ */}
+    <div className="w-full sm:w-[420px] bg-[#111111] border-l border-[#1f1f1f] flex flex-col shadow-2xl">
       <div className="flex items-center justify-between px-5 py-4 border-b border-[#1f1f1f]">
         <h2 className="text-[14px] font-semibold text-zinc-100">{selectedItem.name}</h2>
         <button onClick={() => setSelectedItem(null)} className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-white/[0.08] text-zinc-500 hover:text-zinc-300 transition-colors">
@@ -312,16 +401,112 @@ MODAL / SLIDE-OVER — always use this pattern:
 • Multiple status types with realistic distributions
 • Dates spanning last 6 months
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📱 MOBILE RESPONSIVE — MANDATORY FOR EVERY APP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Every app MUST work perfectly on mobile (320px), tablet (768px), and desktop (1280px+).
+This is NON-NEGOTIABLE — build responsive from the start, not as an afterthought.
+
+RESPONSIVE APP SHELL — use this exact pattern with mobile sidebar state:
+\`\`\`tsx
+const [sidebarOpen, setSidebarOpen] = useState(false);
+
+<div className="flex h-screen bg-[#0a0a0a] overflow-hidden font-sans">
+  {/* Mobile overlay */}
+  {sidebarOpen && (
+    <div className="fixed inset-0 z-20 bg-black/60 lg:hidden" onClick={() => setSidebarOpen(false)} />
+  )}
+  {/* Sidebar — hidden on mobile, slide in when open */}
+  <aside className={\`fixed lg:static inset-y-0 left-0 z-30 w-[220px] bg-[#111111] border-r border-[#1f1f1f] flex flex-col shrink-0 transform transition-transform duration-200 \${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:translate-x-0\`}>
+    {/* ... sidebar content ... */}
+  </aside>
+  <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+    <Header onMenuClick={() => setSidebarOpen(!sidebarOpen)} />
+    <main className="flex-1 overflow-y-auto bg-[#0a0a0a] p-4 md:p-6">
+      {/* page content */}
+    </main>
+  </div>
+</div>
+\`\`\`
+
+RESPONSIVE HEADER — always include hamburger button for mobile:
+\`\`\`tsx
+<header className="h-14 border-b border-[#1f1f1f] bg-[#111111] flex items-center justify-between px-4 md:px-6 shrink-0">
+  <div className="flex items-center gap-3">
+    {/* Hamburger — mobile only */}
+    <button onClick={onMenuClick} className="lg:hidden w-8 h-8 flex items-center justify-center rounded-lg hover:bg-white/[0.08] text-zinc-400">
+      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+      </svg>
+    </button>
+    <div>
+      <h1 className="text-[14px] md:text-[15px] font-semibold text-zinc-100 tracking-tight">{pageTitle}</h1>
+      <p className="text-[11px] md:text-[12px] text-zinc-600 hidden sm:block">{pageSubtitle}</p>
+    </div>
+  </div>
+  <div className="flex items-center gap-2">
+    {/* Search — hidden on small mobile */}
+    <div className="relative hidden sm:block">
+      <input className="h-8 pl-8 pr-3 bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[12px] text-zinc-300 placeholder-zinc-600 outline-none focus:border-zinc-600 w-40 md:w-52 transition-colors" placeholder="Search…" />
+    </div>
+    {/* CTA */}
+    <button className="flex items-center gap-1.5 h-8 px-3 md:px-3.5 bg-indigo-600 hover:bg-indigo-500 text-white text-[12px] font-medium rounded-lg transition-colors">
+      <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 4v16m8-8H4"/></svg>
+      <span className="hidden sm:inline">New {entityName}</span>
+    </button>
+  </div>
+</header>
+\`\`\`
+
+RESPONSIVE GRID RULES — always use these breakpoints:
+• Stat cards:  grid-cols-1 sm:grid-cols-2 xl:grid-cols-4
+• Content cards: grid-cols-1 md:grid-cols-2 lg:grid-cols-3
+• Full-width on mobile, multi-column on larger screens
+
+RESPONSIVE TABLE — always wrap in overflow container:
+\`\`\`tsx
+<div className="overflow-x-auto -mx-4 md:mx-0">
+  <table className="w-full min-w-[600px]">
+    {/* ... table content ... */}
+  </table>
+</div>
+\`\`\`
+
+TOUCH TARGETS — all interactive elements:
+• Buttons/links: min-height 44px on mobile (use py-2.5 or h-11)
+• Use touch-manipulation on scrollable containers
+• Tap-friendly padding on list items: py-3 minimum
+
+SPACING — tighter on mobile, comfortable on desktop:
+• Section padding: p-4 md:p-6 lg:p-8
+• Card gaps: gap-3 md:gap-4
+• Headings: text-xl md:text-2xl lg:text-3xl
+
+━━━ DATA REQUIREMENTS ━━━
+• 20+ realistic records — real names, companies, dollar amounts, percentages
+• NO placeholder data: "John Doe", "Lorem ipsum", "Item 1", "Test" → REJECTED
+• Multiple status types with realistic distributions
+• Dates spanning last 6 months
+
 ━━━ FINAL CHECKLIST before outputting ━━━
 □ App shell: flex h-screen with sidebar + header + main
+□ Mobile sidebar: fixed position, hidden by default, slides in via sidebarOpen state
+□ Hamburger button in header (lg:hidden) that toggles sidebarOpen
+□ Mobile overlay (fixed inset-0, lg:hidden) behind open sidebar
 □ Sidebar: logo, nav with icons, user profile at bottom
-□ Header: title, search input, notification bell, CTA button
+□ Header: hamburger + title + search (hidden sm:hidden) + CTA (text hidden on mobile)
+□ Stat cards: grid-cols-1 sm:grid-cols-2 xl:grid-cols-4
 □ 4 stat cards with sparklines and trend percentages
-□ Data table OR kanban with 15+ rows, status badges, hover actions
+□ Data table wrapped in overflow-x-auto with min-w-[600px]
+□ Table OR kanban with 15+ rows, status badges, hover actions
 □ At least one modal/slide-over with click-to-open
 □ Background: #0a0a0a body, #111111 sidebar/cards, #1f1f1f borders
 □ Every button has hover: state and transition-colors
+□ All touch targets ≥ 44px height on mobile
 □ No npm packages, no routing libraries
+□ FULLY RESPONSIVE — tested mentally at 375px, 768px, 1280px widths
+□ EVERY sidebar nav item renders a COMPLETE page — no stubs, no empty views, no "coming soon"
+□ EVERY button/form/interactive element has working state logic — no dead UI elements
 
 ━━━ NEW APP / FULL REBUILD ━━━
 When building from scratch, output files in this EXACT order:
@@ -361,6 +546,9 @@ Rules:
 • Language tag + space + filename on EVERY opening fence: \`\`\`tsx App.tsx not \`\`\`tsx
 • Keep each file under 150 lines
 • Split every reusable piece into its own components/*.tsx file
+• EVERY page component referenced in the nav MUST be a complete, content-rich component — no stub pages
+• EVERY interactive element (button, form, filter, modal trigger) MUST have working state logic
+• DO NOT use "coming soon", "under construction", "TODO", empty divs, or placeholder content on any page
 
 ━━━ FEATURE ADD / MODIFICATION ━━━
 When the user asks to change, add, or update something in an existing app:
@@ -377,14 +565,89 @@ After outputting ALL code blocks (the very last closing \`\`\` fence), write:
 
 Example: ✅ Done! Added a dark mode toggle to the Header component that persists via localStorage. Updated constants.ts with a color theme map and modified App.tsx to wrap the layout in a theme context provider.
 
+━━━ AUTHENTICATION (REAL — NOT DUMMY) ━━━
+When the user asks for authentication, login, signup, or user accounts — ALWAYS use Supabase Auth via window.db.
+NEVER generate fake auth with hardcoded credentials like \`if (email === 'admin@example.com')\` — that is rejected.
+window.db is always available globally. Use it like this:
+
+🚫 NEVER DO THIS — CRASHES THE SANDBOX:
+   import { createClient } from '@supabase/supabase-js'   ← stripped, createClient undefined
+   const supabase = createClient(url, key)                ← CRASH
+   DO NOT create a lib/supabase.ts or utils/supabase.ts file — window.db is already configured.
+
+✅ ALWAYS USE window.db — it's pre-configured with the correct project schema:
+   const { data } = await window.db.from('tasks').select('*')
+   await window.db.auth.signInWithPassword({ email, password })
+
+SIGN UP:
+\`\`\`tsx
+const { data, error } = await window.db.auth.signUp({ email, password });
+if (error) setError(error.message);
+else setUser(data.user);
+\`\`\`
+
+SIGN IN:
+\`\`\`tsx
+const { data, error } = await window.db.auth.signInWithPassword({ email, password });
+if (error) setError(error.message);
+else setUser(data.user);
+\`\`\`
+
+SIGN OUT:
+\`\`\`tsx
+await window.db.auth.signOut();
+setUser(null);
+\`\`\`
+
+GET CURRENT USER ON LOAD:
+\`\`\`tsx
+useEffect(() => {
+  window.db.auth.getSession().then(({ data: { session } }) => {
+    setUser(session?.user ?? null);
+    setLoading(false);
+  });
+  const { data: { subscription } } = window.db.auth.onAuthStateChange((_event, session) => {
+    setUser(session?.user ?? null);
+  });
+  return () => subscription.unsubscribe();
+}, []);
+\`\`\`
+
+AUTH-GATED APP SHELL:
+\`\`\`tsx
+const [user, setUser] = useState<any>(null);
+const [authLoading, setAuthLoading] = useState(true);
+// ... auth listener in useEffect ...
+if (authLoading) return <LoadingScreen />;
+if (!user) return <AuthPage onAuth={setUser} />;
+return <MainApp user={user} onSignOut={() => window.db.auth.signOut().then(() => setUser(null))} />;
+\`\`\`
+
+Rules:
+• ALWAYS use window.db.auth.* for real auth — NEVER hardcode credentials
+• Show sign in AND sign up forms (tabs or toggle) in a polished AuthPage component
+• Show validation errors from Supabase (error.message) inline beneath the form
+• After successful auth, show the main app (auth-gated shell pattern above)
+• Show a loading state while checking session on mount
+• Include a sign out button in the app header/sidebar
+• For Supabase projects: ALWAYS include a profiles table in schema.sql (see SUPABASE PROJECT COMPLETENESS above)
+• For Supabase projects: ALL user-owned tables MUST use auth.uid() = user_id in RLS policies
+
 ━━━ SURGICAL FIX MODE ━━━
-When a user message contains "SURGICAL FIX" and provides an error + current files:
-  • Read the error carefully and identify the EXACT cause
-  • Output ONLY the file(s) that need to change to fix the error
-  • Do NOT re-output files that are already correct — they will be preserved automatically
-  • One sentence explaining the fix, then only the changed file(s)
-  • After the last closing \`\`\` fence, write one sentence starting with "✅ Fixed:" describing what was corrected.
-  • Use the same code block format: \`\`\`tsx filename.tsx`;
+When a user message contains "SURGICAL FIX":
+🚨 OVERRIDE ALL OTHER RULES: Do NOT use "ALWAYS CONFIRM WHAT YOU UNDERSTOOD". Do NOT write preambles. Do NOT write explanations. Do NOT say "I cannot determine the cause". NEVER output text without code blocks.
+
+Your ENTIRE response in SURGICAL FIX mode must follow this format EXACTLY:
+✅ Fixed: [one sentence describing what was wrong and what was changed]
+\`\`\`tsx filename.tsx
+// complete fixed file
+\`\`\`
+
+Rules:
+• Output ONLY the file(s) that contain the bug — NEVER re-output files that are already working
+• If you are not 100% sure which file: output ONLY App.tsx with the fix applied — do NOT dump all files
+• ALWAYS output at least one code block. Never respond with only text.
+• Use the same format: language tag + space + filename on every opening fence`;
 
 
 
@@ -447,7 +710,17 @@ WHAT MUST GO IN window.db (persistent data — NEVER useState):
   ❌→✅ counters, scores, or any numeric data that must persist
   ❌→✅ file references / uploaded URLs
 
-Project schema (FIXED — never change): "${projectId}"
+Project schema name: "${projectId}" — this is a PostgreSQL schema identifier used ONLY in schema.sql.
+
+🚨 CRITICAL — JAVASCRIPT CODE RULE (CRASHES IF VIOLATED):
+window.db is already scoped to the schema "${projectId}" automatically.
+In JavaScript, ALWAYS call window.db.from('tableName') with ONLY the table name — NO schema prefix:
+  ✅ window.db.from('tasks').select('*')                  ← CORRECT
+  ❌ window.db.from('${projectId}.tasks').select('*')      ← CRASH: "${projectId}" is not a JS variable
+  ❌ window.db.from(${projectId} + '.tasks').select('*')   ← CRASH: "${projectId}" is not defined
+  ❌ window.db.schema('${projectId}').from('tasks')         ← WRONG API
+  ❌ const schema = ${projectId}                            ← CRASH: "${projectId}" is not a JS variable
+"${projectId}" ONLY appears in schema.sql as a quoted SQL identifier — it NEVER appears in .tsx or .ts files.
 
 window.db is a Supabase client. Use it for ALL data operations:
 
@@ -472,14 +745,67 @@ FILE UPLOADS:
 
 ${schemaBlock}
 
-⚠️  SCHEMA RULES — ABSOLUTE AND NON-NEGOTIABLE:
-- Schema name "${projectId}" is PERMANENT AND FIXED for this project — never change it.
+⚠️  SCHEMA RULES — SQL ONLY (schema.sql file ONLY — never in .tsx/.ts code):
+- Schema name "${projectId}" is PERMANENT AND FIXED — never change it.
 - NEVER create a different schema (no new CREATE SCHEMA with a different name).
 - When adding new sections or features: add new tables to the EXISTING schema "${projectId}".
-- ALL tables MUST use the prefix: "${projectId}".tableName — every single reference, no exceptions.
+- In schema.sql ONLY: all tables MUST use the prefix "${projectId}".tableName (e.g., CREATE TABLE "${projectId}".tasks).
 - The "public" schema is RESERVED for the platform. NEVER create tables in public.
 - NEVER use bare table names like "CREATE TABLE tasks" — always "${projectId}".tasks.
 - ALWAYS include CREATE SCHEMA IF NOT EXISTS "${projectId}" at the top of schema.sql (it is idempotent).
+
+🚨 SUPABASE PROJECT COMPLETENESS — ZERO TOLERANCE FOR MISSING PIECES 🚨
+
+This is a Supabase project. The following rules are MANDATORY and NON-NEGOTIABLE:
+
+1. SCHEMA COMPLETENESS:
+   - EVERY table that is queried via window.db in the code MUST exist in schema.sql.
+   - NEVER call window.db.from('tableName') without a CREATE TABLE IF NOT EXISTS "${projectId}".tableName in schema.sql.
+   - NEVER leave a comment like "-- add more tables here" or "-- TODO: add X table". CREATE THEM.
+   - If the app has users/profiles, tasks, posts, comments, orders, products, etc. — EVERY entity needs its own table.
+   - Include ALL columns used in the code (no missing columns in the schema).
+
+2. AUTHENTICATION COMPLETENESS (when auth is included):
+   - ALWAYS include a profiles table for user metadata.
+   - ALWAYS use auth.uid() in RLS policies for user-owned data, NOT "USING (true)".
+   - COMPLETE auth flow: sign up, sign in, sign out, session restore, loading state.
+   - INCLUDE email confirmation handling and proper error messages.
+   - RLS pattern for user-owned rows:
+     CREATE POLICY "Users manage own data" ON "${projectId}".tableName
+       FOR ALL USING (auth.uid() = user_id);
+   - Profiles table template:
+     CREATE TABLE IF NOT EXISTS "${projectId}".profiles (
+       id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+       email TEXT,
+       full_name TEXT,
+       avatar_url TEXT,
+       created_at TIMESTAMPTZ DEFAULT NOW()
+     );
+     ALTER TABLE "${projectId}".profiles ENABLE ROW LEVEL SECURITY;
+     CREATE POLICY "Users manage own profile" ON "${projectId}".profiles
+       FOR ALL USING (auth.uid() = id);
+     GRANT ALL ON "${projectId}".profiles TO anon, authenticated;
+
+3. NO MISSING FILES:
+   - EVERY component imported in App.tsx MUST be output as its own file.
+   - EVERY page referenced in the nav MUST be a fully implemented component file.
+   - NEVER import a file that you don't also output in this response.
+   - If the plan has 6 pages, output 6 page component files — no exceptions.
+
+4. NO BROKEN FUNCTIONALITY:
+   - EVERY form submits to the database (INSERT/UPDATE via window.db).
+   - EVERY list loads from the database on mount (SELECT via window.db).
+   - EVERY delete button actually deletes (DELETE via window.db).
+   - EVERY edit/update saves to the database (UPDATE via window.db).
+   - No hardcoded static arrays where the data should come from the DB.
+   - Handle loading: show spinner while fetching. Handle errors: show error message.
+
+5. GRANT PERMISSIONS (required in schema.sql for every table):
+   ALTER TABLE "${projectId}".tableName ENABLE ROW LEVEL SECURITY;
+   GRANT ALL ON "${projectId}".tableName TO anon, authenticated;
+   GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA "${projectId}" TO anon, authenticated;
+
+A Supabase project that is missing tables, missing files, missing auth, or has non-functional CRUD is REJECTED.
 `;
   }
 
@@ -518,10 +844,17 @@ function classifyRequest(message, hasFiles) {
 
 function pickGeneratorModel(requestType, manualModel, isAutoMode) {
   if (!isAutoMode && manualModel) return manualModel;
-  // Claude Sonnet for all generation — best at following complex multi-file architecture instructions
-  // GPT-4o is reserved for the fast planning pass (JSON output only)
-  return 'claude-sonnet-4-6';
+  // Always use the best model — quality over speed to minimize errors
+  return 'claude-opus-4-6';
 }
+
+// Tiered token budgets — stop models from padding output unnecessarily
+const MAX_TOKENS_BY_TYPE = {
+  new_app:     32000,   // raised 20k→32k: prevents mid-App.tsx truncation on complex apps
+  redesign:    20000,   // raised 16k→20k: redesigns touch many files
+  feature_add: 12000,
+  bug_fix:      8000,
+};
 
 const PLANNER_PROMPT = `You are a senior product architect. Given a user's React app request, output a concise JSON build plan.
 Output ONLY valid JSON with no other text, no code fences, no markdown.
@@ -535,6 +868,21 @@ Output ONLY valid JSON with no other text, no code fences, no markdown.
   "dataEntities": ["users", "transactions", "analytics"],
   "designDirection": "dark minimal SaaS dashboard with indigo accent"
 }`;
+
+/**
+ * Derives the list of files the generator MUST produce from the planner output.
+ * Used to (a) enforce a checklist in the generator prompt and (b) detect truncation on the client.
+ */
+function deriveFileManifest(plan) {
+  const files = ['types.ts', 'data.ts'];
+  (plan.components || []).forEach(c => files.push(`components/${c}.tsx`));
+  (plan.pages || []).forEach(p => {
+    const name = p.replace(/\s+/g, '') + 'Page';
+    files.push(`pages/${name}.tsx`);
+  });
+  files.push('App.tsx');
+  return files;
+}
 
 // ── /api/build — multi-model pipeline ────────────────────────────────────────
 
@@ -562,17 +910,16 @@ app.post('/api/build', async (req, res) => {
     if (requestType === 'new_app' || requestType === 'redesign') {
       send({ stage: 'planning' });
       try {
-        const planResponse = await openaiClient.chat.completions.create({
-          model: 'gpt-4o',
-          max_tokens: 400,
-          temperature: 0.2,
-          response_format: { type: 'json_object' },
+        const planMsg = await anthropicClient.messages.create({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 500,
           messages: [
-            { role: 'system', content: PLANNER_PROMPT },
-            { role: 'user', content: userMessage },
+            { role: 'user', content: `${PLANNER_PROMPT}\n\nRequest: ${userMessage}` },
           ],
         });
-        const planText = planResponse.choices[0]?.message?.content || '{}';
+        let planText = planMsg.content[0]?.type === 'text' ? planMsg.content[0].text : '{}';
+        // Strip markdown code fences if the model ignores instructions and wraps in ```json ... ```
+        planText = planText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
         const plan = JSON.parse(planText);
         plan.requestType = requestType;
         // Normalize description to future tense (model often returns past tense despite instructions)
@@ -606,6 +953,17 @@ app.post('/api/build', async (req, res) => {
           `NAVIGATION RULE: const [page, setPage] = useState('${(plan.pages || ['dashboard'])[0].toLowerCase().replace(/\s+/g, '-')}') — switch views with setPage(), never use React Router or any routing library.`,
           '[/BUILD PLAN]',
         ].join('\n');
+
+        // Derive required file manifest and inject as an enforced checklist.
+        // Also send it to the client so it can detect truncation and auto-continue.
+        const manifest = deriveFileManifest(plan);
+        send({ stage: 'manifest', files: manifest });
+
+        const manifestLines = manifest.map(f => `□ ${f}`).join('\n');
+        planContext +=
+          `\n\nMANDATORY FILE MANIFEST — you MUST output ALL of these files as complete code blocks:\n${manifestLines}\n` +
+          `Priority order if tokens run low: types.ts → data.ts → components → pages → App.tsx (LAST but REQUIRED)\n` +
+          `NEVER skip App.tsx — it is the entry point. Without it the app cannot render.`;
       } catch (planErr) {
         console.error('[build] Planner failed:', planErr.message);
         send({ stage: 'plan', plan: null });
@@ -614,6 +972,7 @@ app.post('/api/build', async (req, res) => {
 
     // ── Step 3: Generate ──────────────────────────────────────────────────────
     const generatorModel = pickGeneratorModel(requestType, preferredModel, isAutoMode);
+    const maxTok = MAX_TOKENS_BY_TYPE[requestType] ?? 20000;
     send({ stage: 'generating', model: generatorModel });
 
     // Build the effective system prompt — pass currentFiles so AI sees existing schema.sql
@@ -626,10 +985,34 @@ app.post('/api/build', async (req, res) => {
     // Build file context for feature_add / bug_fix — inject current files so AI knows what exists
     let filesContext = '';
     if (hasFiles && Object.keys(currentFiles).length > 0 && requestType !== 'new_app') {
-      const fileEntries = Object.entries(currentFiles)
-        .map(([name, content]) => `\`\`\`${name.endsWith('.tsx') ? 'tsx' : name.endsWith('.ts') ? 'ts' : name.endsWith('.sql') ? 'sql' : 'txt'} ${name}\n${content}\n\`\`\``)
+      const MAX_FILES = 6;
+      const MAX_CHARS_PER_FILE = 2000;
+
+      // Prioritize App.tsx first, then largest files (most complex / most relevant)
+      const sorted = Object.entries(currentFiles)
+        .sort(([a], [b]) => {
+          if (a === 'App.tsx') return -1;
+          if (b === 'App.tsx') return 1;
+          return (currentFiles[b]?.length ?? 0) - (currentFiles[a]?.length ?? 0);
+        })
+        .slice(0, MAX_FILES);
+
+      const fileEntries = sorted
+        .map(([name, content]) => {
+          const lang = name.endsWith('.tsx') ? 'tsx' : name.endsWith('.ts') ? 'ts' : name.endsWith('.sql') ? 'sql' : 'txt';
+          const preview = content.length > MAX_CHARS_PER_FILE
+            ? content.slice(0, MAX_CHARS_PER_FILE) + '\n// ...(truncated)'
+            : content;
+          return `\`\`\`${lang} ${name}\n${preview}\n\`\`\``;
+        })
         .join('\n\n');
-      filesContext = `\n\n[CURRENT APP FILES — modify only what is needed, preserve everything else]\n${fileEntries}\n[/CURRENT APP FILES]`;
+
+      const totalFiles = Object.keys(currentFiles).length;
+      const skipped = totalFiles - sorted.length;
+      const header = skipped > 0
+        ? `[CURRENT APP FILES — ${skipped} smaller file(s) omitted for brevity — modify only what is needed]`
+        : '[CURRENT APP FILES — modify only what is needed, preserve everything else]';
+      filesContext = `\n\n${header}\n${fileEntries}\n[/CURRENT APP FILES]`;
     }
 
     // Inject plan context + file context into the last user message
@@ -645,7 +1028,7 @@ app.post('/api/build', async (req, res) => {
     if (generatorModel === 'gpt-4o') {
       const stream = await openaiClient.chat.completions.create({
         model: 'gpt-4o',
-        max_tokens: 16000,
+        max_tokens: maxTok,
         messages: [
           { role: 'system', content: effectiveSystemPrompt },
           ...augmented.map((m) => ({ role: m.role, content: toOpenAIContent(m) })),
@@ -656,10 +1039,11 @@ app.post('/api/build', async (req, res) => {
         const text = chunk.choices[0]?.delta?.content || '';
         if (text) send({ text });
       }
-    } else if (generatorModel === 'gemini-2.0-flash') {
+    } else if (generatorModel === 'gemini-2.5-flash') {
       const gemModel = geminiClient.getGenerativeModel({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         systemInstruction: effectiveSystemPrompt,
+        generationConfig: { maxOutputTokens: maxTok },
       });
       const history = augmented.slice(0, -1).map((m) => ({
         role: m.role === 'assistant' ? 'model' : 'user',
@@ -673,10 +1057,10 @@ app.post('/api/build', async (req, res) => {
         if (text) send({ text });
       }
     } else {
-      // Claude Sonnet
+      // Claude (Sonnet or Opus depending on request type)
       const claudeStream = anthropicClient.messages.stream({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 32000,
+        model: generatorModel,
+        max_tokens: maxTok,
         system: effectiveSystemPrompt,
         messages: augmented.map((m) => ({ role: m.role, content: toAnthropicContent(m) })),
       });
@@ -704,49 +1088,64 @@ app.post('/api/suggest', async (req, res) => {
 
   const fileNames = Object.keys(files).join(', ');
 
-  // Build a compact but comprehensive code summary for the model to reason about
-  // what already exists — include App.tsx fully, plus first 300 chars of every other file
+  // Build a comprehensive code summary — App.tsx gets the most context since it wires
+  // everything together; other files get enough to detect their features too
   const codeSummary = Object.entries(files)
+    .sort(([a], [b]) => {
+      if (a === 'App.tsx') return -1;
+      if (b === 'App.tsx') return 1;
+      return (files[b]?.length ?? 0) - (files[a]?.length ?? 0);
+    })
     .map(([name, content]) => {
-      const preview = name === 'App.tsx'
-        ? content.slice(0, 2000)
-        : content.slice(0, 300);
-      return `### ${name}\n${preview}${content.length > preview.length ? '\n...(truncated)' : ''}`;
+      const limit = name === 'App.tsx' ? 5000 : name.endsWith('.tsx') ? 1500 : 600;
+      const preview = content.slice(0, limit);
+      return `### ${name}\n${preview}${content.length > preview.length ? '\n// ...(truncated)' : ''}`;
     })
     .join('\n\n');
 
   try {
     const response = await openaiClient.chat.completions.create({
       model: 'gpt-4o',
-      max_tokens: 600,
-      temperature: 0.8,
+      max_tokens: 1200,
+      temperature: 0.7,
       response_format: { type: 'json_object' },
       messages: [
         {
           role: 'system',
           content: `You are a senior product advisor for a React SaaS app builder.
-Analyse the EXISTING app code carefully, then suggest 5 specific features or UI enhancements the developer might want to add NEXT.
 
-CRITICAL RULES:
-• NEVER suggest something that is already implemented in the code — read the code carefully before suggesting
-• Each suggestion must be a NEW capability not yet present in the codebase
-• Each suggestion must be immediately actionable for an AI code generator
-• Keep labels to 2-4 words
+Your job: suggest 5 features the developer should add NEXT — features that are NOT already in the code.
 
-Output ONLY this JSON (no other text):
+STEP 1 — Scan the code and mentally list every feature already present:
+  e.g. search bar, modal, filters, charts, dark mode, export, pagination, sidebar, etc.
+
+STEP 2 — Suggest only features that are MISSING. Do NOT suggest:
+  • Anything you identified in Step 1
+  • Generic "improve UI" or "add animations" that aren't specific
+  • Features visible as state variables, components, or JSX in the code
+
+STEP 3 — Output ONLY this JSON (no other text, no markdown):
 {
   "suggestions": [
-    { "label": "2-4 word label", "prompt": "Full clear instruction: exactly what to build or change, specific enough for an AI to implement" },
-    { "label": "2-4 word label", "prompt": "..." },
-    { "label": "2-4 word label", "prompt": "..." },
-    { "label": "2-4 word label", "prompt": "..." },
-    { "label": "2-4 word label", "prompt": "..." }
+    {
+      "label": "2-4 word label shown on the pill button",
+      "prompt": "A detailed 2-3 sentence build instruction. Sentence 1: what to add and where (reference actual component/entity names from the code). Sentence 2: specific UX behaviour, interactions, or data handling. Sentence 3 (optional): edge cases, empty states, or polish details."
+    }
   ]
-}`,
+}
+
+PROMPT QUALITY RULES:
+• Each prompt must be 40-100 words — detailed enough for an AI to implement without asking questions
+• Reference actual variable names, component names, or data fields from the scanned code
+• Describe the exact UI: where it appears, how it looks, how the user interacts with it
+• Include relevant state changes, data updates, or visual feedback
+
+BAD prompt: "Add pagination to the table"
+GOOD prompt: "Add pagination to the data table with page size options (10 / 25 / 50 rows) controlled by a dropdown in the table footer. Show 'Showing 1–25 of 142 items' text on the left and Prev / Next buttons on the right. Keep the current sort and filter state when changing pages."`,
         },
         {
           role: 'user',
-          content: `Files: ${fileNames}\n\n${codeSummary}`,
+          content: `App files: ${fileNames}\n\n${codeSummary}`,
         },
       ],
     });
@@ -760,23 +1159,90 @@ Output ONLY this JSON (no other text):
 });
 
 
+// ── /api/rewrite — improve a user prompt before sending to build ─────────────
+
+app.post('/api/rewrite', async (req, res) => {
+  const { prompt = '', files = {} } = req.body;
+  if (!prompt.trim()) return res.json({ rewritten: prompt });
+
+  const fileList = Object.keys(files).join(', ') || 'none';
+
+  const systemPrompt = `You are a prompt-rewriting assistant for an AI coding platform that builds React/TypeScript web apps.
+The user has typed a rough prompt describing what they want to build or change. Your job is to rewrite it into a clear, detailed, actionable instruction for the code-generation AI.
+
+Rules:
+- Keep the same intent — never change what the user asked for
+- Add helpful specifics: mention relevant UI components, interactions, data, edge cases
+- Be concrete and implementation-focused (e.g. "Add a modal with a form that has name + email fields and a Submit button" not "add a modal")
+- Keep it concise — 1-3 sentences max, no bullet points, no markdown
+- Output ONLY the rewritten prompt, nothing else — no explanations, no preamble`;
+
+  const userMsg = `Current project files: ${fileList}
+
+User's prompt: "${prompt.trim()}"
+
+Rewrite this into a detailed, actionable instruction:`;
+
+  try {
+    const msg = await anthropicClient.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 300,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userMsg }],
+    });
+    const rewritten = msg.content[0]?.type === 'text' ? msg.content[0].text.trim() : prompt;
+    res.json({ rewritten });
+  } catch (err) {
+    console.error('[rewrite] Error:', err.message);
+    res.json({ rewritten: prompt });
+  }
+});
+
+
 // ── /api/chat — direct model endpoint (used by repair loop) ──────────────────
 
+// Minimal system prompt used ONLY for auto-repair. Intentionally short so it doesn't
+// conflict with the repair message's own instructions.
+const REPAIR_SYSTEM_PROMPT = `You are a precise surgical bug fixer. Your ONLY job is to fix the specific runtime error described in the message.
+
+ABSOLUTE RULES — violating any of these makes the repair worse, not better:
+1. Output ONLY the files you actually changed. If a file is unchanged, DO NOT output it.
+2. Make the SMALLEST possible change. Fix only the reported error — do not refactor, redesign, or add features.
+3. Never rewrite an entire file unless the entire file is broken. Patch the broken lines only.
+4. The files in the message labelled "READ-ONLY CONTEXT" are provided so you can understand the codebase — do NOT re-output them unless you changed them.
+5. Do NOT add comments, logs, or explanations inside code.
+6. Do NOT change file names, component names, or project structure.
+
+Output format for each changed file:
+\`\`\`tsx filename.tsx
+// only the fixed file content here
+\`\`\``;
+
 app.post('/api/chat', async (req, res) => {
-  const { messages, model = 'gpt-4o', storageMode, projectConfig, currentFiles = {} } = req.body;
+  const { messages, model = 'claude-opus-4-6', storageMode, projectConfig, currentFiles = {}, isRepairMode = false } = req.body;
 
   if (model === 'gpt-4o' && !process.env.OPENAI_API_KEY) {
     return res.status(400).json({ error: 'OPENAI_API_KEY is not configured.' });
   }
-  if (model === 'gemini-2.0-flash' && !process.env.GEMINI_API_KEY) {
+  if (model === 'gemini-2.5-flash' && !process.env.GEMINI_API_KEY) {
     return res.status(400).json({ error: 'GEMINI_API_KEY is not configured.' });
   }
-  if (model === 'claude-sonnet-4-6' && !process.env.ANTHROPIC_API_KEY) {
+  if ((model === 'claude-sonnet-4-6' || model === 'claude-opus-4-6') && !process.env.ANTHROPIC_API_KEY) {
     return res.status(400).json({ error: 'ANTHROPIC_API_KEY is not configured.' });
   }
 
-  const chatStorageContext = buildStorageContext(storageMode, projectConfig, currentFiles);
-  const chatSystemPrompt = [SYSTEM_PROMPT, chatStorageContext].filter(Boolean).join('\n\n');
+  // Repair mode: use a short focused system prompt so Claude only fixes the error.
+  // Full SYSTEM_PROMPT conflicts with repair (it tells AI to output ALL files), causing full rewrites.
+  let chatSystemPrompt;
+  if (isRepairMode) {
+    const chatStorageContext = buildStorageContext(storageMode, projectConfig, currentFiles);
+    chatSystemPrompt = chatStorageContext
+      ? `${REPAIR_SYSTEM_PROMPT}\n\n${chatStorageContext}`
+      : REPAIR_SYSTEM_PROMPT;
+  } else {
+    const chatStorageContext = buildStorageContext(storageMode, projectConfig, currentFiles);
+    chatSystemPrompt = [SYSTEM_PROMPT, chatStorageContext].filter(Boolean).join('\n\n');
+  }
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -803,10 +1269,10 @@ app.post('/api/chat', async (req, res) => {
         if (text) res.write(`data: ${JSON.stringify({ text })}\n\n`);
       }
 
-    } else if (model === 'gemini-2.0-flash') {
+    } else if (model === 'gemini-2.5-flash') {
       // ── Gemini 2.0 Flash ───────────────────────────────────────────────────
       const geminiModel = geminiClient.getGenerativeModel({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         systemInstruction: chatSystemPrompt,
       });
 
@@ -825,9 +1291,9 @@ app.post('/api/chat', async (req, res) => {
       }
 
     } else {
-      // ── Anthropic Claude ────────────────────────────────────────────────────
+      // ── Anthropic Claude (uses whatever model was requested, default: Opus) ──
       const stream = anthropicClient.messages.stream({
-        model: 'claude-sonnet-4-6',
+        model: model,
         max_tokens: 32000,
         system: chatSystemPrompt,
         messages: messages.map((m) => ({ role: m.role, content: toAnthropicContent(m) })),
@@ -861,15 +1327,15 @@ app.post('/api/chat', async (req, res) => {
 // ── /api/ask — Q&A only, no code generation ──────────────────────────────────
 
 app.post('/api/ask', async (req, res) => {
-  const { messages, model = 'claude-sonnet-4-6', currentFiles = {}, storageMode, projectConfig } = req.body;
+  const { messages, model = 'claude-opus-4-6', currentFiles = {}, storageMode, projectConfig } = req.body;
 
   if (model === 'gpt-4o' && !process.env.OPENAI_API_KEY) {
     return res.status(400).json({ error: 'OPENAI_API_KEY is not configured.' });
   }
-  if (model === 'gemini-2.0-flash' && !process.env.GEMINI_API_KEY) {
+  if (model === 'gemini-2.5-flash' && !process.env.GEMINI_API_KEY) {
     return res.status(400).json({ error: 'GEMINI_API_KEY is not configured.' });
   }
-  if (model === 'claude-sonnet-4-6' && !process.env.ANTHROPIC_API_KEY) {
+  if ((model === 'claude-sonnet-4-6' || model === 'claude-opus-4-6') && !process.env.ANTHROPIC_API_KEY) {
     return res.status(400).json({ error: 'ANTHROPIC_API_KEY is not configured.' });
   }
 
@@ -918,9 +1384,9 @@ app.post('/api/ask', async (req, res) => {
         if (text) res.write(`data: ${JSON.stringify({ text })}\n\n`);
       }
 
-    } else if (model === 'gemini-2.0-flash') {
+    } else if (model === 'gemini-2.5-flash') {
       const geminiModel = geminiClient.getGenerativeModel({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         systemInstruction: ASK_SYSTEM_PROMPT,
       });
       const history = messages.slice(0, -1).map((m) => ({
@@ -937,7 +1403,7 @@ app.post('/api/ask', async (req, res) => {
 
     } else {
       const stream = anthropicClient.messages.stream({
-        model: 'claude-sonnet-4-6',
+        model: model,
         max_tokens: 4096,
         system: ASK_SYSTEM_PROMPT,
         messages: messages.map((m) => ({ role: m.role, content: m.content })),
@@ -1246,6 +1712,110 @@ app.post('/api/delete-project-resources', async (req, res) => {
   }
 
   res.json({ success: true, ...results });
+});
+
+// ── /api/env-vars — read & write .env file ───────────────────────────────────
+
+const ENV_FILE_PATH = join(__dirname, '..', '.env');
+
+const MANAGED_ENV_VARS = [
+  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
+  'GEMINI_API_KEY',
+  'SUPABASE_URL',
+  'SUPABASE_ANON_KEY',
+  'SUPABASE_SERVICE_ROLE_KEY',
+  'SUPABASE_DB_URL',
+  'S3_REGION',
+  'S3_ACCESS_KEY_ID',
+  'S3_SECRET_ACCESS_KEY',
+  'S3_BUCKET',
+];
+
+function parseEnvFile() {
+  try {
+    const content = readFileSync(ENV_FILE_PATH, 'utf-8');
+    const vars = {};
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx < 0) continue;
+      const key = trimmed.substring(0, eqIdx).trim();
+      const value = trimmed.substring(eqIdx + 1);
+      vars[key] = value;
+    }
+    return vars;
+  } catch {
+    return {};
+  }
+}
+
+function updateEnvFile(updates) {
+  let content = '';
+  try { content = readFileSync(ENV_FILE_PATH, 'utf-8'); } catch { /* new file */ }
+
+  const lines = content.split('\n');
+  const written = new Set();
+
+  const newLines = lines.map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) return line;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx < 0) return line;
+    const key = trimmed.substring(0, eqIdx).trim();
+    if (key in updates) {
+      written.add(key);
+      return `${key}=${updates[key]}`;
+    }
+    return line;
+  });
+
+  // Append any keys that weren't already in the file
+  for (const [key, value] of Object.entries(updates)) {
+    if (!written.has(key)) newLines.push(`${key}=${value}`);
+  }
+
+  writeFileSync(ENV_FILE_PATH, newLines.join('\n'), 'utf-8');
+}
+
+app.get('/api/env-vars', (_req, res) => {
+  const fileVars = parseEnvFile();
+  const result = {};
+  for (const key of MANAGED_ENV_VARS) {
+    // Prefer live process.env (may differ from file if set externally)
+    result[key] = process.env[key] ?? fileVars[key] ?? '';
+  }
+  res.json({ vars: result });
+});
+
+app.post('/api/env-vars', (req, res) => {
+  const { vars } = req.body;
+  if (!vars || typeof vars !== 'object') {
+    return res.status(400).json({ error: 'vars object required' });
+  }
+
+  // Only allow managed keys
+  const allowed = {};
+  for (const key of MANAGED_ENV_VARS) {
+    if (key in vars) allowed[key] = String(vars[key]);
+  }
+
+  // Write to .env
+  updateEnvFile(allowed);
+
+  // Update process.env immediately
+  for (const [key, value] of Object.entries(allowed)) {
+    process.env[key] = value;
+  }
+
+  // Re-initialize API clients with new keys
+  anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+
+  console.log('[env-vars] Updated:', Object.keys(allowed).join(', '));
+  res.json({ success: true, updated: Object.keys(allowed) });
 });
 
 app.get('/api/health', (_req, res) => {
