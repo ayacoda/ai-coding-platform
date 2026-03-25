@@ -69,7 +69,7 @@ function TabButton({
 export default function EditorPage() {
   const { id: projectId } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const { rightPanel, files, messages, promptQueue, queuePaused, setFiles, setProjectMeta, storageMode, projectConfig, clearMessages, setMessages, setQueue, setQueuePaused, currentProjectName } = useStore();
+  const { rightPanel, files, messages, promptQueue, queuePaused, setFiles, setProjectMeta, storageMode, projectConfig, projectSecrets, clearMessages, setMessages, setQueue, setQueuePaused, currentProjectName, setProjectSecrets } = useStore();
   const projectName = currentProjectName ?? 'Untitled Project';
 
   const [loadingProject, setLoadingProject] = useState(true);
@@ -78,6 +78,10 @@ export default function EditorPage() {
   const msgSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const queueSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isFirstLoad = useRef(true);
+  // For new projects: stores the real DB ID once the row is created on first file save
+  const realProjectIdRef = useRef<string | null>(null);
+  // Prevents re-loading from DB when we do a replace-navigate after project creation
+  const skipNextLoadRef = useRef(false);
 
   // Cancel generation and pause+save queue when leaving the editor
   useEffect(() => {
@@ -87,13 +91,14 @@ export default function EditorPage() {
 
       // If there are pending queue items, pause the queue and save to Supabase (fire-and-forget)
       const { promptQueue: q, currentProjectId: pid } = useStore.getState();
-      if (q.length > 0 && pid) {
+      const effectiveId = realProjectIdRef.current ?? pid;
+      if (q.length > 0 && effectiveId && effectiveId !== 'new') {
         useStore.getState().setQueuePaused(true);
         // Fire-and-forget save so queue survives navigation
         supabase
           .from('projects')
           .update({ prompt_queue: q, queue_paused: true })
-          .eq('id', pid)
+          .eq('id', effectiveId)
           .then(() => {});
       }
     };
@@ -102,6 +107,25 @@ export default function EditorPage() {
   // Load project from Supabase on mount
   useEffect(() => {
     if (!projectId) return;
+
+    // Skip re-load when we just replaced the URL after creating a new project
+    if (skipNextLoadRef.current) {
+      skipNextLoadRef.current = false;
+      return;
+    }
+
+    if (projectId === 'new') {
+      // Fresh new project — no DB row yet, start with empty state
+      realProjectIdRef.current = null;
+      setProjectMeta({ projectId: 'new', projectName: 'Untitled Project', storageMode: 'supabase', projectConfig: null });
+      setFiles({}, true);
+      setProjectSecrets({});
+      clearMessages();
+      isFirstLoad.current = false;
+      setLoadingProject(false);
+      return;
+    }
+
     clearMessages(); // reset while loading (spinner is visible)
     isFirstLoad.current = true;
     loadProject(projectId);
@@ -156,6 +180,10 @@ export default function EditorPage() {
       projectConfig: resolvedConfig,
     });
 
+    // Restore per-project API secrets (stored inside project_config.secrets)
+    const savedSecrets = (resolvedConfig as typeof projectConfig & { secrets?: Record<string, string> })?.secrets ?? {};
+    setProjectSecrets(savedSecrets);
+
     if (project.files && Object.keys(project.files).length > 0) {
       const sanitized = sanitizeGeneratedFiles(project.files as Record<string, string>);
       setFiles(sanitized, true);
@@ -186,9 +214,22 @@ export default function EditorPage() {
 
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
-      saveProject(projectId);
+      saveProject(realProjectIdRef.current ?? projectId);
     }, 1500);
   }, [files]);
+
+  // Debounced auto-save when project secrets change
+  useEffect(() => {
+    if (!projectId || isFirstLoad.current || loadingProject) return;
+    const effectiveId = realProjectIdRef.current ?? projectId;
+    if (effectiveId === 'new') return;
+
+    // Use the files save timer slot to avoid an extra DB write
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      saveProject(realProjectIdRef.current ?? projectId);
+    }, 800);
+  }, [projectSecrets]);
 
   // Debounced auto-save when queue changes
   useEffect(() => {
@@ -196,11 +237,13 @@ export default function EditorPage() {
 
     if (queueSaveTimerRef.current) clearTimeout(queueSaveTimerRef.current);
     queueSaveTimerRef.current = setTimeout(() => {
+      const effectiveId = realProjectIdRef.current ?? projectId;
+      if (effectiveId === 'new') return; // no DB row yet
       const { promptQueue: q, queuePaused: paused } = useStore.getState();
       supabase
         .from('projects')
         .update({ prompt_queue: q, queue_paused: paused })
-        .eq('id', projectId)
+        .eq('id', effectiveId)
         .then(() => {});
     }, 1500);
   }, [promptQueue, queuePaused]);
@@ -211,6 +254,8 @@ export default function EditorPage() {
 
     if (msgSaveTimerRef.current) clearTimeout(msgSaveTimerRef.current);
     msgSaveTimerRef.current = setTimeout(() => {
+      const effectiveId = realProjectIdRef.current ?? projectId;
+      if (effectiveId === 'new') return; // no DB row yet
       // Read from store directly to avoid stale closure
       const currentMessages = useStore.getState().messages;
       // Only save settled (non-streaming) messages
@@ -219,21 +264,81 @@ export default function EditorPage() {
       supabase
         .from('projects')
         .update({ messages: toSave })
-        .eq('id', projectId)
+        .eq('id', effectiveId)
         .then(() => {});
     }, 2000);
   }, [messages]);
 
   async function saveProject(id: string) {
+    const effectiveId = realProjectIdRef.current ?? id;
+    const currentSecrets = useStore.getState().projectSecrets;
+
+    if (effectiveId === 'new') {
+      // Only create the DB row once we have actual files
+      const currentFiles = useStore.getState().files;
+      if (Object.keys(currentFiles).length === 0) return;
+
+      const { data: authData } = await supabase.auth.getUser();
+      if (!authData.user) return;
+
+      const name = useStore.getState().currentProjectName ?? 'Untitled Project';
+      const hex = Math.random().toString(16).slice(2, 10);
+      const schemaId = `p_${hex}`;
+      // Embed secrets in project_config (no extra DB column needed)
+      const config = {
+        id: schemaId,
+        storageMode: 'supabase',
+        secrets: Object.keys(currentSecrets).length > 0 ? currentSecrets : undefined,
+      };
+
+      const { data, error } = await supabase
+        .from('projects')
+        .insert({
+          user_id: authData.user.id,
+          name,
+          files: currentFiles,
+          storage_mode: 'supabase',
+          project_config: config,
+          updated_at: new Date().toISOString(),
+        })
+        .select()
+        .single();
+
+      if (error || !data) {
+        console.error('[editor] project create error:', error?.message);
+        return;
+      }
+
+      realProjectIdRef.current = data.id;
+      setProjectMeta({ projectId: data.id, projectName: name, storageMode: 'supabase', projectConfig: config as typeof projectConfig });
+
+      // Provision schema in background
+      fetch('/api/provision/supabase', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId: schemaId }),
+      }).catch(() => {});
+
+      // Update URL to real ID without triggering a full re-load
+      skipNextLoadRef.current = true;
+      navigate(`/project/${data.id}`, { replace: true });
+      return;
+    }
+
+    // Embed current secrets into project_config when saving
+    const configToSave = projectConfig
+      ? { ...projectConfig, secrets: Object.keys(currentSecrets).length > 0 ? currentSecrets : undefined }
+      : null;
+
     await supabase
       .from('projects')
       .update({
-        files,
+        files: useStore.getState().files,
         storage_mode: storageMode,
-        project_config: projectConfig,
+        project_config: configToSave,
         updated_at: new Date().toISOString(),
       })
-      .eq('id', id);
+      .eq('id', effectiveId);
   }
 
   if (loadingProject) {

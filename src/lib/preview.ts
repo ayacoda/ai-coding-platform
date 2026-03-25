@@ -173,7 +173,32 @@ function buildStorageScripts(config?: PreviewConfig): string {
       ? '    // Schema name alias — prevents "p_xxxxx is not defined" if AI uses schema name as JS var\n' +
         '    window["' + projectId + '"] = window.db;\n' +
         '    window["proj_default"] = window.db;\n'
-      : '    window["proj_default"] = window.db;\n');
+      : '    window["proj_default"] = window.db;\n') +
+    // Proactive auth stubs — AI-generated apps often reference these before async auth resolves.
+    // In the sandbox there's no session, so these would crash. Stub them with safe mock values.
+    '    // Auth stubs — prevents "user/session/profile is not defined" crashes in preview\n' +
+    '    var _mockUser = { id: "demo_user_01", email: "demo@example.com", name: "Demo User", full_name: "Demo User", username: "demouser", role: "user", avatar_url: "", created_at: new Date().toISOString() };\n' +
+    '    var _mockSession = { user: _mockUser, access_token: "demo_token", refresh_token: "demo_refresh", expires_at: 9999999999 };\n' +
+    '    if (typeof window.user === "undefined") window.user = _mockUser;\n' +
+    '    if (typeof window.profile === "undefined") window.profile = _mockUser;\n' +
+    '    if (typeof window.session === "undefined") window.session = _mockSession;\n' +
+    '    if (typeof window.currentUser === "undefined") window.currentUser = _mockUser;\n' +
+    '    // Patch window.db.auth so ANY Supabase auth pattern renders without crashing.\n' +
+    '    // This runs after window.db is created, overriding the real auth methods with mock ones.\n' +
+    '    if (window.db && window.db.auth) {\n' +
+    '      window.db.auth.user = function() { return _mockUser; };\n' +
+    '      window.db.auth.getUser = async function() { return { data: { user: _mockUser }, error: null }; };\n' +
+    '      window.db.auth.getSession = async function() { return { data: { session: _mockSession }, error: null }; };\n' +
+    '      window.db.auth.session = function() { return _mockSession; };\n' +
+    '      window.db.auth.signIn = async function() { return { data: { user: _mockUser, session: _mockSession }, error: null }; };\n' +
+    '      window.db.auth.signUp = async function() { return { data: { user: _mockUser, session: _mockSession }, error: null }; };\n' +
+    '      window.db.auth.signInWithPassword = async function() { return { data: { user: _mockUser, session: _mockSession }, error: null }; };\n' +
+    '      window.db.auth.signOut = async function() { return { error: null }; };\n' +
+    '      window.db.auth.onAuthStateChange = function(cb) {\n' +
+    '        setTimeout(function() { try { cb("SIGNED_IN", _mockSession); } catch(e) {} }, 0);\n' +
+    '        return { data: { subscription: { unsubscribe: function() {} } } };\n' +
+    '      };\n' +
+    '    }\n';
 
   return (
     '  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"><\/script>\n' +
@@ -394,7 +419,9 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '          "if (m === \'react-dom\') return ReactDOM;" +\n' +
     '          "if (m === \'@supabase/supabase-js\') return { createClient: window.createClient };" +\n' +
     '          "return {};" +\n' +
-    '          "};";\n' +
+    '          "};" +\n' +
+    // Expose auth stubs as local vars so AI code can use them without window. prefix
+    '          "var user = window.user; var profile = window.profile; var session = window.session; var currentUser = window.currentUser;";\n' +
     // Runtime auto-stub loop — handles any number of "X is not defined" errors:
     //   • PascalCase (interface used as JSX component) → stub as visible error div
     //   • p_xxxxx / proj_default (schema name as JS var) → alias to window.db
@@ -423,6 +450,21 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '                       borderRadius:"4px",fontSize:"12px",fontFamily:"monospace",display:"inline-block",margin:"2px"}\n' +
     '              }, "[missing component: " + _n + "]"); };\n' +
     '              console.warn("[preview] stub:", _n);\n' +
+    '              _run();\n' +
+    '            } else if (_autoStubsLeft > 0 && msg.match(/^\'?([a-z]\\w*)\'? is not defined/)) {\n' +
+    '              _autoStubsLeft--;\n' +
+    '              var _lv = msg.match(/^\'?([a-z]\\w*)\'? is not defined/)[1];\n' +
+    '              var _AUTH_STUBS = {\n' +
+    '                user:    { id: "demo_user_01", email: "demo@example.com", name: "Demo User", role: "user", avatar_url: "", created_at: new Date().toISOString() },\n' +
+    '                profile: { id: "demo_user_01", email: "demo@example.com", full_name: "Demo User", username: "demouser", bio: "", avatar_url: "" },\n' +
+    '                session: { user: { id: "demo_user_01", email: "demo@example.com" }, access_token: "demo_token", expires_at: 9999999999 },\n' +
+    '                data:    [],\n' +
+    '                error:   null,\n' +
+    '                items:   [],\n' +
+    '                rows:    [],\n' +
+    '              };\n' +
+    '              window[_lv] = _AUTH_STUBS[_lv] !== undefined ? _AUTH_STUBS[_lv] : {};\n' +
+    '              console.warn("[preview] auto-stub (lowercase):", _lv, "→", window[_lv]);\n' +
     '              _run();\n' +
     '            } else {\n' +
     '              if (msg.includes("Cannot read properties of null") || msg.includes("Cannot read properties of undefined")) {\n' +

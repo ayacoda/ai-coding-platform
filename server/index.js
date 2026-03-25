@@ -8,6 +8,7 @@ import { config } from 'dotenv';
 import { readFileSync, writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import ts from 'typescript';
 import pkg from 'pg';
 const { Client: PgClient } = pkg;
 
@@ -113,6 +114,18 @@ If you cannot output code, output nothing — but NEVER give manual instructions
 ━━━ SANDBOX RULES (MUST FOLLOW OR APP CRASHES) ━━━
 The preview concatenates ALL files into one eval(). Critical constraints:
 
+🔴 #1 RUNTIME CRASH — WINDOW.DB RULE (read before anything else):
+The sandbox has NO module system and NO global named 'db' or 'supabase'.
+ONLY 'window.db' is available. Every other form crashes with "X is not defined":
+   ❌ const db = window.db        → CRASH (local var, still undefined after eval merge)
+   ❌ const db = createClient()   → CRASH
+   ❌ db.from('table')            → CRASH: "db is not defined"
+   ❌ supabase.from('table')      → CRASH: "supabase is not defined"
+   ❌ const { db } = useSupabase() → CRASH
+   ✅ window.db.from('table')     → ONLY correct form. Always. No exceptions.
+   ✅ window.db.auth.signIn(...)  → ONLY correct form for auth
+This is auto-enforced by the server — but violations still waste generation time.
+
 🚫 NEVER name variables/functions/components these exact names (they shadow globals):
    Fragment, createElement, createContext, forwardRef, memo, Children,
    Component, createRef, Suspense, lazy, createPortal, startTransition
@@ -131,6 +144,15 @@ The preview concatenates ALL files into one eval(). Critical constraints:
    • import { createClient } from '@supabase/supabase-js' — CRASH: createClient stripped, undefined
      Use window.db directly — it is already configured with the correct project and schema
    • DO NOT create lib/supabase.ts or utils/supabase.ts — window.db is already ready to use
+
+🚫 NO AUTH FLOWS IN GENERATED APPS — CRASHES THE PREVIEW:
+   The preview sandbox has NO logged-in user. All Supabase auth calls return null or errors.
+   ❌ NEVER write: window.db.auth.getUser(), window.db.auth.getSession(), onAuthStateChange()
+   ❌ NEVER write: const { data: { user } } = await window.db.auth.getUser()
+   ❌ NEVER build login screens, signup forms, or auth-gate checks in generated apps
+   ✅ Apps MUST render the logged-in/dashboard state directly — skip auth entirely.
+   ✅ If your app needs a "current user", hardcode a mock at the top of App.tsx:
+      const currentUser = { id: 'user_01', name: 'Demo User', email: 'demo@example.com', role: 'admin' };
 
 🔴 INTERFACES ≠ COMPONENTS — #1 CRASH CAUSE — READ THIS CAREFULLY:
    TypeScript interface/type declarations are COMPLETELY ERASED at runtime.
@@ -552,7 +574,20 @@ Rules:
 
 ━━━ FEATURE ADD / MODIFICATION ━━━
 When the user asks to change, add, or update something in an existing app:
-• Output ONLY the files that actually change — DO NOT re-output unchanged files
+
+🚨 SURGICAL PRECISION — THIS IS THE MOST IMPORTANT RULE FOR MODIFICATIONS:
+• You will receive the COMPLETE content of ALL existing files.
+• Output ONLY the specific file(s) that must change to implement the request.
+• DO NOT re-output any file that does not need to change — every file you output REPLACES the existing version.
+• If you re-output App.tsx with simplified code, the existing App.tsx is DESTROYED. Same for every other file.
+• If the request is "add a search bar to the header" — output ONLY the Header component file. Nothing else.
+• If the request only touches one file, output ONE file. Not two, not five. ONE.
+
+Checklist before outputting:
+① Read the user's request. Which specific file(s) need to change?
+② Output ONLY those files — complete and correct.
+③ Leave everything else untouched.
+
 • Unchanged files are automatically preserved — only send the modified ones
 • You MUST output at least one code block — NO EXCEPTIONS
 • Language tag + space + filename on every fence: \`\`\`tsx App.tsx
@@ -832,6 +867,146 @@ function buildSecretsContext(secrets) {
   return lines.join('\n');
 }
 
+// ── Post-generation validation ────────────────────────────────────────────────
+
+/**
+ * Server-side file parser — mirrors parseFilesFromResponse on the client.
+ * Returns { filename: content } for all named code blocks in the text.
+ */
+function parseFilesFromText(text) {
+  const files = {};
+  const regex = /```[a-zA-Z]+\s+([^\n`\s][^\n]*)\n([\s\S]*?)```/g;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    const filename = match[1].trim();
+    const code = match[2];
+    if (filename && /\.\w+$/.test(filename) && !filename.includes(' ') && code.trim()) {
+      files[filename] = code.trimEnd();
+    }
+  }
+  return files;
+}
+
+/**
+ * Validates generated TS/TSX files for syntax errors and banned sandbox patterns.
+ * Returns an array of { file, messages[] } objects (empty = all clean).
+ */
+function validateGeneratedFiles(files) {
+  const errors = [];
+
+  for (const [filename, content] of Object.entries(files)) {
+    const isTsx = filename.endsWith('.tsx');
+    const isTs  = filename.endsWith('.ts');
+    if (!isTsx && !isTs) continue;
+
+    const fileErrors = [];
+
+    // ── TypeScript syntax check (no type-checking — syntax only, very fast) ──
+    try {
+      const compilerOptions = {
+        target: ts.ScriptTarget.ES2020,
+        module: ts.ModuleKind.ESNext,
+        skipLibCheck: true,
+        allowSyntheticDefaultImports: true,
+      };
+      // Only set jsx option for .tsx files — omitting it for .ts avoids a spurious diagnostic
+      if (isTsx) compilerOptions.jsx = ts.JsxEmit.React;
+
+      const result = ts.transpileModule(content, {
+        compilerOptions,
+        reportDiagnostics: true,
+        fileName: filename,
+      });
+      if (result.diagnostics && result.diagnostics.length > 0) {
+        for (const d of result.diagnostics) {
+          const msg = typeof d.messageText === 'string'
+            ? d.messageText
+            : d.messageText.messageText;
+          if (d.start !== undefined) {
+            const lineNum = (content.slice(0, d.start).match(/\n/g) || []).length + 1;
+            fileErrors.push(`SYNTAX Line ${lineNum}: ${msg}`);
+          } else {
+            fileErrors.push(`SYNTAX: ${msg}`);
+          }
+        }
+      }
+    } catch (e) {
+      fileErrors.push(`PARSE ERROR: ${e.message}`);
+    }
+
+    // ── Banned pattern checks ──────────────────────────────────────────────
+    if (/import[^;'"]*createClient[^;'"]*from\s+['"]@supabase\/supabase-js['"]/.test(content)) {
+      fileErrors.push(`BANNED IMPORT: 'import { createClient } from "@supabase/supabase-js"' crashes the sandbox. Remove this import and use window.db directly instead.`);
+    }
+    if (/\brequire\s*\(/.test(content)) {
+      fileErrors.push(`BANNED: require() is not available in the sandbox. Convert to ES import syntax.`);
+    }
+    if (/import[^;'"]*from\s+['"]react-router(?:-dom)?['"]/.test(content)) {
+      fileErrors.push(`BANNED IMPORT: react-router is not available in the sandbox. Use useState for navigation instead.`);
+    }
+    if (/useState\s*<[^>]*\[\][^>]*>\s*\(\s*null\s*\)/.test(content)) {
+      fileErrors.push(`BUG: useState<T[]>(null) will crash on .map()/.filter(). Change to useState<T[]>([]).`);
+    }
+    // Bare db.X() or supabase.X() — only window.db is available as a global
+    if (/(?<![.\w])db\.(from|auth|storage|rpc|channel|functions)\s*\(/.test(content)) {
+      fileErrors.push(`BANNED: 'db.from(...)' is not defined. Use 'window.db.from(...)' — window.db is the only valid global.`);
+    }
+    if (/(?<![.\w])supabase\.(from|auth|storage|rpc|channel|functions)\s*\(/.test(content)) {
+      fileErrors.push(`BANNED: 'supabase.from(...)' is not defined. Use 'window.db.from(...)' — window.db is the only valid global.`);
+    }
+    if (/\b(?:const|let|var)\s+(?:db|supabase)\s*=/.test(content)) {
+      fileErrors.push(`BANNED: 'const db = ...' or 'const supabase = ...' creates a local variable that shadows nothing useful. Use window.db directly — no local alias needed.`);
+    }
+
+    if (fileErrors.length > 0) {
+      errors.push({ file: filename, messages: fileErrors });
+    }
+  }
+
+  return errors;
+}
+
+/**
+ * Deterministic sandbox constraint fixer — runs BEFORE AI validation correction.
+ * Fixes patterns we KNOW are wrong without needing AI, using simple text transforms.
+ * Returns { files: correctedFiles, fixes: [{file, applied[]}] }
+ */
+function applyProgrammaticFixes(files) {
+  const result = {};
+  const fixes = [];
+
+  for (const [filename, content] of Object.entries(files)) {
+    if (!filename.endsWith('.tsx') && !filename.endsWith('.ts')) {
+      result[filename] = content;
+      continue;
+    }
+
+    let c = content;
+    const applied = [];
+
+    // 1. Remove 'import { createClient } from "@supabase/supabase-js"'
+    const c1 = c.replace(/^[^\n]*import\s+[^'"]*createClient[^'"]*from\s+['"]@supabase\/supabase-js['"]\s*;?\n?/gm, '');
+    if (c1 !== c) { applied.push('removed @supabase/supabase-js import'); c = c1; }
+
+    // 2. Remove 'const db = ...' / 'const supabase = ...' local variable declarations
+    const c2 = c.replace(/^[^\n]*\b(?:const|let|var)\s+(?:db|supabase)\s*=[^\n]*\n?/gm, '');
+    if (c2 !== c) { applied.push('removed local db/supabase alias'); c = c2; }
+
+    // 3. Replace supabase.X( → window.db.X(  (bare supabase without window. prefix)
+    const c3 = c.replace(/(?<![.\w])supabase\.(from|auth|storage|rpc|channel|functions)\b/g, 'window.db.$1');
+    if (c3 !== c) { applied.push('replaced supabase.X → window.db.X'); c = c3; }
+
+    // 4. Replace bare db.X( → window.db.X(  (not preceded by window. or any identifier)
+    const c4 = c.replace(/(?<![.\w])db\.(from|auth|storage|rpc|channel|functions)\b/g, 'window.db.$1');
+    if (c4 !== c) { applied.push('replaced db.X → window.db.X'); c = c4; }
+
+    if (applied.length > 0) fixes.push({ file: filename, applied });
+    result[filename] = c;
+  }
+
+  return { files: result, fixes };
+}
+
 // ── Pipeline helpers ──────────────────────────────────────────────────────────
 
 function classifyRequest(message, hasFiles) {
@@ -852,8 +1027,8 @@ function pickGeneratorModel(requestType, manualModel, isAutoMode) {
 const MAX_TOKENS_BY_TYPE = {
   new_app:     32000,   // raised 20k→32k: prevents mid-App.tsx truncation on complex apps
   redesign:    20000,   // raised 16k→20k: redesigns touch many files
-  feature_add: 12000,
-  bug_fix:      8000,
+  feature_add: 16000,   // raised 12k→16k: more context injected, need headroom for targeted changes
+  bug_fix:     10000,   // raised 8k→10k: same reason
 };
 
 const PLANNER_PROMPT = `You are a senior product architect. Given a user's React app request, output a concise JSON build plan.
@@ -982,37 +1157,52 @@ app.post('/api/build', async (req, res) => {
       .filter(Boolean)
       .join('\n\n');
 
-    // Build file context for feature_add / bug_fix — inject current files so AI knows what exists
+    // Build file context for feature_add / bug_fix — inject ALL current files in full
     let filesContext = '';
     if (hasFiles && Object.keys(currentFiles).length > 0 && requestType !== 'new_app') {
-      const MAX_FILES = 6;
-      const MAX_CHARS_PER_FILE = 2000;
+      // Total character budget — well within Claude's 200K context window.
+      // Most generated apps are 20–60 KB total, so all files fit without truncation.
+      const TOTAL_CHAR_BUDGET = 80000;
 
-      // Prioritize App.tsx first, then largest files (most complex / most relevant)
-      const sorted = Object.entries(currentFiles)
-        .sort(([a], [b]) => {
-          if (a === 'App.tsx') return -1;
-          if (b === 'App.tsx') return 1;
-          return (currentFiles[b]?.length ?? 0) - (currentFiles[a]?.length ?? 0);
-        })
-        .slice(0, MAX_FILES);
+      // Sort: App.tsx first, then types.ts, then by size descending (largest = most important)
+      const sorted = Object.entries(currentFiles).sort(([a], [b]) => {
+        if (a === 'App.tsx') return -1;
+        if (b === 'App.tsx') return 1;
+        if (a === 'types.ts') return -1;
+        if (b === 'types.ts') return 1;
+        return (currentFiles[b]?.length ?? 0) - (currentFiles[a]?.length ?? 0);
+      });
 
-      const fileEntries = sorted
-        .map(([name, content]) => {
-          const lang = name.endsWith('.tsx') ? 'tsx' : name.endsWith('.ts') ? 'ts' : name.endsWith('.sql') ? 'sql' : 'txt';
-          const preview = content.length > MAX_CHARS_PER_FILE
-            ? content.slice(0, MAX_CHARS_PER_FILE) + '\n// ...(truncated)'
-            : content;
-          return `\`\`\`${lang} ${name}\n${preview}\n\`\`\``;
-        })
-        .join('\n\n');
+      let totalChars = 0;
+      const fileEntries = [];
+      const truncatedNames = [];
 
-      const totalFiles = Object.keys(currentFiles).length;
-      const skipped = totalFiles - sorted.length;
-      const header = skipped > 0
-        ? `[CURRENT APP FILES — ${skipped} smaller file(s) omitted for brevity — modify only what is needed]`
-        : '[CURRENT APP FILES — modify only what is needed, preserve everything else]';
-      filesContext = `\n\n${header}\n${fileEntries}\n[/CURRENT APP FILES]`;
+      for (const [name, content] of sorted) {
+        const lang = name.endsWith('.tsx') ? 'tsx' : name.endsWith('.ts') ? 'ts' : name.endsWith('.sql') ? 'sql' : 'txt';
+        if (totalChars + content.length > TOTAL_CHAR_BUDGET) {
+          // Budget exhausted — show filename only so AI knows the file exists
+          truncatedNames.push(name);
+          continue;
+        }
+        fileEntries.push(`\`\`\`${lang} ${name}\n${content}\n\`\`\``);
+        totalChars += content.length;
+      }
+
+      // If some files didn't fit, list their names so AI doesn't accidentally overwrite them
+      const existingFilesList = Object.keys(currentFiles).join(', ');
+      const truncationNote = truncatedNames.length > 0
+        ? `\n⚠️ Budget limit reached — the following files exist but are not shown (DO NOT output them unless the user's request specifically requires changing them): ${truncatedNames.join(', ')}`
+        : '';
+
+      const header =
+        `[CURRENT APP FILES — ALL ${Object.keys(currentFiles).length} files shown below in full.\n` +
+        `Complete file list: ${existingFilesList}\n` +
+        `🚨 OUTPUT ONLY FILES THAT ACTUALLY NEED TO CHANGE. Every file you output overwrites the existing version.\n` +
+        `Any file NOT in your response is preserved exactly as-is — you do NOT need to re-output working files.` +
+        truncationNote +
+        `]`;
+
+      filesContext = `\n\n${header}\n${fileEntries.join('\n\n')}\n[/CURRENT APP FILES]`;
     }
 
     // Inject plan context + file context into the last user message
@@ -1024,6 +1214,9 @@ app.post('/api/build', async (req, res) => {
             : m
         )
       : messages;
+
+    // Accumulate generated text so we can validate it after streaming
+    let accumulatedText = '';
 
     if (generatorModel === 'gpt-4o') {
       const stream = await openaiClient.chat.completions.create({
@@ -1037,7 +1230,7 @@ app.post('/api/build', async (req, res) => {
       });
       for await (const chunk of stream) {
         const text = chunk.choices[0]?.delta?.content || '';
-        if (text) send({ text });
+        if (text) { send({ text }); accumulatedText += text; }
       }
     } else if (generatorModel === 'gemini-2.5-flash') {
       const gemModel = geminiClient.getGenerativeModel({
@@ -1054,7 +1247,7 @@ app.post('/api/build', async (req, res) => {
       const result = await chat.sendMessageStream(lastMsg);
       for await (const chunk of result.stream) {
         const text = chunk.text();
-        if (text) send({ text });
+        if (text) { send({ text }); accumulatedText += text; }
       }
     } else {
       // Claude (Sonnet or Opus depending on request type)
@@ -1064,13 +1257,86 @@ app.post('/api/build', async (req, res) => {
         system: effectiveSystemPrompt,
         messages: augmented.map((m) => ({ role: m.role, content: toAnthropicContent(m) })),
       });
-      claudeStream.on('text', (text) => send({ text }));
+      claudeStream.on('text', (text) => { send({ text }); accumulatedText += text; });
       claudeStream.on('error', (error) => {
         console.error('[build] Claude stream error:', error);
         send({ error: error.message });
       });
       await claudeStream.finalMessage();
     }
+
+    // ── Step 4: Post-generation quality pass ────────────────────────────────
+    // 4a. Deterministic programmatic fixes (no AI needed — guaranteed correct)
+    // 4b. Validation for remaining issues (syntax errors, remaining banned patterns)
+    // 4c. AI correction pass for anything the deterministic fixes couldn't handle
+    send({ stage: 'validating' });
+    const generatedFiles = parseFilesFromText(accumulatedText);
+
+    // 4a. Programmatic fixes — regex-based transforms for known banned patterns.
+    // These run BEFORE AI validation so we catch the easy cases deterministically.
+    if (Object.keys(generatedFiles).length > 0) {
+      const { files: progFixed, fixes: progFixes } = applyProgrammaticFixes(generatedFiles);
+      if (progFixes.length > 0) {
+        console.log(`[build] programmatic fixes applied to ${progFixes.length} file(s):`, progFixes.map(f => `${f.file}: ${f.applied.join(', ')}`).join(' | '));
+        // Stream corrected file blocks — client's parser takes the last occurrence of each filename
+        for (const { file } of progFixes) {
+          const fixed = progFixed[file];
+          if (!fixed) continue;
+          const lang = file.endsWith('.tsx') ? 'tsx' : file.endsWith('.sql') ? 'sql' : 'ts';
+          send({ text: `\n\`\`\`${lang} ${file}\n${fixed}\n\`\`\`` });
+          // Update in-memory so validation runs on the fixed version
+          generatedFiles[file] = fixed;
+        }
+      }
+    }
+
+    // 4b. Validation — catch remaining syntax errors and banned patterns
+    const validationErrors = Object.keys(generatedFiles).length > 0
+      ? validateGeneratedFiles(generatedFiles)
+      : [];
+
+    if (validationErrors.length > 0) {
+      console.log(`[build] validation found ${validationErrors.length} file(s) with errors — running correction pass`);
+
+      const errorSummary = validationErrors
+        .map(e => `📄 ${e.file}:\n${e.messages.map(m => `  - ${m}`).join('\n')}`)
+        .join('\n\n');
+
+      const filesToFix = [...new Set(validationErrors.map(e => e.file))];
+      const fileBlocks = filesToFix
+        .filter(f => generatedFiles[f])
+        .map(f => {
+          const lang = f.endsWith('.tsx') ? 'tsx' : 'ts';
+          return `\`\`\`${lang} ${f}\n${generatedFiles[f]}\n\`\`\``;
+        })
+        .join('\n\n');
+
+      const correctionPrompt =
+        `SURGICAL FIX — these critical errors were found in the generated code and MUST be corrected:\n\n` +
+        `[ERRORS]\n${errorSummary}\n[/ERRORS]\n\n` +
+        `Files that need correction:\n${fileBlocks}\n\n` +
+        `Fix ONLY the listed errors. Output ONLY the corrected version of each file that had errors. No explanation needed.`;
+
+      // 4c. Use Sonnet (not Haiku) — Haiku is too weak and often introduces new errors
+      send({ stage: 'validation_fixing', count: validationErrors.length });
+      try {
+        const fixStream = anthropicClient.messages.stream({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 8000,
+          system: SYSTEM_PROMPT,
+          messages: [{ role: 'user', content: correctionPrompt }],
+        });
+        fixStream.on('text', (text) => send({ text }));
+        await fixStream.finalMessage();
+        send({ stage: 'validation_fixed', count: validationErrors.length });
+      } catch (fixErr) {
+        console.error('[build] validation correction failed:', fixErr.message);
+        send({ stage: 'validation_clean' }); // don't block the response on fix failure
+      }
+    } else {
+      send({ stage: 'validation_clean' });
+    }
+
   } catch (error) {
     console.error('[build] Pipeline error:', error);
     const msg = error instanceof Error ? error.message : String(error);
@@ -1205,17 +1471,22 @@ Rewrite this into a detailed, actionable instruction:`;
 // conflict with the repair message's own instructions.
 const REPAIR_SYSTEM_PROMPT = `You are a precise surgical bug fixer. Your ONLY job is to fix the specific runtime error described in the message.
 
-ABSOLUTE RULES — violating any of these makes the repair worse, not better:
+🚨 CRITICAL — YOUR RESPONSE MUST CONTAIN AT LEAST ONE CODE BLOCK:
+Never respond with only text analysis or explanation. Always output the fixed file(s) as code blocks.
+If you are unsure what to change, pick the most likely file and apply the safest fix you can identify.
+A response with zero code blocks is a FAILED repair — it changes nothing and wastes the attempt.
+
+ABSOLUTE RULES:
 1. Output ONLY the files you actually changed. If a file is unchanged, DO NOT output it.
 2. Make the SMALLEST possible change. Fix only the reported error — do not refactor, redesign, or add features.
-3. Never rewrite an entire file unless the entire file is broken. Patch the broken lines only.
-4. The files in the message labelled "READ-ONLY CONTEXT" are provided so you can understand the codebase — do NOT re-output them unless you changed them.
+3. Never rewrite an entire file unless the entire file is broken. Patch only the broken lines.
+4. Files labelled "READ-ONLY CONTEXT" — do NOT re-output them unless you changed them.
 5. Do NOT add comments, logs, or explanations inside code.
 6. Do NOT change file names, component names, or project structure.
 
-Output format for each changed file:
+Required output format (must include at least one code block):
 \`\`\`tsx filename.tsx
-// only the fixed file content here
+// complete fixed file content here
 \`\`\``;
 
 app.post('/api/chat', async (req, res) => {
@@ -1351,11 +1622,17 @@ app.post('/api/ask', async (req, res) => {
   const askStorageContext = buildStorageContext(storageMode, projectConfig, currentFiles);
 
   const ASK_SYSTEM_PROMPT =
-    `You are an expert developer assistant helping with a React/TypeScript web app.\n` +
-    `The user is asking a question — answer it clearly and concisely.\n` +
-    `IMPORTANT: Do NOT generate complete file implementations. Do NOT output full file code blocks.\n` +
-    `You may include short illustrative snippets (under 20 lines) to explain a concept.\n` +
-    `Focus on explaining, advising, and answering — not building.\n` +
+    `You are a senior product consultant for AYACODA AI Studio — an AI-powered React app builder.\n` +
+    `You are in CONSULTATION mode. Your role is to discuss, plan, and advise — you do NOT write code.\n\n` +
+    `When the user describes something to build:\n` +
+    `• Describe in 2-4 sentences what you would create\n` +
+    `• List the key pages/features in bullet points\n` +
+    `• Be enthusiastic and specific — mention component names, data, and interactions\n` +
+    `• End with: "Ready to build? Click the **Build this** button below to start." (always include this exact phrase)\n\n` +
+    `When the user asks a technical question:\n` +
+    `• Answer clearly and concisely\n` +
+    `• You may include short illustrative snippets (under 20 lines) for concepts\n\n` +
+    `NEVER output complete file implementations. NEVER output full code blocks (e.g. \`\`\`tsx App.tsx ...\`\`\`).\n` +
     (askStorageContext
       ? `\n${askStorageContext}\n⚠️ When answering questions about database schema or tables, always keep them in the project schema above — NEVER suggest using the public schema.\n`
       : '') +

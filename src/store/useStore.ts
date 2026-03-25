@@ -49,6 +49,7 @@ interface AppStore {
   clearVisibleMessages: () => void;
   updateLastAssistantPipeline: (pipeline: Message['pipeline']) => void;
   removeLastMessages: (count: number) => void;
+  setLastAssistantBuildIntent: (prompt: string) => void;
 
   // UI State
   isGenerating: boolean;
@@ -100,6 +101,7 @@ interface AppStore {
   // API secrets for third-party integrations — stored in memory, injected into preview via window.ENV
   projectSecrets: Record<string, string>;
   setProjectSecret: (envName: string, value: string) => void;
+  setProjectSecrets: (secrets: Record<string, string>) => void;
   removeProjectSecret: (envName: string) => void;
   clearProjectSecrets: () => void;
 }
@@ -170,6 +172,15 @@ export const useStore = create<AppStore>()(
         })),
       removeLastMessages: (count) =>
         set((state) => ({ messages: state.messages.slice(0, -count) })),
+      setLastAssistantBuildIntent: (prompt) =>
+        set((state) => {
+          const messages = [...state.messages];
+          const lastIdx = messages.findLastIndex((m) => m.role === 'assistant');
+          if (lastIdx >= 0) {
+            messages[lastIdx] = { ...messages[lastIdx], buildIntent: prompt };
+          }
+          return { messages };
+        }),
       updateLastAssistantPipeline: (pipeline) =>
         set((state) => {
           const messages = [...state.messages];
@@ -229,6 +240,7 @@ export const useStore = create<AppStore>()(
       projectSecrets: {},
       setProjectSecret: (envName, value) =>
         set((state) => ({ projectSecrets: { ...state.projectSecrets, [envName]: value } })),
+      setProjectSecrets: (secrets) => set({ projectSecrets: secrets }),
       removeProjectSecret: (envName) =>
         set((state) => {
           const next = { ...state.projectSecrets };

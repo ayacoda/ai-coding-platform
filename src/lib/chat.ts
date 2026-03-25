@@ -41,6 +41,9 @@ export function sanitizeGeneratedFiles(
   const implRe = (n: string) =>
     new RegExp(`(function\\s+${n}[\\s(<]|const\\s+${n}[\\s:=]|class\\s+${n}[\\s{(])`);
   for (const name of interfaceNames) {
+    // Skip names that already have disambiguation suffixes — they've already been renamed.
+    // This prevents cascading renames: AppPageData → AppPageDataData → AppPageDataDataData.
+    if (/(?:Data|Card|Row|Item|Tile|List|View|Type)$/.test(name)) continue;
     const usedAsJSX = new RegExp(`<${name}[\\s/>]`).test(allCode) ||
       new RegExp(`createElement\\(${name}[,\\s)]`).test(allCode);
     if (!usedAsJSX) continue;
@@ -97,7 +100,10 @@ export function sanitizeGeneratedFiles(
     );
     if (jsxFileEntry) {
       const [jsxFile, jsxCode] = jsxFileEntry;
-      result[jsxFile] = stubFn + jsxCode;
+      // Don't inject the stub if one already exists for this name — prevents duplicate stubs.
+      if (!jsxCode.includes(`// Auto-stub: '${name}'`)) {
+        result[jsxFile] = stubFn + jsxCode;
+      }
     }
   }
 
@@ -197,6 +203,130 @@ async function triggerCompletionContinuation(
 }
 
 /**
+ * Detect page files that are stubs — too short or contain placeholder text.
+ * These need a follow-up completion call.
+ */
+function detectStubPages(files: Record<string, string>): string[] {
+  const stubs: string[] = [];
+  for (const [name, code] of Object.entries(files)) {
+    // Only check page-like files
+    if (!name.includes('Page') && !name.startsWith('pages/')) continue;
+    if (name === 'App.tsx') continue;
+    const lines = code.trim().split('\n').length;
+    const lower = code.toLowerCase();
+    const isStub =
+      lines < 25 ||
+      lower.includes('coming soon') ||
+      lower.includes('under construction') ||
+      lower.includes('page coming soon') ||
+      lower.includes('not implemented') ||
+      lower.includes('placeholder') ||
+      (lines < 50 && (lower.includes('return null') || lower.includes('return <div></div>')));
+    if (isStub) stubs.push(name);
+  }
+  return stubs;
+}
+
+/**
+ * Fires a single follow-up call to fully implement all stub/missing pages.
+ * Called after the main generation stream ends whenever stub pages are detected.
+ * Each page gets a complete, production-quality implementation — not a stub.
+ */
+async function triggerPageCompletion(
+  pagesToComplete: string[],
+  currentFiles: Record<string, string>
+): Promise<void> {
+  if (pagesToComplete.length === 0) return;
+  const { setFiles, updateLastAssistantMessage, messages } = useStore.getState();
+
+  console.log('[chat] page completion — completing:', pagesToComplete);
+
+  // Build abbreviated context of the foundation files
+  const contextFiles = ['types.ts', 'data.ts', 'App.tsx', 'components/Sidebar.tsx', 'components/Layout.tsx'];
+  const contextSections = contextFiles
+    .filter(f => currentFiles[f])
+    .map(name => {
+      const code = currentFiles[name];
+      const preview = code.length > 600 ? code.slice(0, 600) + '\n// ...(truncated)' : code;
+      return `\`\`\`tsx ${name}\n${preview}\n\`\`\``;
+    })
+    .join('\n\n');
+
+  // Show what each stub currently looks like
+  const stubSections = pagesToComplete.map(name => {
+    const code = currentFiles[name];
+    if (!code) return `**${name}** — missing entirely, must be created from scratch`;
+    const preview = code.length > 250 ? code.slice(0, 250) + '\n// ...' : code;
+    return `**${name}** — stub (${code.split('\n').length} lines), replace with full implementation:\n\`\`\`tsx\n${preview}\n\`\`\``;
+  }).join('\n\n');
+
+  const prompt =
+    `The app was generated but these pages are stubs or empty — complete them now:\n\n` +
+    `${stubSections}\n\n` +
+    `Foundation context (already generated — DO NOT re-output these):\n${contextSections}\n\n` +
+    `For EACH page listed above, output a COMPLETE fully-implemented version:\n` +
+    `• Full working UI — tables, cards, modals, forms, filters, all interactive\n` +
+    `• Use the same types and data from types.ts/data.ts\n` +
+    `• Match the dark zinc-950/900/800 theme from the other files\n` +
+    `• 15+ realistic records rendered in the UI\n` +
+    `• NO "coming soon", NO placeholders, NO TODO comments\n` +
+    `Output ONLY the listed page files. Do NOT re-output App.tsx, types.ts, data.ts, or any other file.`;
+
+  try {
+    const { storageMode, projectConfig } = useStore.getState();
+    const resp = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: prompt }],
+        model: 'claude-opus-4-6',
+        storageMode,
+        projectConfig,
+      }),
+    });
+    if (!resp.ok) { console.warn('[chat] page completion HTTP error:', resp.status); return; }
+
+    const reader = resp.body!.getReader();
+    const decoder = new TextDecoder();
+    let fullContent = '';
+    let buf = '';
+
+    // Append progress note to last assistant message
+    const lastMsg = [...messages].reverse().find(m => m.role === 'assistant');
+    const baseContent = lastMsg?.content ?? '';
+    updateLastAssistantMessage(baseContent + '\n\n---\n*Completing missing pages…*');
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') break;
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.text) {
+            fullContent += parsed.text;
+            updateLastAssistantMessage(baseContent + '\n\n---\n*Completing missing pages…*\n\n' + fullContent);
+          }
+        } catch { /* skip malformed lines */ }
+      }
+    }
+
+    const completedFiles = parseFilesFromResponse(fullContent);
+    console.log('[chat] page completion result:', Object.keys(completedFiles));
+    if (Object.keys(completedFiles).length > 0) {
+      setFiles(completedFiles);
+    }
+  } catch (e) {
+    console.warn('[chat] page completion failed:', e);
+  }
+}
+
+/**
  * Picks the best model for repair (surgical fix) scenarios.
  * Claude is best at careful, targeted fixes.
  */
@@ -215,6 +345,7 @@ export async function sendAskMessage(userInput: string, attachments?: ChatAttach
     setIsGenerating,
     setLastMessageStreaming,
     setLastMessageError,
+    setLastAssistantBuildIntent,
     setHasApiKey,
     selectedModel,
     removeLastMessages,
@@ -228,7 +359,7 @@ export async function sendAskMessage(userInput: string, attachments?: ChatAttach
     content: userInput,
     imageAttachments: imageAttachments.map((a) => ({ dataUrl: a.dataUrl!, name: a.name })),
   });
-  addMessage({ id: genId(), role: 'assistant', content: '', isStreaming: true });
+  addMessage({ id: genId(), role: 'assistant', content: '', isStreaming: true, isAskResponse: true });
 
   setIsGenerating(true);
   currentAbortController = new AbortController();
@@ -302,6 +433,9 @@ export async function sendAskMessage(userInput: string, attachments?: ChatAttach
       }
     }
 
+    // Store the AI's full response as the build prompt so clicking "Build this"
+    // sends the complete detailed description — not the user's short original prompt.
+    setLastAssistantBuildIntent(fullContent);
     setLastMessageStreaming(false);
   } catch (err) {
     if (err instanceof Error && err.name === 'AbortError') {
@@ -420,11 +554,19 @@ export async function sendChatMessage(
       deduped.push(raw[i]);
     }
 
-    // Replace the last message (current user message) with full content + images
+    // Replace the last message (current user message) with full content + images.
+    // Guard: if the current user message had no text (image-only), the filter above removes it,
+    // so deduped may end on an assistant message. Check role before assigning images.
     if (deduped.length > 0) {
-      const last = { ...deduped[deduped.length - 1], content: userContent };
-      if (images) (last as HistoryMsg).images = images;
-      history = [...deduped.slice(0, -1), last];
+      const lastMsg = deduped[deduped.length - 1];
+      if (lastMsg.role === 'user') {
+        const last = { ...lastMsg, content: userContent };
+        if (images) (last as HistoryMsg).images = images;
+        history = [...deduped.slice(0, -1), last];
+      } else {
+        // Image-only user message was filtered out — append it as a new entry
+        history = [...deduped, { role: 'user', content: userContent, ...(images ? { images } : {}) }];
+      }
     } else {
       history = [{ role: 'user', content: userContent, ...(images ? { images } : {}) }];
     }
@@ -566,6 +708,21 @@ export async function sendChatMessage(
                 updateStage('polishing', 'running');
                 break;
               }
+              case 'validating': {
+                // Mark generating (or polishing) done, start validating
+                updateStage('generating', 'done');
+                updateStage('polishing', 'done');
+                updateStage('validating', 'running');
+                break;
+              }
+              case 'validation_fixing':
+                // Validation found errors and is running a correction — no UI change needed
+                break;
+              case 'validation_fixed':
+              case 'validation_clean': {
+                updateStage('validating', 'done');
+                break;
+              }
               case 'manifest': {
                 // Server-derived list of files the generator must produce.
                 // Stored so we can detect truncation after the stream ends.
@@ -592,11 +749,22 @@ export async function sendChatMessage(
     }
 
     const rawFiles = parseFilesFromResponse(fullContent);
-    // Pass existing files as context so collision detection works for surgical fixes
-    // (e.g. interface Project in types.ts seen even when only App.tsx was returned).
     const existingFiles = useStore.getState().files;
-    const newFiles = sanitizeGeneratedFiles(rawFiles, existingFiles);
+    // Sanitize only for initial generation — never for repairs.
+    // Repairs are surgical: the original generation already ran sanitize.
+    // Re-running sanitize on repairs causes cascading renames:
+    //   AppPage → AppPageData (repair 1) → AppPageDataData (repair 2) → AppPageDataDataData (repair 3).
+    const newFiles = isRepair ? rawFiles : sanitizeGeneratedFiles(rawFiles, existingFiles);
     console.log('[chat] parsed files:', Object.keys(newFiles), '| content length:', fullContent.length);
+
+    // If repair returned NO code blocks, treat it as a failed attempt — signal via error so
+    // the auto-fixer knows to retry with a stronger/more explicit prompt, rather than silently
+    // leaving unchanged files in place (which would cause the same error to fire again immediately).
+    if (isRepair && Object.keys(newFiles).length === 0) {
+      console.warn('[chat] repair returned no code — escalating');
+      setLastMessageError('Repair returned no code changes. Retrying with stronger instructions…');
+      return;
+    }
 
     // Truncation detection: if this was a new_app, we got some files but App.tsx is absent,
     // the model hit the token limit before finishing. Auto-trigger a completion continuation.
@@ -613,9 +781,31 @@ export async function sendChatMessage(
       const allFilesNow = { ...existingFiles, ...newFiles };
       const missingFiles = (capturedManifest ?? ['App.tsx']).filter(f => !rawFiles[f]);
       await triggerCompletionContinuation(missingFiles, allFilesNow);
+      // After continuation, also complete any stub pages that were generated but empty
+      const allFilesAfterCont = useStore.getState().files;
+      const stubsAfterCont = detectStubPages(allFilesAfterCont);
+      const missingPagesAfterCont = (capturedManifest ?? [])
+        .filter(f => f.startsWith('pages/') && !allFilesAfterCont[f]);
+      const toCompleteAfterCont = [...new Set([...stubsAfterCont, ...missingPagesAfterCont])];
+      if (toCompleteAfterCont.length > 0) {
+        await triggerPageCompletion(toCompleteAfterCont, allFilesAfterCont);
+      }
     } else if (Object.keys(newFiles).length > 0) {
       setFiles(newFiles);
       setRightPanel('preview');
+
+      // For new_app: scan for stub/missing pages and complete them with a follow-up call.
+      // This ensures every page has full implementation — not stubs or "coming soon" placeholders.
+      if (!isRepair && isNewApp) {
+        const allFiles = { ...existingFiles, ...newFiles };
+        const stubPages = detectStubPages(allFiles);
+        const missingManifestPages = (capturedManifest ?? [])
+          .filter(f => f.startsWith('pages/') && !allFiles[f]);
+        const pagesToComplete = [...new Set([...stubPages, ...missingManifestPages])];
+        if (pagesToComplete.length > 0) {
+          await triggerPageCompletion(pagesToComplete, allFiles);
+        }
+      }
 
       // Fallback rename: if this was a new_app and the plan rename didn't fire (e.g. planner JSON
       // parse failed), extract a title from the generated files' <title> tag or document.title call.

@@ -12,7 +12,7 @@ export interface PipelinePlan {
 }
 
 export interface PipelineStageInfo {
-  name: 'routing' | 'planning' | 'generating' | 'polishing';
+  name: 'routing' | 'planning' | 'generating' | 'polishing' | 'validating';
   status: 'running' | 'done';
   model?: string;
 }
@@ -46,6 +46,13 @@ export interface Message {
   };
   /** True for auto-repair (error-fix) messages — code blocks should be hidden when done */
   isRepairMessage?: boolean;
+  /**
+   * Set on Ask-mode assistant responses. Stores the AI's full response text so the
+   * "Switch to Build mode" button can re-send it as a build request.
+   */
+  buildIntent?: string;
+  /** Marks this as an Ask-mode response — code blocks hidden to prevent confusion. */
+  isAskResponse?: boolean;
 }
 
 export interface QueueItem {
@@ -63,4 +70,6 @@ export interface ProjectConfig {
   /** Short unique project ID, e.g. 'p_a1b2c3d4' */
   id: string;
   storageMode: StorageMode;
+  /** Per-project API secrets for third-party integrations, stored inside project_config JSONB */
+  secrets?: Record<string, string>;
 }

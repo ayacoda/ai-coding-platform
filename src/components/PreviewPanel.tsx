@@ -6,20 +6,21 @@ import { buildPreviewHTML } from '../lib/preview';
 import { sendChatMessage } from '../lib/chat';
 import { saveVersion } from '../lib/versions';
 
-// Maximum total repair attempts per generation (NOT reset by file changes from repair itself).
-// Only 2 attempts: attempt 1 is targeted (suspect files), attempt 2 sends ALL files.
-// After 2 attempts, we stop — looping never fixes structural code issues.
-const MAX_FIX_ATTEMPTS = 2;
-// Stop immediately if the same error fingerprint repeats consecutively.
-const STUCK_THRESHOLD = 2;
+// Stop if the EXACT same error fingerprint repeats this many times in a row — genuine infinite loop.
+// Only stopping condition: keeps fixing cascading errors (A → B → C → fixed) indefinitely.
+const STUCK_THRESHOLD = 5;
 
-/** Normalize an error string so minor variations (line numbers, token values) don't defeat stuck detection. */
+/** Normalize an error string so minor variations (line numbers) don't defeat stuck detection.
+ *  IMPORTANT: keep the identifier in "X is not defined" errors so that fixing AppointmentsPage
+ *  (→ TreatmentCard is not defined) is correctly seen as PROGRESS, not the same stuck error. */
 function normalizeError(msg: string): string {
   return msg
     .replace(/line\s+\d+/gi, 'line N')      // line 42 → line N
     .replace(/col(?:umn)?\s+\d+/gi, 'col N') // col 7 → col N
     .replace(/at\s+\S+:\d+:\d+/g, '')        // at file:1:2 → (removed)
-    .replace(/'\S+'|"\S+"/g, "'X'")          // 'foo' → 'X'  (variable identifiers)
+    // Don't normalize quoted identifiers in "X is not defined" — each different missing name
+    // is genuine progress, not a repeated error. Only collapse quoted values elsewhere.
+    .replace(/(?<!not defined)'[^']{20,}'|(?<!not defined)"[^"]{20,}"/g, "'...'")
     .slice(0, 120)
     .trim();
 }
@@ -362,7 +363,7 @@ function ErrorOverlay({
             </p>
             <p className="text-zinc-500 text-xs mt-0.5">
               {isStuck
-                ? `${fixAttempt} attempts couldn't resolve this — describe the fix in chat`
+                ? 'Same error keeps repeating — click Try Again or describe the fix in chat'
                 : 'Auto-fix will start shortly…'}
             </p>
           </div>
@@ -723,6 +724,7 @@ export default function PreviewPanel() {
   const filesRef = useRef(files);
   const isFixingRef = useRef(false);
   const isGeneratingRef = useRef(isGenerating);
+  const isStuckRef = useRef(false);
   // Track last N error messages to detect "stuck" loops
   const recentErrors = useRef<string[]>([]);
   const autoFixTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -734,6 +736,7 @@ export default function PreviewPanel() {
   useEffect(() => { filesRef.current = files; }, [files]);
   useEffect(() => { isFixingRef.current = isFixing; }, [isFixing]);
   useEffect(() => { isGeneratingRef.current = isGenerating; }, [isGenerating]);
+  useEffect(() => { isStuckRef.current = isStuck; }, [isStuck]);
 
   const streamingContent = useMemo(() => {
     const last = [...messages].reverse().find((m) => m.role === 'assistant' && m.isStreaming);
@@ -757,19 +760,15 @@ export default function PreviewPanel() {
       globalRepairCount.current = 0;
       setFixAttempt(0);
       setIsStuck(false);
+      isStuckRef.current = false;
     }
   }, [files]);
 
   function doFix(error: string) {
     if (isFixingRef.current || isGeneratingRef.current) return;
 
-    // Hard cap using persistent ref — not bypassed by file changes from repairs.
     globalRepairCount.current += 1;
     const attemptNumber = globalRepairCount.current;
-    if (attemptNumber > MAX_FIX_ATTEMPTS) {
-      setIsStuck(true);
-      return;
-    }
 
     // Fuzzy stuck detection — normalize errors before comparing.
     const fingerprint = normalizeError(error);
@@ -779,6 +778,7 @@ export default function PreviewPanel() {
       recentErrors.current.every((e) => e === fingerprint)
     ) {
       setIsStuck(true);
+      isStuckRef.current = true;
       return;
     }
 
@@ -809,6 +809,16 @@ export default function PreviewPanel() {
         /import.*from.*@supabase\/supabase-js/.test(code)
       );
 
+    // Detect bare `db` or `supabase` used as a variable instead of `window.db`.
+    // This happens when the AI writes `db.from(...)` or `const db = supabase` instead of `window.db.from(...)`.
+    const isWindowDbCrash = !isSupabaseCrash && (errorSymbol === 'db' || errorSymbol === 'supabase') &&
+      Object.values(currentFiles).some((code) =>
+        /(?<![.\w])db\.(?:from|auth|storage|rpc|channel|functions)\s*[.(]/.test(code) ||
+        /(?<![.\w])supabase\.(?:from|auth|storage|rpc|channel|functions)\s*[.(]/.test(code) ||
+        /\bconst\s+(?:db|supabase)\s*=/.test(code) ||
+        /\blet\s+(?:db|supabase)\s*=/.test(code)
+      );
+
     // "Illegal return statement" — a bare `return` exists at file/module top level (outside any function).
     // The sandbox eval() runs at script scope so top-level returns are illegal.
     // We don't know which file has it, so we must send ALL files.
@@ -825,18 +835,18 @@ export default function PreviewPanel() {
     // For other errors, only send suspect files to keep context small.
     const suspectFiles = new Set<string>();
     suspectFiles.add('App.tsx');
-    if (!isInterfaceAsComponentCrash && !isSupabaseCrash && !isIllegalReturnCrash && !isInvalidLhsCrash && !isSchemaNameCrash && errorSymbol) {
+    if (!isInterfaceAsComponentCrash && !isSupabaseCrash && !isWindowDbCrash && !isIllegalReturnCrash && !isInvalidLhsCrash && !isSchemaNameCrash && errorSymbol) {
       for (const [fname, code] of Object.entries(currentFiles)) {
         if (code.includes(errorSymbol)) suspectFiles.add(fname);
       }
     }
 
-    // Attempt 2: escalate to ALL files regardless of error type (broader context for the fix).
-    // Never rewrite the whole app — that just regenerates the same broken code.
-    const needsAllFiles = isInterfaceAsComponentCrash || isSupabaseCrash || isIllegalReturnCrash ||
-      isInvalidLhsCrash || isSchemaNameCrash || attemptNumber >= 2;
+    // Attempt 2+: always escalate to ALL files for broader context.
+    const needsAllFiles = isInterfaceAsComponentCrash || isSupabaseCrash || isWindowDbCrash ||
+      isIllegalReturnCrash || isInvalidLhsCrash || isSchemaNameCrash || attemptNumber >= 2;
     const allFilesLabel = isInterfaceAsComponentCrash ? 'interface-as-component rename'
       : isSupabaseCrash ? 'Supabase import fix'
+      : isWindowDbCrash ? 'window.db fix — scan every file for bare db usage'
       : isIllegalReturnCrash ? 'illegal return — must scan every file'
       : isInvalidLhsCrash ? 'invalid LHS — must find JS syntax error in style/expression'
       : isSchemaNameCrash ? 'schema-name-as-variable — must replace in all files'
@@ -860,6 +870,26 @@ export default function PreviewPanel() {
 
     // Always use Opus for all repair attempts — best quality, fewest follow-up errors.
     const overrideModel = 'claude-opus-4-6';
+
+    // Escalation context — injected when this is not the first attempt.
+    // Since we use isolatedContext:true, the model has no memory. We inject history manually.
+    const escalationContext = attemptNumber <= 1 ? '' :
+      attemptNumber === 2
+        ? `\n\n🔴 SECOND ATTEMPT: Your previous fix DID NOT resolve the error. The EXACT SAME error is still occurring.\n` +
+          `You need to find what you MISSED. Check: Did you update ALL files? Is the same variable used in a different file? Did you accidentally reintroduce the problem?`
+        : attemptNumber === 3
+        ? `\n\n🔴 THIRD ATTEMPT (${attemptNumber - 1} previous fixes FAILED): Do NOT repeat the same approach.\n` +
+          `ESCALATED STRATEGY — completely rewrite the affected component(s) from scratch:\n` +
+          `• Remove ALL uses of the broken API/variable/import entirely\n` +
+          `• Replace with a simpler working implementation\n` +
+          `• A working app with fewer features is BETTER than a crashing full-featured app`
+        : `\n\n🚨 ATTEMPT #${attemptNumber} (${attemptNumber - 1} previous fixes ALL FAILED):\n` +
+          `NUCLEAR APPROACH — the current implementation is fundamentally broken. You must:\n` +
+          `1. Identify the ROOT CAUSE (what variable/import/API is broken)\n` +
+          `2. Remove ALL usage of that broken thing from every file\n` +
+          `3. Replace database calls with hardcoded mock data arrays if window.db keeps failing\n` +
+          `4. Remove features if necessary — a working simple app beats a broken complex one\n` +
+          `Output EVERY file you change, completely rewritten if needed.`;
 
     // Build a targeted hint based on the error type.
     const e = error.toLowerCase();
@@ -890,6 +920,27 @@ export default function PreviewPanel() {
           `  4. Change: supabase.auth.signIn(...)  →  window.db.auth.signInWithPassword(...)\n` +
           `  5. Remove ALL imports of createClient, SupabaseClient, or anything from @supabase/supabase-js.\n` +
           `  window.db is pre-configured globally — use it everywhere, no import needed.`;
+      } else if (/^(user|profile|session|currentUser|authUser)$/.test(name)) {
+        extraHint = `\n⚠️ ROOT CAUSE: "${name}" is an auth/session variable that doesn't exist in the preview sandbox.\n` +
+          `The sandbox has no logged-in user — Supabase auth calls return null and async state never resolves.\n` +
+          `REQUIRED FIX — add a static mock so the preview renders:\n` +
+          `  1. At the top of App.tsx (outside any component), add:\n` +
+          `     const ${name} = { id: 'demo_user_01', email: 'demo@example.com', name: 'Demo User', role: 'user', avatar_url: '' };\n` +
+          `  2. Remove any async auth calls (window.db.auth.getUser, onAuthStateChange) that set "${name}".\n` +
+          `  3. Pass "${name}" as a prop to child components that need it.\n` +
+          `✅ Output EVERY file you changed as a full code block.`;
+      } else if (isWindowDbCrash) {
+        extraHint = `\n⚠️ ROOT CAUSE: "${name}" is used as a bare variable but it DOES NOT EXIST as a global.\n` +
+          `In the preview sandbox, the Supabase client is ONLY available as \`window.db\` — NOT as \`db\` or \`supabase\`.\n` +
+          `REQUIRED FIX — search EVERY file for these patterns and fix them:\n` +
+          `  ❌ db.from(...)             →  ✅ window.db.from(...)\n` +
+          `  ❌ db.auth.signIn(...)      →  ✅ window.db.auth.signInWithPassword(...)\n` +
+          `  ❌ supabase.from(...)       →  ✅ window.db.from(...)\n` +
+          `  ❌ const db = ...           →  ✅ delete this line entirely\n` +
+          `  ❌ const supabase = ...     →  ✅ delete this line entirely\n` +
+          `  ❌ const { db } = ...       →  ✅ delete this line entirely\n` +
+          `Use ONLY \`window.db.from()\`, \`window.db.auth.*\`, \`window.db.storage.*\` — never a local \`db\` variable.\n` +
+          `✅ Output EVERY file you changed as a full code block.`;
       } else {
         extraHint = `\n• "${name} is not defined" — MOST LIKELY CAUSES:\n` +
           `  1. Missing import: check every file that uses "${name}" has an import statement for it.\n` +
@@ -956,6 +1007,19 @@ export default function PreviewPanel() {
         `✅ Replace every "supabase.auth.*" with "window.db.auth.*" in all files.\n` +
         `✅ Remove ALL imports from '@supabase/supabase-js' — use window.db everywhere.\n` +
         `✅ Output each changed file as a full code block.`
+      : isWindowDbCrash
+      ? `WINDOW.DB FIX REQUIRED — the sandbox only provides \`window.db\`, NOT a local \`db\` variable.\n` +
+        `Search EVERY file and make these replacements:\n` +
+        `  ❌ db.from(...)           →  ✅ window.db.from(...)\n` +
+        `  ❌ db.auth.*              →  ✅ window.db.auth.*\n` +
+        `  ❌ db.storage.*           →  ✅ window.db.storage.*\n` +
+        `  ❌ db.rpc(...)            →  ✅ window.db.rpc(...)\n` +
+        `  ❌ supabase.from(...)     →  ✅ window.db.from(...)\n` +
+        `  ❌ const db = ...         →  ✅ DELETE this line\n` +
+        `  ❌ const supabase = ...   →  ✅ DELETE this line\n` +
+        `  ❌ const { db } = ...     →  ✅ DELETE this line\n` +
+        `CRITICAL: There must be ZERO occurrences of bare \`db.\` (not preceded by \`window.\`) in any file.\n` +
+        `✅ Output EVERY file you changed as a full code block.`
       : isIllegalReturnCrash
       ? `ILLEGAL RETURN FIX REQUIRED — scan ALL files for bare \`return\` statements at module/file top level.\n` +
         `✅ Delete any \`return\` statement that is not inside a function, class, or arrow function.\n` +
@@ -989,7 +1053,8 @@ export default function PreviewPanel() {
         `✅ Never guess — verify the root cause in the file before changing anything.`;
 
     sendChatMessage(
-      `You are in STRICT REPAIR MODE. Fix the runtime error below using the smallest possible change.\n\n` +
+      `You are in STRICT REPAIR MODE. Fix the runtime error below.` +
+      escalationContext + `\n\n` +
       `ERROR:\n\`\`\`\n${error}\n\`\`\`\n\n` +
       `${filesSummary}\n\n` +
       fixInstruction +
@@ -1019,18 +1084,13 @@ export default function PreviewPanel() {
 
         if (autoFixTimer.current) clearTimeout(autoFixTimer.current);
 
-        // Only schedule auto-fix if we haven't exhausted attempts.
-        // Never auto-fix once stuck — prevents infinite loops.
-        if (globalRepairCount.current < MAX_FIX_ATTEMPTS) {
-          setIsStuck(false);
+        // Always schedule a fix — only backs off when the exact same error repeats (stuck detection).
+        if (!isStuckRef.current) {
           autoFixTimer.current = setTimeout(() => {
             if (!isFixingRef.current && !isGeneratingRef.current) {
               doFix(msg);
             }
           }, 1500);
-        } else {
-          // Attempts exhausted — show stuck state so user knows to re-prompt manually
-          setIsStuck(true);
         }
       } else if (e.data?.type === 'preview-ready') {
         // Successfully rendered — reset everything including the persistent repair counter
@@ -1038,6 +1098,7 @@ export default function PreviewPanel() {
         globalRepairCount.current = 0;
         setFixAttempt(0);
         setIsStuck(false);
+        isStuckRef.current = false;
         setPreviewError(null);
 
         // Consume and save the pending version snapshot
@@ -1068,6 +1129,7 @@ export default function PreviewPanel() {
       recentErrors.current = [];      // clear stuck error fingerprints
       globalRepairCount.current = 0;  // reset attempt counter so retry actually fires
       setIsStuck(false);
+      isStuckRef.current = false;
       doFix(previewError);
     }
   }

@@ -139,26 +139,41 @@ export const KNOWN_INTEGRATIONS: IntegrationDef[] = [
   },
 ];
 
-// Detect integration intent in a message
-const INTENT_RE = /\b(integrat|connect|add|use|set\s*up|implement|enable|hook\s*up|incorporat|embed|include|build\s*with|plug\s*in)\b/i;
-const API_CTX_RE = /\b(api|sdk|key|token|library|lib|endpoint|integration)\b/i;
-
 export interface DetectedIntegration {
   def: IntegrationDef;
   missingKeys: ServiceKeyDef[];
 }
 
+/**
+ * Detects third-party integrations mentioned in a message.
+ * Triggers whenever a known service name appears — no intent/api keyword required.
+ * Only reports integrations where at least one required key is missing.
+ */
 export function detectIntegrations(
   message: string,
   storedSecrets: Record<string, string>
 ): DetectedIntegration[] {
-  const hasIntent = INTENT_RE.test(message);
-  const hasApiCtx = API_CTX_RE.test(message);
-  if (!hasIntent && !hasApiCtx) return [];
-
   const results: DetectedIntegration[] = [];
   for (const def of KNOWN_INTEGRATIONS) {
     if (!def.patterns.some((p) => p.test(message))) continue;
+    const missing = def.keys.filter((k) => !storedSecrets[k.envName]);
+    if (missing.length > 0) results.push({ def, missingKeys: missing });
+  }
+  return results;
+}
+
+/**
+ * Scans file contents for integration usage patterns.
+ * Used after code generation to prompt for any API keys the generated code needs.
+ */
+export function detectIntegrationsInFiles(
+  files: Record<string, string>,
+  storedSecrets: Record<string, string>
+): DetectedIntegration[] {
+  const allContent = Object.values(files).join('\n');
+  const results: DetectedIntegration[] = [];
+  for (const def of KNOWN_INTEGRATIONS) {
+    if (!def.patterns.some((p) => p.test(allContent))) continue;
     const missing = def.keys.filter((k) => !storedSecrets[k.envName]);
     if (missing.length > 0) results.push({ def, missingKeys: missing });
   }

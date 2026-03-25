@@ -258,7 +258,7 @@ export default function DashboardPage() {
   const navigate = useNavigate();
   const [projects, setProjects] = useState<DbProject[]>([]);
   const [loading, setLoading] = useState(true);
-  const [creating, setCreating] = useState(false);
+  const [creating] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [confirmDeleteProject, setConfirmDeleteProject] = useState<DbProject | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -308,26 +308,8 @@ export default function DashboardPage() {
     fetchProjects();
   }, [fetchProjects]);
 
-  async function createProject() {
-    setCreating(true);
-    const { data, error } = await supabase
-      .from('projects')
-      .insert({
-        user_id: user!.id,
-        name: 'Untitled Project',
-        files: {},
-        storage_mode: 'supabase',
-      })
-      .select()
-      .single();
-
-    if (error) {
-      console.error('[dashboard] create error:', error.message);
-      setCreating(false);
-      return;
-    }
-
-    navigate(`/project/${data.id}`);
+  function createProject() {
+    navigate('/project/new');
   }
 
   async function deleteProject(id: string) {
