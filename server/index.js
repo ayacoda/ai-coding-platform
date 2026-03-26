@@ -262,11 +262,29 @@ Exception: Only use real auth (window.db.auth.*) when user explicitly asks for l
       → ✅ new RegExp(escapeRegExp(query), 'i').test(i.name)
       → ❌ items.filter(i => /query/i.test(i.name))  — regex literal in JSX = "Invalid regular expression"
 
-【RULE 5 — STATE SAFETY】
-   ❌ useState<Item[] | null>(null) then .filter() → CRASH
+【RULE 5 — STATE & DATA SAFETY】
+   ❌ useState<Item[] | null>(null) then .filter()/.map() → CRASH ("Cannot read properties of null")
    ❌ useState<Data>() then .rows.map() → CRASH
-   ✅ useState<Item[]>([]) • useState<Data>({ rows: [], cols: [] })
+   ❌ const [data, setData] = useState(null) — null crashes on .map()/.filter()
+   ✅ ALWAYS initialize array state with []: useState<Item[]>([])
    ✅ Optional chaining everywhere: items?.map(...) ?? []
+   ✅ Guard all async data: {data && data.map(...)} or {(data ?? []).map(...)}
+
+SAFE DATA PATTERN for Supabase projects (use this EXACT pattern, no variations):
+   const [items, setItems] = useState<ItemType[]>([]);  // [] not null
+   const [loading, setLoading] = useState(true);
+   useEffect(() => {
+     window.db.from('tablename').select('*').then(({ data }) => {
+       setItems(data ?? []);  // ?? [] guards against null result
+       setLoading(false);
+     });
+   }, []);
+   // In JSX: {loading ? <Spinner /> : items.map(item => ...)}
+
+SAFE DATA PATTERN for localStorage/static apps (preferred — no async issues):
+   // In data.ts — ALL data as static arrays, no async, no Supabase calls
+   export const TICKETS: Ticket[] = [{ id: '1', ... }, { id: '2', ... }];
+   // In component — use the static array directly, zero crash risk
 
 【RULE 6 — IMPORTS & FILES】
    ✅ import { useState } from 'react' • import type { X } from './types'
@@ -274,6 +292,17 @@ Exception: Only use real auth (window.db.auth.*) when user explicitly asks for l
    🔴 Every <Component /> used in JSX must be imported. Missing import = crash.
    🔴 Every file you import MUST also be output as a code block in this response.
    🔴 Every JSX tag must be closed. Wrap multiple returns in <>. Use {expr} not bare expressions.
+
+【RULE 7 — SANDBOX COMPLEXITY LIMIT】
+The sandbox evaluates all files as a single merged script. Complex patterns break it:
+   ❌ SQL/RPC function calls via schema variable: p_xxxx.myFunction() — only .from()/.auth()/.storage()/.rpc() exist
+   ❌ Deep async chains: Promise.all, concurrent fetches, race conditions — use simple sequential useEffect
+   ❌ Dynamic imports: import() — not supported in sandbox
+   ❌ Web Workers, IndexedDB, Broadcast Channel — not available
+   ❌ Complex class hierarchies, decorators, abstract classes — TypeScript erases them wrong
+   ✅ Supabase RPC calls: window.db.rpc('function_name', { param: value }) — NOT schema.function_name()
+   ✅ Keep each component under 100 lines — smaller is more reliable
+   ✅ If in doubt: use a static data array instead of async Supabase call
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🎨 PHASE 5 — UI QUALITY STANDARDS
@@ -877,6 +906,33 @@ function validateGeneratedFiles(files) {
     if (/\b(?:const|let|var)\s+(?:db|supabase)\s*=/.test(content)) {
       fileErrors.push(`BANNED: 'const db = ...' or 'const supabase = ...' creates a local variable that shadows nothing useful. Use window.db directly — no local alias needed.`);
     }
+    // Auth context patterns — crash because there's no Provider wrapping the app
+    if (/\b(?:useAuth|useUser|useSupabaseUser|useSession)\s*\(\s*\)/.test(content)) {
+      fileErrors.push(`BANNED: useAuth()/useUser()/useSession() hooks are not defined in the sandbox. Define a DEMO_USER constant inside the App function and pass as props instead.`);
+    }
+    if (/useContext\s*\(\s*[A-Z]\w*(?:Auth|User|Session)\w*Context/.test(content)) {
+      fileErrors.push(`BANNED: useContext(AuthContext) crashes because no Provider wraps the app. Use a DEMO_USER constant in App.tsx and pass as props.`);
+    }
+    // localStorage/sessionStorage — banned per RULE 4
+    if (/\b(?:localStorage|sessionStorage)\s*\.(?:setItem|getItem|removeItem|clear)\s*\(/.test(content)) {
+      fileErrors.push(`BANNED: localStorage/sessionStorage is not available in the sandbox. Use useState for all state.`);
+    }
+    // fetch() calls — banned per RULE 4 (use static data arrays in data.ts instead)
+    if (/(?<![.\w])fetch\s*\(/.test(content)) {
+      fileErrors.push(`BANNED: fetch() HTTP calls are not available in the sandbox. Use static mock data arrays in data.ts, or window.db for Supabase projects.`);
+    }
+    // External package imports that will crash after import stripping
+    if (/from\s+['"](?:lucide-react|framer-motion|recharts|@headlessui|@heroicons|react-icons|axios|lodash|date-fns|moment|@mui|antd|@radix-ui|@tanstack\/react-query|zustand|react-hook-form)['"]/.test(content)) {
+      fileErrors.push(`BANNED IMPORT: External npm packages are not available in the sandbox. Use plain Tailwind CSS, React built-ins, and SVG icons instead.`);
+    }
+    // Supabase auth subscriptions — async and crash in sandbox
+    if (/window\.db\.auth\.onAuthStateChange/.test(content)) {
+      fileErrors.push(`BANNED: window.db.auth.onAuthStateChange() is an async subscription that crashes in the sandbox. Remove it and use a DEMO_USER mock instead.`);
+    }
+    // window.db.auth.getUser() / getSession() — async, returns null in sandbox
+    if (/window\.db\.auth\.(?:getUser|getSession)\s*\(/.test(content)) {
+      fileErrors.push(`BANNED: window.db.auth.getUser()/getSession() return null in the sandbox — async auth state never resolves. Use a DEMO_USER constant instead.`);
+    }
 
     if (fileErrors.length > 0) {
       errors.push({ file: filename, messages: fileErrors });
@@ -919,6 +975,36 @@ function applyProgrammaticFixes(files) {
     // 4. Replace bare db.X( → window.db.X(  (not preceded by window. or any identifier)
     const c4 = c.replace(/(?<![.\w])db\.(from|auth|storage|rpc|channel|functions)\b/g, 'window.db.$1');
     if (c4 !== c) { applied.push('replaced db.X → window.db.X'); c = c4; }
+
+    // 5. Fix useState<T[]>(null) → useState<T[]>([]) — crashes on .map()/.filter() before data loads
+    const c5 = c.replace(/useState\s*<([^>]+\[\])>\s*\(\s*null\s*\)/g, 'useState<$1>([])');
+    if (c5 !== c) { applied.push('fixed useState<T[]>(null) → useState<T[]>([])'); c = c5; }
+
+    // 6. Fix useState(null) for common array-typed variable names — prevents "Cannot read properties of null"
+    const c6 = c.replace(
+      /\b(const|let)\s+\[(\w+),\s*set\w+\]\s*=\s*useState\s*\(\s*null\s*\)/g,
+      (match, decl, varName) => {
+        const arrayNames = /^(data|items|rows|users|products|orders|tickets|events|records|results|list|entries|messages|tasks|posts|comments|notifications|bookings|transactions|cards|files|tags|categories|options|members|sessions|logs|metrics)s?$/i;
+        return arrayNames.test(varName) ? match.replace('useState(null)', 'useState([])') : match;
+      }
+    );
+    if (c6 !== c) { applied.push('fixed useState(null) → useState([]) for array-named state'); c = c6; }
+
+    // 7. Remove imports of banned external packages (they crash after import stripping)
+    // Keeps React/ReactDOM imports in case AI writes them (they're stripped but harmless)
+    const bannedPkgs = /^[^\n]*import[^'"]*from\s+['"](?:lucide-react|framer-motion|recharts|@headlessui|@heroicons|react-icons|react-router|react-router-dom|axios|lodash|date-fns|moment|clsx|classnames|tailwind-merge|@radix-ui|@tanstack|react-query|zustand|jotai|immer|zod|yup|react-hook-form|@mui|antd|chakra-ui|@chakra-ui)['"]\s*;?\n?/gm;
+    const c7 = c.replace(bannedPkgs, '');
+    if (c7 !== c) { applied.push('removed banned external package import(s)'); c = c7; }
+
+    // 8. Remove localStorage/sessionStorage usage — BANNED per RULE 4
+    // Replace direct .setItem calls with no-ops, .getItem with null
+    const c8a = c.replace(/\blocalStorage\.setItem\s*\([^)]*\)\s*;?/g, '/* localStorage removed */');
+    const c8b = c8a.replace(/\bsessionStorage\.setItem\s*\([^)]*\)\s*;?/g, '/* sessionStorage removed */');
+    if (c8b !== c) { applied.push('removed localStorage/sessionStorage usage'); c = c8b; }
+
+    // 9. Remove Supabase onAuthStateChange subscriptions — async auth crashes sandbox
+    const c9 = c.replace(/window\.db\.auth\.onAuthStateChange\s*\([^)]*\)\s*;?/g, '/* onAuthStateChange removed */');
+    if (c9 !== c) { applied.push('removed onAuthStateChange subscription'); c = c9; }
 
     if (applied.length > 0) fixes.push({ file: filename, applied });
     result[filename] = c;
@@ -1057,8 +1143,9 @@ app.post('/api/build', async (req, res) => {
         const manifestLines = manifest.map(f => `□ ${f}`).join('\n');
         planContext +=
           `\n\nMANDATORY FILE MANIFEST — you MUST output ALL of these files as complete code blocks:\n${manifestLines}\n` +
-          `Priority order if tokens run low: types.ts → data.ts → components → pages → App.tsx (LAST but REQUIRED)\n` +
-          `NEVER skip App.tsx — it is the entry point. Without it the app cannot render.`;
+          `Output order (FOLLOW THIS EXACTLY): types.ts → App.tsx → data.ts → components → pages\n` +
+          `App.tsx MUST be output SECOND so token truncation never cuts it off — it is the entry point.\n` +
+          `NEVER skip App.tsx — without it the app cannot render.`;
       } catch (planErr) {
         console.error('[build] Planner failed:', planErr.message);
         send({ stage: 'plan', plan: null });
