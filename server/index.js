@@ -229,8 +229,15 @@ Checklist: for every interface X in types.ts, confirm no JSX <X /> exists anywhe
 The sandbox has NO logged-in user. Auth calls return null and crash.
    ❌ window.db.auth.getUser(), getSession(), onAuthStateChange()
    ❌ Login screens, signup forms, auth gates
-   ✅ Render dashboard state directly. Mock user at top of App.tsx:
-      const currentUser = { id: 'user_01', name: 'Demo User', email: 'demo@example.com', role: 'admin' };
+   ❌ createContext / useContext for auth — context providers are NOT wrapped around your app
+   ❌ useAuth(), useUser(), useSupabaseUser(), AuthContext — these hooks/contexts are UNDEFINED in sandbox
+   ❌ const { user } = useAuth()  or  const user = useContext(AuthContext)  → user will be null/undefined → crash
+   ❌ Any pattern that sets user via async effect (user starts null, component renders, user.name crashes)
+   ✅ Hardcode a mock user as a plain object constant at the top of App.tsx, then PASS AS PROPS:
+      const DEMO_USER = { id: 'user_01', name: 'Demo User', email: 'demo@example.com', role: 'admin', avatar_url: '' };
+      // Then: <ConfirmationPage user={DEMO_USER} booking={booking} />
+      // Components receive user as a prop — NEVER from context or global variable
+   ✅ Every component that needs user data must declare it as a typed prop: ({ user }: { user: typeof DEMO_USER })
 Exception: Only use real auth (window.db.auth.*) when user explicitly asks for login/auth features.
 
 【RULE 4 — FORBIDDEN PATTERNS】

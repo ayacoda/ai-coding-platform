@@ -421,7 +421,9 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '          "return {};" +\n' +
     '          "};" +\n' +
     // Expose auth stubs as local vars so AI code can use them without window. prefix
-    '          "var user = window.user; var profile = window.profile; var session = window.session; var currentUser = window.currentUser;";\n' +
+    '          "var _u = window.user || { id: \'demo_user_01\', email: \'demo@example.com\', name: \'Demo User\', role: \'user\', avatar_url: \'\', created_at: \'2024-01-01\' };" +\n' +
+    '          "var user = _u; var profile = window.profile || _u; var session = window.session || { user: _u, access_token: \'demo_token\', expires_at: 9999999999 };" +\n' +
+    '          "var currentUser = window.currentUser || _u; var authUser = _u; var auth = { user: _u, currentUser: _u };";\n' +
     // Runtime auto-stub loop — handles any number of "X is not defined" errors:
     //   • PascalCase (interface used as JSX component) → stub as visible error div
     //   • p_xxxxx / proj_default (schema name as JS var) → alias to window.db

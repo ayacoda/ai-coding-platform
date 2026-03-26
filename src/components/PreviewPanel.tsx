@@ -971,13 +971,16 @@ export default function PreviewPanel() {
           `  5. Remove ALL imports of createClient, SupabaseClient, or anything from @supabase/supabase-js.\n` +
           `  window.db is pre-configured globally — use it everywhere, no import needed.`;
       } else if (/^(user|profile|session|currentUser|authUser)$/.test(name)) {
-        extraHint = `\n⚠️ ROOT CAUSE: "${name}" is an auth/session variable that doesn't exist in the preview sandbox.\n` +
-          `The sandbox has no logged-in user — Supabase auth calls return null and async state never resolves.\n` +
-          `REQUIRED FIX — add a static mock so the preview renders:\n` +
-          `  1. At the top of App.tsx (outside any component), add:\n` +
-          `     const ${name} = { id: 'demo_user_01', email: 'demo@example.com', name: 'Demo User', role: 'user', avatar_url: '' };\n` +
-          `  2. Remove any async auth calls (window.db.auth.getUser, onAuthStateChange) that set "${name}".\n` +
-          `  3. Pass "${name}" as a prop to child components that need it.\n` +
+        extraHint = `\n⚠️ ROOT CAUSE: "${name}" is an auth/session variable — the sandbox has NO logged-in user.\n` +
+          `Auth context, useAuth(), useContext(AuthContext) all return null/undefined in the preview sandbox.\n` +
+          `REQUIRED FIX — replace ALL auth patterns with a hardcoded mock:\n` +
+          `  1. At the TOP of App.tsx (inside the App function, first line), define:\n` +
+          `     const DEMO_USER = { id: 'demo_user_01', email: 'demo@example.com', name: 'Demo User', role: 'user', avatar_url: '' };\n` +
+          `  2. REMOVE: any useAuth(), useContext(AuthContext), useUser(), const [${name}, set${name[0].toUpperCase() + name.slice(1)}] = useState(null)\n` +
+          `  3. REMOVE: any async auth effects (getUser, onAuthStateChange, getSession)\n` +
+          `  4. Pass DEMO_USER as a prop named "user" to every component that needs it: <ConfirmationPage user={DEMO_USER} />\n` +
+          `  5. In every child component, declare user as a PROP: function ConfirmationPage({ user }: { user: typeof DEMO_USER })\n` +
+          `⚠️ CRITICAL: Do NOT add \`const user = ...\` at MODULE level (outside any function) — that causes "already declared" crash.\n` +
           `✅ Output EVERY file you changed as a full code block.`;
       } else if (isWindowDbCrash) {
         extraHint = `\n⚠️ ROOT CAUSE: "${name}" is used as a bare variable but it DOES NOT EXIST as a global.\n` +
