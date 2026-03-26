@@ -473,6 +473,12 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '              window[_lv] = _AUTH_STUBS[_lv] !== undefined ? _AUTH_STUBS[_lv] : {};\n' +
     '              console.warn("[preview] auto-stub (lowercase):", _lv, "→", window[_lv]);\n' +
     '              _run();\n' +
+    '            } else if (_autoStubsLeft > 0 && msg.match(/has already been declared/)) {\n' +
+    '              // Duplicate const/let across merged files — retry with all const/let as var\n' +
+    '              _autoStubsLeft--;\n' +
+    '              evalCode = evalCode.replace(/\\bconst\\b/g,"var").replace(/\\blet\\b/g,"var");\n' +
+    '              console.warn("[preview] already-declared: retrying with const/let→var");\n' +
+    '              _run();\n' +
     '            } else {\n' +
     '              if (msg.includes("Cannot read properties of null") || msg.includes("Cannot read properties of undefined")) {\n' +
     '                msg += "\\n\\nHint: state was initialized as null/undefined. Use [] for arrays, {} for objects, or add a null check before accessing properties.";\n' +

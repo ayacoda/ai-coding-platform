@@ -918,8 +918,8 @@ export default function PreviewPanel() {
     // Mark that the next file change will come from this repair, not a new user build
     fileChangeFromRepair.current = true;
 
-    // Always use Opus for all repair attempts — best quality, fewest follow-up errors.
-    const overrideModel = 'claude-opus-4-6';
+    // Sonnet for attempts 1-2 (fast, avoids ECONNRESET timeouts), Opus only for 3+
+    const overrideModel = attemptNumber >= 3 ? 'claude-opus-4-6' : 'claude-sonnet-4-6';
 
     // Escalation context — injected when this is not the first attempt.
     // Since we use isolatedContext:true, the model has no memory. We inject history manually.

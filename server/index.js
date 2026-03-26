@@ -154,15 +154,12 @@ Do all of this silently. Output only the result — code blocks. Never narrate y
   ✅ Do not generate surface-level fake apps — real routes, real workflows, real data
 
 BUILD ORDER for new_app — generate in this EXACT dependency order:
-  LAYER 0 — types.ts + constants.ts   (no dependencies)
-  LAYER 1 — data.ts                   (depends on types)
-  LAYER 2 — utils/format.ts           (depends on types)
-  LAYER 3 — components/*.tsx          (depends on types + utils)
-  LAYER 4 — pages/*.tsx               (depends on components)
-  LAYER 5 — App.tsx                   (wires everything — ALWAYS last)
-
-CRITICAL output order (App.tsx SECOND to survive token-limit truncation):
-  1. types.ts  2. App.tsx  3. constants.ts  4. data.ts  5. utils/format.ts  6. components/*.tsx  7. pages/*.tsx
+  1. types.ts         (pure type declarations — no dependencies)
+  2. App.tsx          (REQUIRED — output early so token truncation never cuts it off)
+  3. data.ts          (depends on types)
+  4. components/*.tsx (depends on types + data)
+  5. pages/*.tsx      (depends on components)
+  NOTE: App.tsx MUST be output second — it is the entry point and must never be omitted.
 
 For feature_add: Output ONLY changed files. Every file you output REPLACES the current version completely.
 
@@ -247,6 +244,9 @@ Exception: Only use real auth (window.db.auth.*) when user explicitly asks for l
    ❌ export { X as default } pattern
    ❌ Utility functions called at top level of data.ts → ✓ price: '$12,400' not formatCurrency(12400)
    ❌ Two files exporting the same component name — they shadow each other
+   ❌ Same variable name declared in more than one file at module level — "X has already been declared" crash
+      → state hooks (const [x, setX] = useState) MUST live inside component functions, never at module level
+      → shared state belongs in a single store/context file, not duplicated across pages
    ❌ Reserved React globals as variable names: Fragment, createElement, createContext,
       forwardRef, memo, Children, Component, createRef, Suspense, lazy, createPortal, startTransition
    ❌ Regex literals with embedded forward slashes inside JSX expressions or filter calls
@@ -479,12 +479,11 @@ FIRST-BUILD RELIABILITY — mentally simulate before outputting:
   If any of the above is uncertain — improve the implementation before outputting.
 
 UI COMPLETENESS:
-  □ App renders at 375px (mobile), 768px (tablet), 1280px (desktop) without overflow
-  □ Hamburger + sidebar overlay for mobile navigation
-  □ 4 stat cards with sparklines on the main dashboard
-  □ Data table with 15+ rows, status badges, hover actions
-  □ At least one slide-over or modal
+  □ App renders correctly and is visually complete — not a skeleton, not a placeholder
+  □ Every page has real data, real actions, real UI (not "coming soon" or empty divs)
+  □ Navigation works — every link/button leads to a real page
   □ Language tag + space + filename on every code fence: \`\`\`tsx App.tsx
+  NOTE: Keep apps SIMPLE enough to work in the sandbox. No charting libraries, no sparklines, no external packages. Use clean cards, tables, and lists instead.
 
 OUTPUT FORMAT:
   □ Start with the intent sentence (Phase 0)
