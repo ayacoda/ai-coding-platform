@@ -445,11 +445,18 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '            } else if (_autoStubsLeft > 0 && componentMatch) {\n' +
     '              _autoStubsLeft--;\n' +
     '              var _n = componentMatch[1];\n' +
-    '              window[_n] = function(p) { return React.createElement("div", {\n' +
-    '                style:{color:"#f87171",border:"1px solid #ef4444",padding:"4px 8px",\n' +
-    '                       borderRadius:"4px",fontSize:"12px",fontFamily:"monospace",display:"inline-block",margin:"2px"}\n' +
-    '              }, "[missing component: " + _n + "]"); };\n' +
-    '              console.warn("[preview] stub:", _n);\n' +
+    '              // ALL_CAPS = data constant (TABLE, COLUMNS, ROWS, etc.) — stub as empty array\n' +
+    '              // PascalCase = React component — stub as visible error div\n' +
+    '              if (_n === _n.toUpperCase() && _n.length > 1) {\n' +
+    '                window[_n] = [];\n' +
+    '                console.warn("[preview] data-stub (ALL_CAPS):", _n, "→ []");\n' +
+    '              } else {\n' +
+    '                window[_n] = function(p) { return React.createElement("div", {\n' +
+    '                  style:{color:"#f87171",border:"1px solid #ef4444",padding:"4px 8px",\n' +
+    '                         borderRadius:"4px",fontSize:"12px",fontFamily:"monospace",display:"inline-block",margin:"2px"}\n' +
+    '                }, "[missing component: " + _n + "]"); };\n' +
+    '                console.warn("[preview] stub:", _n);\n' +
+    '              }\n' +
     '              _run();\n' +
     '            } else if (_autoStubsLeft > 0 && msg.match(/^\'?([a-z]\\w*)\'? is not defined/)) {\n' +
     '              _autoStubsLeft--;\n' +

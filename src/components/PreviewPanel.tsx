@@ -6,9 +6,11 @@ import { buildPreviewHTML } from '../lib/preview';
 import { sendChatMessage } from '../lib/chat';
 import { saveVersion } from '../lib/versions';
 
-// Stop if the EXACT same error fingerprint repeats this many times in a row — genuine infinite loop.
-// Only stopping condition: keeps fixing cascading errors (A → B → C → fixed) indefinitely.
-const STUCK_THRESHOLD = 5;
+// Fix budget: max 2 attempts for the same error fingerprint before stopping.
+const STUCK_THRESHOLD = 2;
+// Stop auto-fixing after this many DISTINCT errors in one session — indicates architectural failure.
+// Prompt the user to regenerate instead of stacking more patches.
+const DISTINCT_ERROR_LIMIT = 3;
 
 /** Normalize an error string so minor variations (line numbers) don't defeat stuck detection.
  *  IMPORTANT: keep the identifier in "X is not defined" errors so that fixing AppointmentsPage
@@ -230,6 +232,7 @@ function ErrorOverlay({
   isFixing,
   fixAttempt,
   isStuck,
+  shouldRegenerate,
   onRetry,
   onDismiss,
   isGenerating,
@@ -239,6 +242,7 @@ function ErrorOverlay({
   isFixing: boolean;
   fixAttempt: number;
   isStuck: boolean;
+  shouldRegenerate: boolean;
   onRetry: () => void;
   onDismiss: () => void;
   isGenerating: boolean;
@@ -342,30 +346,44 @@ function ErrorOverlay({
     );
   }
 
-  // Error state (not yet fixing / stuck)
+  // Error state (not yet fixing / stuck / regeneration needed)
   const firstLine = error?.split('\n')[0] ?? 'Unknown error';
   const hint = error?.split('\n\n').find((p) => p.startsWith('Hint:'));
+
+  // Determine title/subtitle based on state priority: regenerate > stuck > normal
+  const titleText = shouldRegenerate
+    ? 'Rebuild needed'
+    : isStuck
+    ? 'Auto-fix stopped'
+    : 'Runtime Error';
+  const subtitleText = shouldRegenerate
+    ? '3 different errors occurred — patching has stopped. Describe what you want and I\'ll rebuild cleanly.'
+    : isStuck
+    ? 'Same error keeps repeating — click Try Again or describe the fix in chat'
+    : 'Auto-fix will start shortly…';
+  const iconColorClass = shouldRegenerate ? 'text-orange-400' : 'text-red-400';
+  const iconBgClass = shouldRegenerate ? 'bg-orange-500/10 border-orange-500/20' : 'bg-red-500/10 border-red-500/20';
 
   return (
     <div className="absolute inset-0 flex items-center justify-center bg-zinc-950 z-10 p-6">
       <div className="w-full max-w-sm space-y-5">
         {/* Icon + title */}
         <div className="flex flex-col items-center gap-3 text-center">
-          <div className="w-12 h-12 rounded-2xl bg-red-500/10 border border-red-500/20 flex items-center justify-center">
-            <svg className="w-6 h-6 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
-                d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
-            </svg>
+          <div className={`w-12 h-12 rounded-2xl border flex items-center justify-center ${iconBgClass}`}>
+            {shouldRegenerate ? (
+              <svg className={`w-6 h-6 ${iconColorClass}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+            ) : (
+              <svg className={`w-6 h-6 ${iconColorClass}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+                  d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+              </svg>
+            )}
           </div>
           <div>
-            <p className="text-zinc-100 text-sm font-semibold">
-              {isStuck ? 'Auto-fix stopped' : 'Runtime Error'}
-            </p>
-            <p className="text-zinc-500 text-xs mt-0.5">
-              {isStuck
-                ? 'Same error keeps repeating — click Try Again or describe the fix in chat'
-                : 'Auto-fix will start shortly…'}
-            </p>
+            <p className="text-zinc-100 text-sm font-semibold">{titleText}</p>
+            <p className="text-zinc-500 text-xs mt-0.5">{subtitleText}</p>
           </div>
         </div>
 
@@ -389,7 +407,7 @@ function ErrorOverlay({
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M13 10V3L4 14h7v7l9-11h-7z" />
             </svg>
-            {isStuck ? 'Try Again' : 'Fix Now'}
+            {shouldRegenerate ? 'Try Anyway' : isStuck ? 'Try Again' : 'Fix Now'}
           </button>
           <button
             onClick={onDismiss}
@@ -719,14 +737,18 @@ export default function PreviewPanel() {
   const [isFixing, setIsFixing] = useState(false);
   const [fixAttempt, setFixAttempt] = useState(0); // shown in UI
   const [isStuck, setIsStuck] = useState(false);   // true when same error repeated too many times
+  const [shouldRegenerate, setShouldRegenerate] = useState(false); // true when 3+ distinct errors hit
   const [viewportMode, setViewportMode] = useState<ViewportMode>('desktop');
 
   const filesRef = useRef(files);
   const isFixingRef = useRef(false);
   const isGeneratingRef = useRef(isGenerating);
   const isStuckRef = useRef(false);
-  // Track last N error messages to detect "stuck" loops
+  const shouldRegenerateRef = useRef(false);
+  // Track last N error fingerprints for same-error stuck detection
   const recentErrors = useRef<string[]>([]);
+  // Track distinct error fingerprints across the whole session for architectural failure detection
+  const distinctErrorFingerprints = useRef<Set<string>>(new Set());
   const autoFixTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Persistent repair counter — NOT reset when repair outputs new files, only on genuine new builds
   const globalRepairCount = useRef(0);
@@ -737,6 +759,7 @@ export default function PreviewPanel() {
   useEffect(() => { isFixingRef.current = isFixing; }, [isFixing]);
   useEffect(() => { isGeneratingRef.current = isGenerating; }, [isGenerating]);
   useEffect(() => { isStuckRef.current = isStuck; }, [isStuck]);
+  useEffect(() => { shouldRegenerateRef.current = shouldRegenerate; }, [shouldRegenerate]);
 
   const streamingContent = useMemo(() => {
     const last = [...messages].reverse().find((m) => m.role === 'assistant' && m.isStreaming);
@@ -756,22 +779,41 @@ export default function PreviewPanel() {
       // Files changed because a repair ran — keep the global count, don't reset UI attempt counter
       fileChangeFromRepair.current = false;
     } else {
-      // Genuine new build — fully reset repair state
+      // Genuine new build — fully reset ALL repair state including distinct error tracking
       globalRepairCount.current = 0;
+      distinctErrorFingerprints.current = new Set();
       setFixAttempt(0);
       setIsStuck(false);
       isStuckRef.current = false;
+      setShouldRegenerate(false);
+      shouldRegenerateRef.current = false;
     }
   }, [files]);
 
   function doFix(error: string) {
     if (isFixingRef.current || isGeneratingRef.current) return;
+    // Don't attempt fixes if we've already determined regeneration is needed
+    if (shouldRegenerateRef.current) return;
 
     globalRepairCount.current += 1;
     const attemptNumber = globalRepairCount.current;
 
     // Fuzzy stuck detection — normalize errors before comparing.
     const fingerprint = normalizeError(error);
+
+    // Track distinct error fingerprints — if we've seen DISTINCT_ERROR_LIMIT different errors,
+    // the module is architecturally broken. Stop patching, prompt user to regenerate.
+    if (!distinctErrorFingerprints.current.has(fingerprint)) {
+      distinctErrorFingerprints.current.add(fingerprint);
+      if (distinctErrorFingerprints.current.size >= DISTINCT_ERROR_LIMIT) {
+        setShouldRegenerate(true);
+        shouldRegenerateRef.current = true;
+        setIsStuck(false);
+        return;
+      }
+    }
+
+    // Same-error stuck detection — max STUCK_THRESHOLD attempts for identical errors.
     recentErrors.current = [...recentErrors.current.slice(-(STUCK_THRESHOLD - 1)), fingerprint];
     if (
       recentErrors.current.length >= STUCK_THRESHOLD &&
@@ -841,15 +883,23 @@ export default function PreviewPanel() {
       }
     }
 
+    // If symbol not found in ANY file (e.g. TABLE used in async callback — async errors bypass
+    // the sandbox stub loop and are reported before any file context is visible), send all files.
+    const symbolFoundInFiles = errorSymbol
+      ? Object.values(currentFiles).some((code) => code.includes(errorSymbol))
+      : true;
+
     // Attempt 2+: always escalate to ALL files for broader context.
     const needsAllFiles = isInterfaceAsComponentCrash || isSupabaseCrash || isWindowDbCrash ||
-      isIllegalReturnCrash || isInvalidLhsCrash || isSchemaNameCrash || attemptNumber >= 2;
+      isIllegalReturnCrash || isInvalidLhsCrash || isSchemaNameCrash || attemptNumber >= 2 ||
+      !symbolFoundInFiles;
     const allFilesLabel = isInterfaceAsComponentCrash ? 'interface-as-component rename'
       : isSupabaseCrash ? 'Supabase import fix'
       : isWindowDbCrash ? 'window.db fix — scan every file for bare db usage'
       : isIllegalReturnCrash ? 'illegal return — must scan every file'
       : isInvalidLhsCrash ? 'invalid LHS — must find JS syntax error in style/expression'
       : isSchemaNameCrash ? 'schema-name-as-variable — must replace in all files'
+      : !symbolFoundInFiles ? `${errorSymbol} not found in any file — async error, full context`
       : `attempt ${attemptNumber} — full context`;
     const filesSummary = needsAllFiles
       ? `### READ-ONLY CONTEXT — ${allFilesLabel}\nDO NOT re-output files you did not change. Only output the specific files where you made edits.\n\n` +
@@ -1084,8 +1134,8 @@ export default function PreviewPanel() {
 
         if (autoFixTimer.current) clearTimeout(autoFixTimer.current);
 
-        // Always schedule a fix — only backs off when the exact same error repeats (stuck detection).
-        if (!isStuckRef.current) {
+        // Schedule fix only if not stuck and not in regeneration-needed state.
+        if (!isStuckRef.current && !shouldRegenerateRef.current) {
           autoFixTimer.current = setTimeout(() => {
             if (!isFixingRef.current && !isGeneratingRef.current) {
               doFix(msg);
@@ -1096,9 +1146,12 @@ export default function PreviewPanel() {
         // Successfully rendered — reset everything including the persistent repair counter
         recentErrors.current = [];
         globalRepairCount.current = 0;
+        distinctErrorFingerprints.current = new Set();
         setFixAttempt(0);
         setIsStuck(false);
         isStuckRef.current = false;
+        setShouldRegenerate(false);
+        shouldRegenerateRef.current = false;
         setPreviewError(null);
 
         // Consume and save the pending version snapshot
@@ -1126,10 +1179,13 @@ export default function PreviewPanel() {
 
   function handleManualRetry() {
     if (previewError) {
-      recentErrors.current = [];      // clear stuck error fingerprints
-      globalRepairCount.current = 0;  // reset attempt counter so retry actually fires
+      recentErrors.current = [];
+      distinctErrorFingerprints.current = new Set();
+      globalRepairCount.current = 0;
       setIsStuck(false);
       isStuckRef.current = false;
+      setShouldRegenerate(false);
+      shouldRegenerateRef.current = false;
       doFix(previewError);
     }
   }
@@ -1250,14 +1306,15 @@ export default function PreviewPanel() {
         )}
 
         {/* Error / fixing overlay — replaces the white iframe when broken */}
-        {(previewError || isFixing) && !showGeneratingOverlay && (
+        {(previewError || isFixing || shouldRegenerate) && !showGeneratingOverlay && (
           <ErrorOverlay
             error={previewError}
             isFixing={isFixing}
             fixAttempt={fixAttempt}
             isStuck={isStuck}
+            shouldRegenerate={shouldRegenerate}
             onRetry={handleManualRetry}
-            onDismiss={() => setPreviewError(null)}
+            onDismiss={() => { setPreviewError(null); setShouldRegenerate(false); shouldRegenerateRef.current = false; }}
             isGenerating={isGenerating}
             streamingContent={streamingContent}
           />
