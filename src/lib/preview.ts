@@ -426,9 +426,14 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     // Expose auth stubs + common data constant fallbacks so components never crash on
     // "X is not defined" errors at render time. These var declarations are overridden by
     // any const/let/var with the same name declared later in the merged eval code.
-    '          "var _u = window.user || { id: \'demo_user_01\', email: \'demo@example.com\', name: \'Demo User\', role: \'user\', avatar_url: \'\', created_at: \'2024-01-01\' };" +\n' +
+    '          "var _u = window.user || { id: \'demo_user_01\', email: \'demo@example.com\', name: \'Demo User\', full_name: \'Demo User\', username: \'demouser\', role: \'admin\', avatar_url: \'\', created_at: \'2024-01-01\', updated_at: \'2024-01-01\' };" +\n' +
     '          "var user = _u; var profile = window.profile || _u; var session = window.session || { user: _u, access_token: \'demo_token\', expires_at: 9999999999 };" +\n' +
-    '          "var currentUser = window.currentUser || _u; var authUser = _u; var auth = { user: _u, currentUser: _u };" +\n' +
+    '          "var currentUser = window.currentUser || _u; var authUser = _u; var auth = { user: _u, currentUser: _u, isAuthenticated: true, loading: false };" +\n' +
+    // Safe mock for useAuth()/useUser() hook return values — prevents crash when AI writes
+    // const { user } = useAuth() and useAuth is undefined (returns an object safely).
+    '          "var useAuth = function() { return { user: _u, session: window.session, loading: false, error: null, isAuthenticated: true, signIn: async function() {}, signOut: async function() {} }; };" +\n' +
+    '          "var useUser = useAuth; var useSession = function() { return { data: { session: window.session }, status: \'authenticated\' }; };" +\n' +
+    '          "var useSupabaseUser = function() { return _u; }; var useCurrentUser = useAuth;" +\n' +
     // Pre-define common ALL_CAPS data constants as empty arrays. These are overridden when
     // data.ts defines them properly (const ORDERS = [...] shadows the var). The fallback
     // prevents "X is not defined" crashes when a component evaluates before data.ts (wrong sort).
@@ -436,7 +441,13 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '          "var TICKETS=window.TICKETS||[];var EVENTS=window.EVENTS||[];var BOOKINGS=window.BOOKINGS||[];" +\n' +
     '          "var USERS=window.USERS||[];var TRANSACTIONS=window.TRANSACTIONS||[];var TASKS=window.TASKS||[];" +\n' +
     '          "var SUBSCRIPTIONS=window.SUBSCRIPTIONS||[];var POSTS=window.POSTS||[];var CATEGORIES=window.CATEGORIES||[];" +\n' +
-    '          "var SERVICES=window.SERVICES||[];var CLIENTS=window.CLIENTS||[];var PROJECTS=window.PROJECTS||[];";\n' +
+    '          "var SERVICES=window.SERVICES||[];var CLIENTS=window.CLIENTS||[];var PROJECTS=window.PROJECTS||[];" +\n' +
+    '          "var INVOICES=window.INVOICES||[];var LEADS=window.LEADS||[];var DEALS=window.DEALS||[];" +\n' +
+    '          "var APPOINTMENTS=window.APPOINTMENTS||[];var COURSES=window.COURSES||[];var STUDENTS=window.STUDENTS||[];" +\n' +
+    '          "var EMPLOYEES=window.EMPLOYEES||[];var PAYMENTS=window.PAYMENTS||[];var REVIEWS=window.REVIEWS||[];" +\n' +
+    // Pre-define common object/config variables as empty object fallbacks
+    '          "var config={};var settings={};var theme={};var options={};var filters={};var metadata={};" +\n' +
+    '          "var currentProject=window.currentProject||null;var selectedItem=null;var activeTab=\'\';" +\n';
     // Runtime auto-stub loop — handles any number of "X is not defined" errors:
     //   • PascalCase (interface used as JSX component) → stub as visible error div
     //   • p_xxxxx / proj_default (schema name as JS var) → alias to window.db
@@ -476,14 +487,32 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '            } else if (_autoStubsLeft > 0 && msg.match(/^\'?([a-z]\\w*)\'? is not defined/)) {\n' +
     '              _autoStubsLeft--;\n' +
     '              var _lv = msg.match(/^\'?([a-z]\\w*)\'? is not defined/)[1];\n' +
+    '              var _DU = { id: "demo_user_01", email: "demo@example.com", name: "Demo User", full_name: "Demo User", username: "demouser", role: "admin", avatar_url: "", created_at: new Date().toISOString() };\n' +
     '              var _AUTH_STUBS = {\n' +
-    '                user:    { id: "demo_user_01", email: "demo@example.com", name: "Demo User", role: "user", avatar_url: "", created_at: new Date().toISOString() },\n' +
-    '                profile: { id: "demo_user_01", email: "demo@example.com", full_name: "Demo User", username: "demouser", bio: "", avatar_url: "" },\n' +
-    '                session: { user: { id: "demo_user_01", email: "demo@example.com" }, access_token: "demo_token", expires_at: 9999999999 },\n' +
-    '                data:    [],\n' +
-    '                error:   null,\n' +
-    '                items:   [],\n' +
-    '                rows:    [],\n' +
+    '                user:         _DU,\n' +
+    '                profile:      _DU,\n' +
+    '                currentUser:  _DU,\n' +
+    '                authUser:     _DU,\n' +
+    '                session:      { user: _DU, access_token: "demo_token", expires_at: 9999999999 },\n' +
+    '                auth:         { user: _DU, currentUser: _DU, isAuthenticated: true, loading: false },\n' +
+    '                data:         [],\n' +
+    '                error:        null,\n' +
+    '                items:        [],\n' +
+    '                rows:         [],\n' +
+    '                loading:      false,\n' +
+    '                isLoading:    false,\n' +
+    '                isAuthenticated: true,\n' +
+    '                config:       {},\n' +
+    '                settings:     {},\n' +
+    '                theme:        {},\n' +
+    '                options:      [],\n' +
+    '                filters:      {},\n' +
+    '                metadata:     {},\n' +
+    '                notifications: [],\n' +
+    '                messages:     [],\n' +
+    '                results:      [],\n' +
+    '                records:      [],\n' +
+    '                list:         [],\n' +
     '              };\n' +
     '              window[_lv] = _AUTH_STUBS[_lv] !== undefined ? _AUTH_STUBS[_lv] : {};\n' +
     '              console.warn("[preview] auto-stub (lowercase):", _lv, "→", window[_lv]);\n' +
@@ -496,9 +525,14 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '              _run();\n' +
     '            } else {\n' +
     '              if (msg.includes("Cannot read properties of null") || msg.includes("Cannot read properties of undefined")) {\n' +
-    '                msg += "\\n\\nHint: state was initialized as null/undefined. Use [] for arrays, {} for objects, or add a null check before accessing properties.";\n' +
+    '                var _propMatch = msg.match(/Cannot read propert(?:y|ies) of (?:null|undefined) \\(reading \'(\\w+)\'\\)/);\n' +
+    '                var _propName = _propMatch ? _propMatch[1] : "property";\n' +
+    '                msg += "\\n\\nFix: a variable is null/undefined when ." + _propName + " is accessed.\\n" +\n' +
+    '                  "1. If it\'s state: change useState(null) → useState([]) for arrays, useState({}) for objects\\n" +\n' +
+    '                  "2. If it\'s a prop: add a default → function Card({ items = [] }: Props)\\n" +\n' +
+    '                  "3. Use optional chaining: obj?." + _propName + " instead of obj." + _propName;\n' +
     '              } else if (msg.includes("is not a function")) {\n' +
-    '                msg += "\\n\\nHint: the value is not callable — it may be undefined (initialized too late) or a naming conflict with an injected React global.";\n' +
+    '                msg += "\\n\\nHint: the value is not callable — it may be undefined (initialized too late) or a naming conflict with an injected React global (Fragment, memo, Children, etc.). Rename your variable.";\n' +
     '              } else if (msg.includes("is not defined")) {\n' +
     '                var _u = msg.split(" ")[0];\n' +
     '                msg += "\\n\\nHint: \'" + _u + "\' is not in scope. Check file sort order or naming conflicts with React globals.";\n' +

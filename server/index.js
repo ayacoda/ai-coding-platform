@@ -244,6 +244,9 @@ The sandbox has NO logged-in user. Auth calls return null and crash.
       // Then: <ConfirmationPage user={DEMO_USER} booking={booking} />
       // Components receive user as a prop — NEVER from context or global variable
    ✅ Every component that needs user data must declare it as a typed prop: ({ user }: { user: typeof DEMO_USER })
+   ❌ NEVER destructure from useAuth()/useUser()/useSession() — these are undefined in sandbox
+      If AI writes: const { user } = useAuth() → user is undefined → crash on user.name
+      The fixer will replace these calls automatically, but the CORRECT approach is to pass user as a prop.
 Exception: Only use real auth (window.db.auth.*) when user explicitly asks for login/auth features.
 
 【RULE 4 — FORBIDDEN PATTERNS】
@@ -254,6 +257,8 @@ Exception: Only use real auth (window.db.auth.*) when user explicitly asks for l
    ❌ npm packages (lucide-react, recharts, framer-motion, etc.)
    ❌ class decorators, process.env, const enum, namespace
    ❌ Top-level async / await outside useEffect or handlers
+      ✅ CORRECT: useEffect(() => { const load = async () => { const res = await ...; }; load(); }, [])
+      ❌ WRONG:   const data = await fetch(...)  ← top-level await crashes in sandbox eval
    ❌ export { X as default } pattern
    ❌ Utility functions called at top level of data.ts → ✓ price: '$12,400' not formatCurrency(12400)
    ❌ Two files exporting the same component name — they shadow each other
@@ -262,6 +267,7 @@ Exception: Only use real auth (window.db.auth.*) when user explicitly asks for l
       → shared state belongs in a single store/context file, not duplicated across pages
    ❌ Reserved React globals as variable names: Fragment, createElement, createContext,
       forwardRef, memo, Children, Component, createRef, Suspense, lazy, createPortal, startTransition
+      → declaring ANY of these as a local variable SHADOWS the injected React API → instant crash
    ❌ Regex literals with embedded forward slashes inside JSX expressions or filter calls
       → use String.includes(), String.startsWith(), or new RegExp(pattern) instead
       → ✅ items.filter(i => i.name.toLowerCase().includes(query))
@@ -270,11 +276,16 @@ Exception: Only use real auth (window.db.auth.*) when user explicitly asks for l
 
 【RULE 5 — STATE & DATA SAFETY】
    ❌ useState<Item[] | null>(null) then .filter()/.map() → CRASH ("Cannot read properties of null")
+   ❌ useState<Data>() or useState() with NO ARGUMENT → returns undefined, crashes on ALL property access
    ❌ useState<Data>() then .rows.map() → CRASH
    ❌ const [data, setData] = useState(null) — null crashes on .map()/.filter()
    ✅ ALWAYS initialize array state with []: useState<Item[]>([])
-   ✅ Optional chaining everywhere: items?.map(...) ?? []
+   ✅ ALWAYS initialize object state with {}: useState<Config>({} as Config)
+   ✅ NEVER call useState() without an initializer — use null, [], or {} always
+   ✅ Optional chaining on ALL prop/state access: items?.map(...) ?? []   user?.name ?? 'Unknown'
    ✅ Guard all async data: {data && data.map(...)} or {(data ?? []).map(...)}
+   ✅ Props that might be undefined: function Card({ name = 'Unknown', items = [] }: Props)
+      — always provide defaults for every prop that could crash if absent
 
 SAFE DATA PATTERN for Supabase projects (use this EXACT pattern, no variations):
    const [items, setItems] = useState<ItemType[]>([]);  // [] not null
@@ -942,6 +953,33 @@ function validateGeneratedFiles(files) {
     if (/window\.db\.auth\.(?:getUser|getSession)\s*\(/.test(content)) {
       fileErrors.push(`BANNED: window.db.auth.getUser()/getSession() return null in the sandbox — async auth state never resolves. Use a DEMO_USER constant instead.`);
     }
+    // useState() with no initializer — gives undefined which crashes .map()/.filter()
+    if (/\buseState\s*(?:<[^<>]*>)?\s*\(\s*\)/.test(content)) {
+      fileErrors.push(`BUG: useState() called without an initializer returns undefined, which crashes on .map()/.filter()/.length. Use useState(null) for objects or useState([]) for arrays.`);
+    }
+    // React globals used as variable names — they shadow the injected React APIs and crash
+    const REACT_GLOBALS = ['Fragment', 'createElement', 'createContext', 'forwardRef', 'memo',
+      'Children', 'Component', 'createRef', 'Suspense', 'lazy', 'createPortal', 'startTransition',
+      'cloneElement', 'isValidElement', 'PureComponent', 'StrictMode'];
+    for (const g of REACT_GLOBALS) {
+      if (new RegExp(`\\b(?:const|let|var|function|class)\\s+${g}\\b`).test(content)) {
+        fileErrors.push(`BANNED: "${g}" is a React global injected by the sandbox — declaring a local variable/function with the same name shadows it and crashes. Rename your identifier.`);
+      }
+    }
+    // Top-level await outside async function — crashes in non-module eval
+    if (/^(?!.*(?:async\s+function|async\s*\().*)\bawait\b/m.test(content)) {
+      // Rough check: lines with standalone `await` not inside an async block
+      const lines = content.split('\n');
+      let insideAsync = 0;
+      for (const line of lines) {
+        if (/async\s+(?:function|\()/.test(line)) insideAsync++;
+        if (/^\s*\}/.test(line) && insideAsync > 0) insideAsync--;
+        if (insideAsync === 0 && /^\s*(?:const|let|var)\s+\w+\s*=\s*await\b/.test(line)) {
+          fileErrors.push(`BUG: Top-level await (outside async function) crashes in the sandbox eval. Wrap in useEffect with an inner async function: useEffect(() => { (async () => { /* await here */ })(); }, [])`);
+          break;
+        }
+      }
+    }
 
     if (fileErrors.length > 0) {
       errors.push({ file: filename, messages: fileErrors });
@@ -1014,6 +1052,50 @@ function applyProgrammaticFixes(files) {
     // 9. Remove Supabase onAuthStateChange subscriptions — async auth crashes sandbox
     const c9 = c.replace(/window\.db\.auth\.onAuthStateChange\s*\([^)]*\)\s*;?/g, '/* onAuthStateChange removed */');
     if (c9 !== c) { applied.push('removed onAuthStateChange subscription'); c = c9; }
+
+    // 10. Fix useState() with no initializer → useState(null)
+    // Missing initializer gives undefined, which crashes on .map()/.filter()/.length
+    const c10 = c.replace(/\buseState(?:<[^<>]*>)?\s*\(\s*\)/g, (match) => match.replace('()', '(null)'));
+    if (c10 !== c) { applied.push('fixed useState() → useState(null)'); c = c10; }
+
+    // 11. Replace useAuth() / useUser() / useSupabaseUser() / useSession() destructuring
+    // with safe window.user fallback — these hooks are undefined in the sandbox
+    const AUTH_MOCK = `{user:window.user||{id:"demo_user_01",name:"Demo User",email:"demo@example.com",role:"user",avatar_url:"",created_at:"2024-01-01"},` +
+      `session:window.session||{user:window.user,access_token:"demo_token",expires_at:9999999999},` +
+      `loading:false,error:null,isAuthenticated:true,isLoading:false,` +
+      `signIn:async()=>({}),signOut:async()=>({}),signUp:async()=>({})}`;
+    const c11 = c.replace(
+      /const\s*(\{[^}]+\})\s*=\s*(?:useAuth|useUser|useSupabaseUser|useSession|useCurrentUser)\s*\(\s*\)/g,
+      (match, destructure) => `const ${destructure} = ${AUTH_MOCK}`
+    );
+    if (c11 !== c) { applied.push('replaced useAuth()/useUser()/useSession() with safe mock'); c = c11; }
+
+    // 12. Replace useContext(AuthContext/UserContext/SessionContext) with safe mock
+    const c12 = c.replace(
+      /useContext\s*\(\s*[A-Z]\w*(?:Auth|User|Session|Current)\w*Context\w*\s*\)/g,
+      AUTH_MOCK
+    );
+    if (c12 !== c) { applied.push('replaced useContext(AuthContext) with safe mock'); c = c12; }
+
+    // 13. Fix fetch() calls — replace with no-op that returns empty data
+    // Simple standalone fetch calls: const x = await fetch(...)
+    const c13 = c.replace(
+      /\bawait\s+fetch\s*\([^)]*\)(?:\.then\s*\([^)]*\))*\s*;/g,
+      '/* fetch() removed — not available in sandbox */'
+    );
+    if (c13 !== c) { applied.push('removed await fetch() call(s)'); c = c13; }
+
+    // 14. Fix window.db.auth.getUser() / getSession() — stub their return value
+    // These return null in sandbox when not patched (and the mock patch may not be in scope yet)
+    const c14 = c.replace(
+      /await\s+window\.db\.auth\.getUser\s*\(\s*\)/g,
+      '(await (async()=>({data:{user:window.user||null},error:null}))())'
+    );
+    const c14b = c14.replace(
+      /await\s+window\.db\.auth\.getSession\s*\(\s*\)/g,
+      '(await (async()=>({data:{session:window.session||null},error:null}))())'
+    );
+    if (c14b !== c) { applied.push('stubbed window.db.auth.getUser/getSession()'); c = c14b; }
 
     if (applied.length > 0) fixes.push({ file: filename, applied });
     result[filename] = c;
@@ -1363,11 +1445,28 @@ app.post('/api/build', async (req, res) => {
         })
         .join('\n\n');
 
+      // Provide foundation files as read-only context so the fixer understands
+      // available types, existing components, and app structure. Without this,
+      // the fixer often introduces ghost imports or wrong type names.
+      const contextFileNames = ['types.ts', 'App.tsx', 'data.ts'];
+      const contextBlocks = contextFileNames
+        .filter(f => generatedFiles[f] && !filesToFix.includes(f))
+        .map(f => {
+          const lang = f.endsWith('.tsx') ? 'tsx' : 'ts';
+          const preview = generatedFiles[f].length > 800
+            ? generatedFiles[f].slice(0, 800) + '\n// ...(truncated for context)'
+            : generatedFiles[f];
+          return `\`\`\`${lang} ${f} [READ-ONLY CONTEXT — DO NOT re-output this file]\n${preview}\n\`\`\``;
+        })
+        .join('\n\n');
+
       const correctionPrompt =
         `SURGICAL FIX — these critical errors were found in the generated code and MUST be corrected:\n\n` +
         `[ERRORS]\n${errorSummary}\n[/ERRORS]\n\n` +
+        (contextBlocks ? `Foundation context (read-only — do NOT re-output these):\n${contextBlocks}\n\n` : '') +
         `Files that need correction:\n${fileBlocks}\n\n` +
-        `Fix ONLY the listed errors. Output ONLY the corrected version of each file that had errors. No explanation needed.`;
+        `Fix ONLY the listed errors. Output ONLY the corrected version of each file listed in "Files that need correction".\n` +
+        `Do NOT output context files. No explanation needed.`;
 
       // 4c. Use Sonnet (not Haiku) — Haiku is too weak and often introduces new errors
       send({ stage: 'validation_fixing', count: validationErrors.length });
