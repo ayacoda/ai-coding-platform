@@ -298,6 +298,9 @@ SAFE DATA PATTERN for localStorage/static apps (preferred — no async issues):
    🔴 Every <Component /> used in JSX must be imported. Missing import = crash.
    🔴 Every file you import MUST also be output as a code block in this response.
    🔴 Every JSX tag must be closed. Wrap multiple returns in <>. Use {expr} not bare expressions.
+   🔴 NEVER put component files at the root level. Always use components/ or pages/ subfolder.
+      Reason: root .tsx files evaluate BEFORE data.ts — data constants will be undefined.
+      ✅ components/SubscriptionCard.tsx  ❌ SubscriptionCard.tsx (crashes with "X is not defined")
 
 【RULE 7 — SANDBOX COMPLEXITY LIMIT】
 The sandbox evaluates all files as a single merged script. Complex patterns break it:

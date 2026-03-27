@@ -83,7 +83,10 @@ function sortKey(filename: string): string {
     if (base === 'types') return '0a_' + filename.toLowerCase();
     if (base === 'constants') return '0b_' + filename.toLowerCase();
     if (base === 'data' || base.endsWith('data') || base.startsWith('data')) return '2z_' + filename.toLowerCase();
-    // Other root files (store, theme, config at root) — treat as early utils
+    // Root-level .tsx files are almost always components the AI placed at root by mistake.
+    // Sort them with component-level priority (4) so they run AFTER data files.
+    if (filename.endsWith('.tsx')) return '4_' + filename.toLowerCase();
+    // Other root .ts files (store, theme, config) — treat as early utils
     return '1z_' + filename.toLowerCase();
   }
   const folder = parts[0].toLowerCase();
@@ -420,10 +423,20 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '          "if (m === \'@supabase/supabase-js\') return { createClient: window.createClient };" +\n' +
     '          "return {};" +\n' +
     '          "};" +\n' +
-    // Expose auth stubs as local vars so AI code can use them without window. prefix
+    // Expose auth stubs + common data constant fallbacks so components never crash on
+    // "X is not defined" errors at render time. These var declarations are overridden by
+    // any const/let/var with the same name declared later in the merged eval code.
     '          "var _u = window.user || { id: \'demo_user_01\', email: \'demo@example.com\', name: \'Demo User\', role: \'user\', avatar_url: \'\', created_at: \'2024-01-01\' };" +\n' +
     '          "var user = _u; var profile = window.profile || _u; var session = window.session || { user: _u, access_token: \'demo_token\', expires_at: 9999999999 };" +\n' +
-    '          "var currentUser = window.currentUser || _u; var authUser = _u; var auth = { user: _u, currentUser: _u };";\n' +
+    '          "var currentUser = window.currentUser || _u; var authUser = _u; var auth = { user: _u, currentUser: _u };" +\n' +
+    // Pre-define common ALL_CAPS data constants as empty arrays. These are overridden when
+    // data.ts defines them properly (const ORDERS = [...] shadows the var). The fallback
+    // prevents "X is not defined" crashes when a component evaluates before data.ts (wrong sort).
+    '          "var ORDERS=window.ORDERS||[];var PRODUCTS=window.PRODUCTS||[];var ITEMS=window.ITEMS||[];" +\n' +
+    '          "var TICKETS=window.TICKETS||[];var EVENTS=window.EVENTS||[];var BOOKINGS=window.BOOKINGS||[];" +\n' +
+    '          "var USERS=window.USERS||[];var TRANSACTIONS=window.TRANSACTIONS||[];var TASKS=window.TASKS||[];" +\n' +
+    '          "var SUBSCRIPTIONS=window.SUBSCRIPTIONS||[];var POSTS=window.POSTS||[];var CATEGORIES=window.CATEGORIES||[];" +\n' +
+    '          "var SERVICES=window.SERVICES||[];var CLIENTS=window.CLIENTS||[];var PROJECTS=window.PROJECTS||[];";\n' +
     // Runtime auto-stub loop — handles any number of "X is not defined" errors:
     //   • PascalCase (interface used as JSX component) → stub as visible error div
     //   • p_xxxxx / proj_default (schema name as JS var) → alias to window.db
