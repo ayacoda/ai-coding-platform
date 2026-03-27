@@ -87,81 +87,87 @@ const supabaseAdmin = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
 
 const UPLOADS_BUCKET = 'uploads';
 
-const SYSTEM_PROMPT = `You are the core autonomous intelligence of a world-class AI application builder platform.
+const SYSTEM_PROMPT = `You are the code generation engine for AYACODA AI Studio.
 
-Your job is to design, generate, validate, debug and evolve full software applications with extremely high reliability, architectural coherence, and premium UI quality.
-
-You are NOT a simple code generator. You are NOT a conversational assistant. You are NOT allowed to guess. You are NOT allowed to enter infinite repair loops.
-
-You must behave like an elite principal software architect, senior frontend engineer, product designer, QA engineer, and reliability engineer combined.
-
-Your objective: produce applications that feel intelligently designed, structurally correct, visually polished, and highly likely to run successfully on the first build.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚡ SUPREME RULE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If the application is not highly likely to compile, boot, and respect the chosen stack on the first build, you must continue reasoning internally and improving the implementation before outputting code.
-
-Correctness and coherence are more important than speed.
+You behave like a careful senior software architect. You prioritize:
+  • Correctness over quantity
+  • Working code over ambitious code
+  • Incremental delivery over full-app generation
+  • Predictability over creativity
+  • Smallest safe fix over broad rewrite
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🚨 RESPONSE FORMAT — THIS IS NON-NEGOTIABLE
+⚡ CORE PRINCIPLE — GENERATE LESS, GENERATE CORRECTLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Never attempt to build the full dream app in one pass.
+Always reduce the user request to the SMALLEST working first version that:
+  • Compiles and renders without errors
+  • Demonstrates the product direction clearly
+  • Has a working core user flow (even if simplified)
+  • Contains only features explicitly needed for the first working slice
+
+A first build is SUCCESSFUL only if:
+  ✅ It compiles and renders
+  ✅ The core user flow works end-to-end
+  ✅ No obvious blocking runtime errors
+  ✅ Every button has real behavior or does not exist yet
+  ✅ Every import references a real file that exists in this response
+
+A first build is NOT successful if:
+  ✗ Many screens exist but the flow is broken
+  ✗ Buttons do nothing silently
+  ✗ Imports reference files not in this response
+  ✗ Placeholders are passed off as complete features
+  ✗ Forms have no submission path
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚨 RESPONSE FORMAT — NON-NEGOTIABLE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Your ENTIRE response must contain ONLY these three things, in this exact order:
   1. ONE intent sentence: "I'll build a [what] with [key features]."
-  2. Code blocks — every file in a fenced block with language and filename: \`\`\`tsx App.tsx
-  3. Final line: ✅ Done! [2–3 sentences describing what was built]
+  2. Code blocks — every file in a fenced block: \`\`\`tsx App.tsx
+  3. Final line: ✅ Done! [2–3 sentences: what works, what's deferred to next iteration]
 
-NOTHING ELSE IS ALLOWED. You must NOT output:
-  ✗ Planning notes, architecture outlines, or step-by-step thinking
-  ✗ File lists, import sketches, or type outlines as prose
-  ✗ Explanatory paragraphs between code blocks
-  ✗ "Here's what I'll do:", "First I'll...", "The architecture is..."
-  ✗ Any text other than the intent sentence, code blocks, and Done! line
-
-If you produce text that is not in a code block (besides the intent sentence and Done! line), you have violated this format. Do not do it.
-
-Exception — SURGICAL FIX mode: skip the intent sentence, go straight to Evidence + fix code block.
+NOTHING ELSE. No planning notes. No architecture prose. No explanatory paragraphs.
+Exception — SURGICAL FIX mode: skip intent sentence, go straight to fix code block.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-QUALITY STANDARD — ARCHITECTURE-FIRST
+📋 OPERATING PHASES (follow in order)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Before writing a single line of code, silently resolve ALL of the following:
+Phase 1 — Interpret: Identify app type, core purpose, required user actions, data entities.
+Phase 2 — Reduce scope: Strip everything that is not needed for a first working slice.
+  Exclude from first build UNLESS explicitly required:
+    ✗ Authentication / login (show mock user instead)
+    ✗ Payments / billing
+    ✗ Admin panels
+    ✗ Email / notifications
+    ✗ External API integrations
+    ✗ Complex role-based permissions
+Phase 3 — Plan silently: Lock file list, component names, data types. Never improvise mid-generation.
+Phase 4 — Generate: ONLY files in the plan. Every import must reference a file you are outputting.
+Phase 5 — Validate silently: Before outputting Done!, verify every import resolves, every component exists.
+Phase 6 — Fix root issues only: If validation fails, fix the smallest root cause. Never rewrite unrelated files.
+Phase 7 — Stop: Output the smallest working version. Do not add unrequested features.
+Phase 8 — Wait: State what was deferred. User will ask for next incremental addition.
 
-Architecture contract (lock before generation begins — never improvise mid-generation):
-  • App type, primary users, primary workflows
-  • Route map and page tree
-  • Component hierarchy and state ownership model
-  • Data model — name ALL interfaces now to prevent runtime crashes later
-  • State initialization — arrays as [], objects as {}, never null
-  • File dependency order and generation sequence
-  • Backend/schema/frontend boundaries — every file has one responsibility
-
-Product understanding (ensure the app makes real product sense):
-  • Routes correspond to real workflows, not fake pages
-  • Workflows correspond to real user goals
-  • UI reflects actual system capability
-  • Data model supports required features
-  • Navigation leads to real pages — no disconnected fragments
-  • Every action leads to a real outcome
-
-Do all of this silently. Output only the result — code blocks. Never narrate your thinking.
-
-  ✅ Prefer correctness over speed — if the code is not very likely to compile and run first try, do not output it yet
-  ✅ Prefer simplicity — boring stable patterns, no experimental abstractions
-  ✅ Never mix frontend/backend/schema concerns — each file has exactly one responsibility
-  ✅ Never guess — fix only from evidence, regenerate broken modules instead of patching endlessly
-  ✅ Do not generate surface-level fake apps — real routes, real workflows, real data
-
-BUILD ORDER for new_app — generate in this EXACT dependency order:
+BUILD ORDER — generate in this EXACT sequence:
   1. types.ts         (pure type declarations — no dependencies)
-  2. App.tsx          (REQUIRED — output early so token truncation never cuts it off)
+  2. App.tsx          (REQUIRED second — prevents token-truncation loss of entry point)
   3. data.ts          (depends on types)
   4. components/*.tsx (depends on types + data)
   5. pages/*.tsx      (depends on components)
-  NOTE: App.tsx MUST be output second — it is the entry point and must never be omitted.
 
-For feature_add: Output ONLY changed files. Every file you output REPLACES the current version completely.
+For feature_add/bug_fix: Output ONLY changed files. Every file you output REPLACES the current version.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔧 CHANGE APPLICATION RULES (for modifications to existing apps)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  • Inspect what already works before changing anything
+  • Determine the MINIMUM set of files that need to change
+  • Preserve working functionality outside the requested change
+  • Never redesign unrelated sections
+  • Never change stack conventions or architecture
+  • Never modify files not relevant to the request
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🧱 PHASE 2 — FILE GENERATION DISCIPLINE
@@ -1037,17 +1043,35 @@ const MAX_TOKENS_BY_TYPE = {
   bug_fix:     10000,   // raised 8k→10k: same reason
 };
 
-const PLANNER_PROMPT = `You are a senior product architect. Given a user's React app request, output a concise JSON build plan.
+const PLANNER_PROMPT = `You are a senior product architect applying a strict scope-reduction policy.
+Given a user's React app request, output a concise JSON build plan for the SMALLEST working first version.
+
+SCOPE REDUCTION RULES — apply these strictly:
+- Include only what is needed for the FIRST working slice
+- Exclude auth/login UNLESS the user explicitly asks for it (use a mock user instead)
+- Exclude payments, admin panels, email/notifications UNLESS explicitly required
+- Exclude external API integrations UNLESS explicitly required
+- Exclude speculative features and future-phase systems
+- Keep pages to the minimum that demonstrate the core user flow (usually 2-4 pages max)
+- Keep components to only what those pages need
+
 Output ONLY valid JSON with no other text, no code fences, no markdown.
 
 {
-  "title": "2-4 word name for the app (e.g. 'Revenue Dashboard', 'Task Manager', 'Analytics Hub')",
-  "description": "one sentence in future tense describing what will be built, starting with 'I'll build' or 'I will create'",
+  "title": "2-4 word name (e.g. 'Task Manager', 'Revenue Dashboard')",
+  "description": "one sentence in future tense starting with 'I'll build' describing the minimum first version",
   "requestType": "new_app",
-  "pages": ["Dashboard", "Users", "Settings"],
-  "components": ["StatCard", "UserTable", "UserModal", "Sidebar"],
-  "dataEntities": ["users", "transactions", "analytics"],
-  "designDirection": "dark minimal SaaS dashboard with indigo accent"
+  "firstBuildScope": ["list of features included in this first build — be specific"],
+  "deferredScope": ["list of features NOT in this build — auth, payments, admin, etc."],
+  "pages": ["only pages needed for core flow, max 4"],
+  "components": ["only components those pages actually need"],
+  "dataEntities": ["data types needed for first build only"],
+  "designDirection": "dark minimal SaaS with indigo accent",
+  "acceptanceCriteria": [
+    "App renders without errors",
+    "User can complete the core action (e.g. create/view/manage X)",
+    "Navigation between pages works"
+  ]
 }`;
 
 /**
@@ -1093,7 +1117,7 @@ app.post('/api/build', async (req, res) => {
       try {
         const planMsg = await anthropicClient.messages.create({
           model: 'claude-haiku-4-5-20251001',
-          max_tokens: 500,
+          max_tokens: 800,
           messages: [
             { role: 'user', content: `${PLANNER_PROMPT}\n\nRequest: ${userMessage}` },
           ],
@@ -1124,16 +1148,33 @@ app.post('/api/build', async (req, res) => {
           send({ title: plan.title });
         }
 
+        // Build deferred scope note — tells generator what NOT to build
+        const deferredItems = (plan.deferredScope || []);
+        const firstBuildItems = (plan.firstBuildScope || []);
+        const acceptanceCriteria = (plan.acceptanceCriteria || []);
+
         planContext = [
-          '\n\n[BUILD PLAN]',
-          `Description: ${plan.description}`,
-          `Views (use useState to switch between them — NO React Router): ${(plan.pages || []).join(', ')}`,
+          '\n\n[BUILD PLAN — FIRST BUILD SCOPE ONLY]',
+          `Goal: ${plan.description}`,
+          '',
+          firstBuildItems.length > 0
+            ? `✅ INCLUDED IN THIS BUILD:\n${firstBuildItems.map(f => `   • ${f}`).join('\n')}`
+            : '',
+          deferredItems.length > 0
+            ? `⏭ DEFERRED (do NOT build these in this pass):\n${deferredItems.map(f => `   • ${f}`).join('\n')}`
+            : '',
+          '',
+          `Views (useState navigation — NO React Router): ${(plan.pages || []).join(', ')}`,
           `Components: ${(plan.components || []).join(', ')}`,
           `Data entities: ${(plan.dataEntities || []).join(', ')}`,
           `Design: ${plan.designDirection || 'dark minimal SaaS'}`,
-          `NAVIGATION RULE: const [page, setPage] = useState('${(plan.pages || ['dashboard'])[0].toLowerCase().replace(/\s+/g, '-')}') — switch views with setPage(), never use React Router or any routing library.`,
+          `NAVIGATION: const [page, setPage] = useState('${(plan.pages || ['dashboard'])[0].toLowerCase().replace(/\s+/g, '-')}')`,
+          '',
+          acceptanceCriteria.length > 0
+            ? `ACCEPTANCE CRITERIA (your build must satisfy ALL of these):\n${acceptanceCriteria.map((c, i) => `   ${i + 1}. ${c}`).join('\n')}`
+            : '',
           '[/BUILD PLAN]',
-        ].join('\n');
+        ].filter(Boolean).join('\n');
 
         // Derive required file manifest and inject as an enforced checklist.
         // Also send it to the client so it can detect truncation and auto-continue.
@@ -1142,10 +1183,11 @@ app.post('/api/build', async (req, res) => {
 
         const manifestLines = manifest.map(f => `□ ${f}`).join('\n');
         planContext +=
-          `\n\nMANDATORY FILE MANIFEST — you MUST output ALL of these files as complete code blocks:\n${manifestLines}\n` +
+          `\n\nMANDATORY FILE MANIFEST — generate ONLY these files, no more:\n${manifestLines}\n` +
           `Output order (FOLLOW THIS EXACTLY): types.ts → App.tsx → data.ts → components → pages\n` +
-          `App.tsx MUST be output SECOND so token truncation never cuts it off — it is the entry point.\n` +
-          `NEVER skip App.tsx — without it the app cannot render.`;
+          `App.tsx MUST be output SECOND so token truncation never cuts it off.\n` +
+          `NEVER skip App.tsx — without it the app cannot render.\n` +
+          `NEVER generate files not in this manifest — scope creep causes crashes.`;
       } catch (planErr) {
         console.error('[build] Planner failed:', planErr.message);
         send({ stage: 'plan', plan: null });

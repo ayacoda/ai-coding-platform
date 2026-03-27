@@ -9,8 +9,8 @@ import { saveVersion } from '../lib/versions';
 // Fix budget: max 2 attempts for the same error fingerprint before stopping.
 const STUCK_THRESHOLD = 2;
 // Stop auto-fixing after this many DISTINCT errors in one session — indicates architectural failure.
-// Prompt the user to regenerate instead of stacking more patches.
-const DISTINCT_ERROR_LIMIT = 3;
+// 2 distinct errors = the fix introduced a new problem = stop patching, ask user to regenerate.
+const DISTINCT_ERROR_LIMIT = 2;
 
 /** Normalize an error string so minor variations (line numbers) don't defeat stuck detection.
  *  IMPORTANT: keep the identifier in "X is not defined" errors so that fixing AppointmentsPage
@@ -357,7 +357,7 @@ function ErrorOverlay({
     ? 'Auto-fix stopped'
     : 'Runtime Error';
   const subtitleText = shouldRegenerate
-    ? '3 different errors occurred — patching has stopped. Describe what you want and I\'ll rebuild cleanly.'
+    ? 'Fix introduced a new error — patching stopped to avoid loops. Describe what you want and I\'ll rebuild cleanly.'
     : isStuck
     ? 'Same error keeps repeating — click Try Again or describe the fix in chat'
     : 'Auto-fix will start shortly…';
