@@ -447,7 +447,7 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '          "var EMPLOYEES=window.EMPLOYEES||[];var PAYMENTS=window.PAYMENTS||[];var REVIEWS=window.REVIEWS||[];" +\n' +
     // Pre-define common object/config variables as empty object fallbacks
     '          "var config={};var settings={};var theme={};var options={};var filters={};var metadata={};" +\n' +
-    '          "var currentProject=window.currentProject||null;var selectedItem=null;var activeTab=\'\';" +\n';
+    '          "var currentProject=window.currentProject||null;var selectedItem=null;var activeTab=\'\';";\n' +
     // Runtime auto-stub loop — handles any number of "X is not defined" errors:
     //   • PascalCase (interface used as JSX component) → stub as visible error div
     //   • p_xxxxx / proj_default (schema name as JS var) → alias to window.db
