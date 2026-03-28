@@ -1413,7 +1413,7 @@ function MessageBubble({ message, onRePrompt, onFix, onImplement, onBuildFromAsk
                 content={message.content}
                 isStreaming={!!message.isStreaming}
                 onImplement={(!message.pipeline && !message.isAskResponse) ? onImplement : undefined}
-                hideCode={(!!message.isAskResponse && !message.isStreaming) || (!message.isStreaming && (!!message.pipeline || !!message.isRepairMessage))}
+                hideCode={(!!message.isAskResponse && !message.isStreaming) || (!!message.pipeline || !!message.isRepairMessage)}
                 noChips={!!message.isAskResponse}
               />
             )}
@@ -1518,7 +1518,7 @@ function MarkdownContent({ content, isStreaming, onImplement, hideCode, noChips 
         }
         return <TextBlock key={i} text={seg.content} onImplement={onImplement} />;
       })}
-      {/* After generation: show compact file chips instead of full code blocks */}
+      {/* File chips — shown during AND after generation instead of raw code blocks */}
       {hideCode && codeSegments.length > 0 && !noChips && (
         <div className="flex flex-wrap gap-1.5 pt-1">
           {codeSegments.map((seg, i) => {
@@ -1527,21 +1527,28 @@ function MarkdownContent({ content, isStreaming, onImplement, hideCode, noChips 
               ts: 'text-blue-400/70 bg-blue-400/8 border-blue-500/20',
               css: 'text-pink-400/70 bg-pink-400/8 border-pink-500/20',
               json: 'text-orange-400/70 bg-orange-400/8 border-orange-500/20',
+              sql: 'text-amber-400/70 bg-amber-400/8 border-amber-500/20',
             };
             const color = langColor[seg.lang.toLowerCase()] ?? 'text-zinc-500 bg-zinc-800/60 border-zinc-700/40';
+            // The last segment is "currently writing" if it's incomplete (streaming)
+            const isWriting = isStreaming && !seg.isComplete;
             return (
-              <span key={i} className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[10px] font-mono ${color}`}>
-                <svg className="w-2.5 h-2.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                </svg>
+              <span key={i} className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[10px] font-mono transition-opacity ${color} ${isWriting ? 'opacity-70' : 'opacity-100'}`}>
+                {isWriting ? (
+                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse flex-shrink-0" />
+                ) : (
+                  <svg className="w-2.5 h-2.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                )}
                 {seg.filename || seg.lang}
               </span>
             );
           })}
         </div>
       )}
-      {/* Blinking cursor at the end while streaming */}
-      {isStreaming && segments.length > 0 && segments[segments.length - 1].type === 'text' && (
+      {/* Blinking cursor at the end while streaming text (not when inside a code block) */}
+      {isStreaming && segments.length > 0 && segments[segments.length - 1].type === 'text' && !hideCode && (
         <span className="inline-block w-0.5 h-4 bg-indigo-400 ml-0.5 animate-pulse align-middle" />
       )}
     </div>
