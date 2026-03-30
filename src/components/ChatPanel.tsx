@@ -1414,6 +1414,7 @@ function MessageBubble({ message, onRePrompt, onFix, onImplement, onBuildFromAsk
                 isStreaming={!!message.isStreaming}
                 onImplement={(!message.pipeline && !message.isAskResponse) ? onImplement : undefined}
                 hideCode={(!!message.isAskResponse && !message.isStreaming) || (!!message.pipeline || !!message.isRepairMessage)}
+                hideText={!!message.pipeline || !!message.isRepairMessage}
                 noChips={!!message.isAskResponse}
               />
             )}
@@ -1494,7 +1495,7 @@ function parseContent(text: string): Segment[] {
 
 // ─── Markdown Renderer ────────────────────────────────────────────────────────
 
-function MarkdownContent({ content, isStreaming, onImplement, hideCode, noChips }: { content: string; isStreaming: boolean; onImplement?: (text: string) => void; hideCode?: boolean; noChips?: boolean }) {
+function MarkdownContent({ content, isStreaming, onImplement, hideCode, hideText, noChips }: { content: string; isStreaming: boolean; onImplement?: (text: string) => void; hideCode?: boolean; hideText?: boolean; noChips?: boolean }) {
   const segments = parseContent(content);
 
   // When code is hidden, collect all code segments to show as file chips
@@ -1516,6 +1517,7 @@ function MarkdownContent({ content, isStreaming, onImplement, hideCode, noChips 
             />
           );
         }
+        if (hideText) return null;
         return <TextBlock key={i} text={seg.content} onImplement={onImplement} />;
       })}
       {/* File chips — shown during AND after generation instead of raw code blocks */}
@@ -1547,8 +1549,8 @@ function MarkdownContent({ content, isStreaming, onImplement, hideCode, noChips 
           })}
         </div>
       )}
-      {/* Blinking cursor at the end while streaming text (not when inside a code block) */}
-      {isStreaming && segments.length > 0 && segments[segments.length - 1].type === 'text' && !hideCode && (
+      {/* Blinking cursor at the end while streaming text (not when inside a code block, not when text is hidden) */}
+      {isStreaming && segments.length > 0 && segments[segments.length - 1].type === 'text' && !hideCode && !hideText && (
         <span className="inline-block w-0.5 h-4 bg-indigo-400 ml-0.5 animate-pulse align-middle" />
       )}
     </div>
@@ -1830,11 +1832,11 @@ const REQUEST_TYPE_LABELS: Record<string, { label: string; color: string }> = {
 };
 
 const STAGE_DISPLAY: Record<string, string> = {
-  routing:    'Router',
-  planning:   'Planner',
-  generating: 'Generator',
-  polishing:  'Polish',
-  validating: 'Validator',
+  routing:        'Router',
+  planning:       'Planner',
+  generating:     'Generator',
+  polishing:      'Polish',
+  validating:     'Validator',
 };
 
 const MODEL_SHORT: Record<string, string> = {

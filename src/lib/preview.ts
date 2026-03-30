@@ -445,9 +445,28 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '          "var INVOICES=window.INVOICES||[];var LEADS=window.LEADS||[];var DEALS=window.DEALS||[];" +\n' +
     '          "var APPOINTMENTS=window.APPOINTMENTS||[];var COURSES=window.COURSES||[];var STUDENTS=window.STUDENTS||[];" +\n' +
     '          "var EMPLOYEES=window.EMPLOYEES||[];var PAYMENTS=window.PAYMENTS||[];var REVIEWS=window.REVIEWS||[];" +\n' +
+    // Pre-define SQL/CSS reserved keywords as safe empty defaults.
+    // These are commonly used as uppercase variable names by AI (e.g. const TO = '#color').
+    // As var declarations, they're overridden by any const/let with the same name — so they
+    // only act as fallbacks when the real declaration is missing (e.g. import was stripped).
+    // This prevents "TO is not defined" crashes in BOTH sync and async contexts.
+    '          "var TO=\'\';var INTO=\'\';var SET=[];var AS=\'\';var ON=\'\';var BY=\'\';var DO=false;var UP=\'\';var DOWN=\'\';" +\n' +
+    '          "var END=null;var BEGIN=null;var LIMIT=100;var OFFSET=0;var IN=[];var OUT=\'\';" +\n' +
     // Pre-define common object/config variables as empty object fallbacks
     '          "var config={};var settings={};var theme={};var options={};var filters={};var metadata={};" +\n' +
-    '          "var currentProject=window.currentProject||null;var selectedItem=null;var activeTab=\'\';";\n' +
+    '          "var currentProject=window.currentProject||null;var selectedItem=null;var activeTab=\'\';" +\n' +
+    // Pre-define dark/light theme variables as light-mode defaults.
+    // The APP SHELL template in the system prompt defines these inside the App() function,
+    // so they are block-scoped and NOT accessible in sub-components unless passed as props.
+    // These var stubs are overridden by any const/let with the same name (App() re-declares them),
+    // but serve as safe fallbacks for sub-components that reference them without receiving props.
+    // This prevents "bg is not defined" → "bg.toString()" → "[object Object]" CSS class bugs.
+    '          "var bg=\'bg-gray-50\';var surface=\'bg-white\';var border=\'border-gray-200\';" +\n' +
+    '          "var text=\'text-zinc-900\';var textMuted=\'text-zinc-500\';var hoverBg=\'hover:bg-black/[0.04]\';" +\n' +
+    '          "var inputBg=\'bg-gray-100 border-gray-200\';var cardBg=\'bg-white\';" +\n' +
+    // Pre-define common APP SHELL template variables so the sidebar/nav renders even if
+    // the AI forgets to define them (navItems.map() → "{}.map is not a function" crash).
+    '          "var navItems=[];var pageTitle=\'\';var entityName=\'Item\';var initials=\'DU\';";\n' +
     // Runtime auto-stub loop — handles any number of "X is not defined" errors:
     //   • PascalCase (interface used as JSX component) → stub as visible error div
     //   • p_xxxxx / proj_default (schema name as JS var) → alias to window.db
@@ -513,8 +532,37 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '                results:      [],\n' +
     '                records:      [],\n' +
     '                list:         [],\n' +
+    // Common APP SHELL template variables — must be arrays to avoid ".map is not a function"
+    '                navItems:     [],\n' +
+    '                menuItems:    [],\n' +
+    '                sidebarItems: [],\n' +
+    '                tabs:         [],\n' +
+    '                columns:      [],\n' +
+    '                tags:         [],\n' +
+    '                categories:   [],\n' +
+    '                entries:      [],\n' +
+    // Common theme variables — light mode defaults so sub-components render without crashing
+    '                bg:           "bg-gray-50",\n' +
+    '                surface:      "bg-white",\n' +
+    '                border:       "border-gray-200",\n' +
+    '                text:         "text-zinc-900",\n' +
+    '                textMuted:    "text-zinc-500",\n' +
+    '                hoverBg:      "hover:bg-black/[0.04]",\n' +
+    '                inputBg:      "bg-gray-100",\n' +
+    '                cardBg:       "bg-white",\n' +
+    '                pageTitle:    "",\n' +
+    '                entityName:   "Item",\n' +
+    '                initials:     "DU",\n' +
     '              };\n' +
-    '              window[_lv] = _AUTH_STUBS[_lv] !== undefined ? _AUTH_STUBS[_lv] : {};\n' +
+    // Unknown lowercase vars ending in common array-typed suffixes should default to []
+    // to prevent ".map is not a function" crashes on nav/list variables.
+    '              var _isArrayLike = _AUTH_STUBS[_lv] !== undefined\n' +
+    '                ? Array.isArray(_AUTH_STUBS[_lv])\n' +
+    '                : (_lv.endsWith("Items") || _lv.endsWith("List") || _lv.endsWith("Array")\n' +
+    '                   || _lv.endsWith("Data") || _lv.endsWith("Results") || _lv.endsWith("Rows")\n' +
+    '                   || _lv.endsWith("Entries") || _lv.endsWith("Records") || _lv.endsWith("Tabs")\n' +
+    '                   || _lv.endsWith("Columns") || _lv.endsWith("Tags") || _lv.endsWith("Nav"));\n' +
+    '              window[_lv] = _AUTH_STUBS[_lv] !== undefined ? _AUTH_STUBS[_lv] : (_isArrayLike ? [] : {});\n' +
     '              console.warn("[preview] auto-stub (lowercase):", _lv, "→", window[_lv]);\n' +
     '              _run();\n' +
     '            } else if (_autoStubsLeft > 0 && msg.match(/has already been declared/)) {\n' +

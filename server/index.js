@@ -16,6 +16,25 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 config();
 
+// ── Resolve real Anthropic key ────────────────────────────────────────────────
+// The Orchids runtime injects ANTHROPIC_API_KEY=orx_... (proxy key) and
+// ANTHROPIC_BASE_URL pointing to their proxy — but that proxy rejects our models.
+// When an orx_ key is detected, read the real sk-ant-... key from .env directly
+// and create the Anthropic client pointed at the real API.
+function getRealAnthropicKey() {
+  const envKey = process.env.ANTHROPIC_API_KEY || '';
+  if (envKey && !envKey.startsWith('orx_')) return envKey;
+  try {
+    const envFile = readFileSync(join(__dirname, '../.env'), 'utf-8');
+    const match = envFile.match(/^ANTHROPIC_API_KEY=(.+)$/m);
+    if (match) return match[1].trim();
+  } catch {}
+  return envKey;
+}
+
+const realAnthropicKey = getRealAnthropicKey();
+const isRealAnthropicKey = realAnthropicKey.startsWith('sk-');
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -67,7 +86,9 @@ function getTextContent(msg) {
 }
 
 let anthropicClient = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
+  apiKey: realAnthropicKey,
+  // When using the real Anthropic key, bypass any proxy base URL injected by the runtime
+  ...(isRealAnthropicKey ? { baseURL: 'https://api.anthropic.com' } : {}),
 });
 
 let openaiClient = new OpenAI({
@@ -225,8 +246,24 @@ For feature_add/bug_fix: Output ONLY changed files. Every file you output REPLAC
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔧 CHANGE APPLICATION RULES (for modifications to existing apps)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STRUCTURE AND STYLE PRESERVATION — NON-NEGOTIABLE:
+  ❌ DO NOT change any CSS classes, colors, spacing, font sizes, or layout not directly required by the request
+  ❌ DO NOT restructure JSX hierarchy — keep the same nesting and component tree
+  ❌ DO NOT rename variables, functions, props, or components that aren't broken
+  ❌ DO NOT move or reorganize code sections — only add/edit the minimum lines needed
+  ❌ DO NOT switch from inline styles to Tailwind or vice versa
+  ❌ DO NOT change the design system, color palette, or visual language of any section
+  ❌ DO NOT add new dependencies, imports, or abstractions unless required by the feature
+  ❌ DO NOT "clean up" or "improve" code while implementing the change — that's a separate request
+  ✅ Copy every existing className and style EXACTLY when you must re-output a modified file
+  ✅ Add the requested feature as the SMALLEST possible insertion into the existing code
+  ✅ Treat the existing code as ground truth — do not second-guess or "fix" anything that isn't broken
+  ✅ If a file has 200 lines and you need to add 5, output those same 200 lines + 5 new lines exactly
+
+MINIMUM CHANGE RULE:
   • Inspect what already works before changing anything
   • Determine the MINIMUM set of files that need to change
+  • If you can add the feature with 5 lines of code, add 5 lines — not 50
   • Preserve working functionality outside the requested change
   • Never redesign unrelated sections
   • Never change stack conventions or architecture
@@ -264,9 +301,14 @@ FRONTEND files MUST NEVER contain:
   ❌ Raw SQL, DDL, migrations, schema definitions
   ❌ Secret keys or backend environment variables
   ❌ Server-only logic, filesystem logic, backend admin clients
-  ❌ SQL keywords used as variable names (TABLE, SELECT, INSERT, UPDATE, DELETE,
-     CREATE, DROP, ALTER, COLUMN, SCHEMA, INDEX, WHERE, FROM, JOIN) — they leak
+  ❌ SQL/CSS keywords used as variable names (TABLE, SELECT, INSERT, UPDATE, DELETE,
+     CREATE, DROP, ALTER, COLUMN, SCHEMA, INDEX, WHERE, FROM, JOIN,
+     TO, INTO, SET, AS, ON, ORDER, GROUP, HAVING, LIMIT, OFFSET,
+     GRANT, REVOKE, BEGIN, END, TRANSACTION, COMMIT, ROLLBACK) — they leak
      into frontend runtime and crash with "[keyword] is not defined"
+  ❌ Specifically: NEVER use TO, FROM, SET, AS, ON as standalone uppercase variable names.
+     These crash constantly in sandbox: const TO = ..., const FROM = ..., const SET = ..., const AS = ...
+     ✅ Use descriptive names instead: TO_COLOR, GRADIENT_END, DESTINATION_URL, etc.
 
 SCHEMA files (schema.sql) MAY contain:
   ✅ SQL, DDL, migration instructions, schema definitions
@@ -408,22 +450,34 @@ UI rules:
 
 Do not generate placeholder UI. Do not generate one-column broken layouts unless the app truly requires it.
 
-APP SHELL — copy exactly:
+APP SHELL — copy exactly (includes mandatory dark/light toggle):
 \`\`\`tsx
+// ── Theme state — ALWAYS include these two lines at the TOP of the App function ──
+const [darkMode, setDarkMode] = useState(false); // FALSE = light mode is the DEFAULT
 const [sidebarOpen, setSidebarOpen] = useState(false);
-<div className="flex h-screen bg-[#0a0a0a] overflow-hidden font-sans">
+
+// ── Theme variables — define once, use everywhere ──
+const bg      = darkMode ? 'bg-[#0a0a0a]' : 'bg-gray-50';
+const surface  = darkMode ? 'bg-[#111111]' : 'bg-white';
+const border   = darkMode ? 'border-[#1f1f1f]' : 'border-gray-200';
+const text     = darkMode ? 'text-zinc-100' : 'text-zinc-900';
+const textMuted = darkMode ? 'text-zinc-500' : 'text-zinc-500';
+const hoverBg  = darkMode ? 'hover:bg-white/[0.06]' : 'hover:bg-black/[0.04]';
+const inputBg  = darkMode ? 'bg-[#1a1a1a] border-[#2a2a2a] text-zinc-300 placeholder-zinc-600' : 'bg-gray-100 border-gray-200 text-zinc-700 placeholder-zinc-400';
+
+<div className={\`flex h-screen \${bg} overflow-hidden font-sans\`}>
   {sidebarOpen && <div className="fixed inset-0 z-20 bg-black/60 lg:hidden" onClick={() => setSidebarOpen(false)} />}
-  <aside className={\`fixed lg:static inset-y-0 left-0 z-30 w-[220px] bg-[#111111] border-r border-[#1f1f1f] flex flex-col shrink-0 transform transition-transform duration-200 \${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:translate-x-0\`}>
-    <div className="h-14 flex items-center gap-2.5 px-4 border-b border-[#1f1f1f]">
+  <aside className={\`fixed lg:static inset-y-0 left-0 z-30 w-[220px] \${surface} border-r \${border} flex flex-col shrink-0 transform transition-transform duration-200 \${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:translate-x-0\`}>
+    <div className={\`h-14 flex items-center gap-2.5 px-4 border-b \${border}\`}>
       <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-indigo-600 flex items-center justify-center shrink-0">
         <svg className="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 20 20"><path d="M10 2L2 7l8 5 8-5-8-5zM2 13l8 5 8-5M2 10l8 5 8-5"/></svg>
       </div>
-      <span className="font-semibold text-[13px] text-zinc-100 tracking-tight">AppName</span>
+      <span className={\`font-semibold text-[13px] \${text} tracking-tight\`}>AppName</span>
     </div>
     <nav className="flex-1 p-2 space-y-0.5 overflow-y-auto">
       {navItems.map(item => (
         <button key={item.id} onClick={() => onNavigate(item.id)}
-          className={\`w-full flex items-center gap-2.5 px-3 py-[7px] rounded-md text-[13px] transition-colors \${active === item.id ? 'bg-white/[0.07] text-zinc-100' : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/[0.04]'}\`}>
+          className={\`w-full flex items-center gap-2.5 px-3 py-[7px] rounded-md text-[13px] transition-colors \${active === item.id ? (darkMode ? 'bg-white/[0.07] text-zinc-100' : 'bg-indigo-50 text-indigo-700') : \`\${textMuted} \${hoverBg}\`}\`}>
           <svg className="w-4 h-4 shrink-0" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" d={item.icon} />
           </svg>
@@ -431,36 +485,48 @@ const [sidebarOpen, setSidebarOpen] = useState(false);
         </button>
       ))}
     </nav>
-    <div className="p-2 border-t border-[#1f1f1f]">
-      <div className="flex items-center gap-2.5 px-2 py-2 rounded-md hover:bg-white/[0.04] cursor-pointer">
+    <div className={\`p-2 border-t \${border}\`}>
+      <div className={\`flex items-center gap-2.5 px-2 py-2 rounded-md \${hoverBg} cursor-pointer\`}>
         <div className="w-7 h-7 rounded-full bg-gradient-to-br from-orange-400 to-rose-500 flex items-center justify-center text-[11px] font-bold text-white shrink-0">{initials}</div>
         <div className="flex-1 min-w-0">
-          <p className="text-[12px] font-medium text-zinc-200 truncate">{user.name}</p>
-          <p className="text-[11px] text-zinc-600 truncate">{user.role}</p>
+          <p className={\`text-[12px] font-medium \${text} truncate\`}>{user.name}</p>
+          <p className={\`text-[11px] \${textMuted} truncate\`}>{user.role}</p>
         </div>
       </div>
     </div>
   </aside>
   <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-    <header className="h-14 border-b border-[#1f1f1f] bg-[#111111] flex items-center justify-between px-4 md:px-6 shrink-0">
+    <header className={\`h-14 border-b \${border} \${surface} flex items-center justify-between px-4 md:px-6 shrink-0\`}>
       <div className="flex items-center gap-3">
-        <button onClick={() => setSidebarOpen(!sidebarOpen)} className="lg:hidden w-8 h-8 flex items-center justify-center rounded-lg hover:bg-white/[0.08] text-zinc-400">
+        <button onClick={() => setSidebarOpen(!sidebarOpen)} className={\`lg:hidden w-8 h-8 flex items-center justify-center rounded-lg \${hoverBg} \${textMuted}\`}>
           <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16"/></svg>
         </button>
-        <h1 className="text-[14px] md:text-[15px] font-semibold text-zinc-100">{pageTitle}</h1>
+        <h1 className={\`text-[14px] md:text-[15px] font-semibold \${text}\`}>{pageTitle}</h1>
       </div>
       <div className="flex items-center gap-2">
         <div className="relative hidden sm:block">
-          <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
-          <input className="h-8 pl-8 pr-3 bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-[12px] text-zinc-300 placeholder-zinc-600 outline-none focus:border-zinc-600 w-40 md:w-52" placeholder="Search…" />
+          <svg className={\`absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 \${textMuted}\`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+          <input className={\`h-8 pl-8 pr-3 \${inputBg} border rounded-lg text-[12px] outline-none w-40 md:w-52\`} placeholder="Search…" />
         </div>
         <button className="flex items-center gap-1.5 h-8 px-3 bg-indigo-600 hover:bg-indigo-500 text-white text-[12px] font-medium rounded-lg transition-colors">
           <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 4v16m8-8H4"/></svg>
           <span className="hidden sm:inline">New {entityName}</span>
         </button>
+        {/* ── DARK / LIGHT TOGGLE — mandatory, always present ── */}
+        <button
+          onClick={() => setDarkMode(!darkMode)}
+          title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+          className={\`w-8 h-8 flex items-center justify-center rounded-lg transition-colors \${darkMode ? 'hover:bg-white/[0.08] text-zinc-400' : 'hover:bg-black/[0.06] text-zinc-500'}\`}
+        >
+          {darkMode ? (
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3v1m0 16v1m8.66-9h-1M4.34 12h-1m15.07-6.07-.7.7M6.34 17.66l-.7.7m12.02 0-.7-.7M6.34 6.34l-.7-.7M12 5a7 7 0 100 14A7 7 0 0012 5z" /></svg>
+          ) : (
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z" /></svg>
+          )}
+        </button>
       </div>
     </header>
-    <main className="flex-1 overflow-y-auto bg-[#0a0a0a] p-4 md:p-6">{/* page content */}</main>
+    <main className={\`flex-1 overflow-y-auto \${bg} p-4 md:p-6\`}>{/* page content */}</main>
   </div>
 </div>
 \`\`\`
@@ -543,6 +609,67 @@ Responsive rules:
   • Touch targets: min h-11 / py-2.5 on mobile buttons
   • Tables: always wrap in overflow-x-auto with min-w-[600px]
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🌓 DARK / LIGHT MODE TOGGLE — MANDATORY IN EVERY APP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Every generated app MUST include a functional dark/light mode toggle. No exceptions.
+
+IMPLEMENTATION — use this exact pattern:
+
+Step 1 — declare state at the top of App.tsx (inside the App function):
+\`\`\`tsx
+const [darkMode, setDarkMode] = useState(false); // light by default
+\`\`\`
+
+Step 2 — add the toggle button in the header (top-right area, next to other actions):
+\`\`\`tsx
+<button
+  onClick={() => setDarkMode(!darkMode)}
+  title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+  className={\`w-8 h-8 flex items-center justify-center rounded-lg transition-colors \${darkMode ? 'hover:bg-white/[0.08] text-zinc-400' : 'hover:bg-black/[0.06] text-zinc-500'}\`}
+>
+  {darkMode ? (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3v1m0 16v1m8.66-9h-1M4.34 12h-1m15.07-6.07-.7.7M6.34 17.66l-.7.7m12.02 0-.7-.7M6.34 6.34l-.7-.7M12 5a7 7 0 100 14A7 7 0 0012 5z" />
+    </svg>
+  ) : (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z" />
+    </svg>
+  )}
+</button>
+\`\`\`
+
+Step 3 — define color variables inside App.tsx (or pass darkMode as prop to sub-components):
+\`\`\`tsx
+const bg = darkMode ? 'bg-[#0a0a0a]' : 'bg-gray-50';
+const surface = darkMode ? 'bg-[#111111]' : 'bg-white';
+const border = darkMode ? 'border-[#1f1f1f]' : 'border-gray-200';
+const text = darkMode ? 'text-zinc-100' : 'text-zinc-900';
+const textMuted = darkMode ? 'text-zinc-500' : 'text-zinc-500';
+const hoverBg = darkMode ? 'hover:bg-white/[0.06]' : 'hover:bg-black/[0.04]';
+\`\`\`
+
+Step 4 — apply conditionally everywhere:
+\`\`\`tsx
+<div className={\`flex h-screen \${bg} overflow-hidden\`}>
+  <aside className={\`\${surface} border-r \${border}\`}>
+  <header className={\`\${surface} border-b \${border}\`}>
+  <div className={\`\${surface} \${border} rounded-xl p-5 border\`}>  {/* cards */}
+  <p className={\`text-[13px] \${text}\`}>
+  <p className={\`text-[12px] \${textMuted}\`}>
+\`\`\`
+
+RULES — strictly enforced:
+  ✅ darkMode initialized as false (light by default)
+  ✅ Toggle button always visible and functional in the header
+  ✅ Sidebar, header, main content, cards, modals, tables ALL adapt to darkMode
+  ✅ Pass darkMode + setter as props to sub-components that need it, OR define color vars at App level and pass as props
+  ❌ NEVER use Tailwind 'dark:' prefix — requires HTML class strategy, not supported in sandbox
+  ❌ NEVER use document.documentElement.classList — DOM manipulation not available in sandbox eval
+  ❌ NEVER hardcode dark-only colors (#0a0a0a, #111111) without a light-mode counterpart
+  ❌ NEVER omit the toggle — its absence makes the app fail the UI quality standard
+
 Data requirements:
   • 20+ realistic records — real names, companies, dollar amounts, percentages
   • NO placeholder data: "John Doe", "Lorem ipsum", "Item 1", "Test" → REJECTED
@@ -607,6 +734,14 @@ CRASH PREVENTION:
   □ No two components with the same export name
   □ No reserved React global names used as local variables (Fragment, memo, Children, etc.)
 
+MODIFICATION INTEGRITY (feature_add / bug_fix only — skip for new_app/redesign):
+  □ Did NOT change any CSS classes, colors, spacing, or visual layout beyond what was requested
+  □ Did NOT rename any existing variables, functions, props, or components
+  □ Did NOT restructure or reorganize JSX hierarchy in unchanged sections
+  □ Did NOT simplify or reduce existing code in files that were re-output
+  □ Every className in the output matches what was in the input — no silent restyle
+  □ The only visual difference between input and output is the requested new feature
+
 ARCHITECTURE INTEGRITY:
   □ Every component has exactly one responsibility
   □ No duplicated logic across files — shared logic is in one place
@@ -625,6 +760,16 @@ FIRST-BUILD SIMULATION — mentally execute before outputting:
   □ Async safety: every async call is inside useEffect or an event handler, never top-level
   □ Null safety: no crash if any async data returns null/undefined before load completes
   If any of the above is uncertain — improve the implementation before outputting.
+
+DARK / LIGHT THEME (failing this check = app rejected):
+  □ const [darkMode, setDarkMode] = useState(false) declared at top of App function — FALSE = light default
+  □ Theme variables (bg, surface, border, text, textMuted, hoverBg) defined and used throughout
+  □ Toggle button present in the header with sun icon (light mode) / moon icon (dark mode)
+  □ onClick={() => setDarkMode(!darkMode)} wired correctly to the toggle button
+  □ Sidebar, header, main content, cards, modals, tables ALL use theme variables — zero hardcoded dark colors
+  □ App looks correct in light mode (default) — white/gray surfaces, dark text
+  □ App looks correct in dark mode — dark surfaces, light text
+  □ NEVER use Tailwind dark: prefix, document.documentElement.classList, or localStorage for theme
 
 UI COMPLETENESS:
   □ App renders correctly and is visually complete — not a skeleton, not a placeholder
@@ -647,11 +792,20 @@ OUTPUT FORMAT:
 
 FEATURE ADD / MODIFICATION — surgical precision:
   • Output ONLY the file(s) that must change. Every file you output REPLACES the existing version.
-  • Re-outputting App.tsx with simplified code DESTROYS the current App.tsx.
+  • Re-outputting App.tsx with simplified code DESTROYS the current App.tsx — DO NOT simplify it.
+  • Re-outputting a component with different styling DESTROYS its visual design — preserve every className.
   • One change touches one file → output one file. No extras.
-  ① Read the request — which specific files change?
-  ② Output ONLY those files, complete and correct.
-  ③ Leave everything else untouched.
+  ① Read the request — EXACTLY what was asked? Nothing more, nothing less.
+  ② Identify the MINIMUM file(s) that must change.
+  ③ In those files: keep ALL existing structure, styles, variable names, and logic untouched.
+     Only insert/modify the exact lines required by the request.
+  ④ Output ONLY those files, complete and correct.
+  ⑤ Leave everything else untouched.
+
+  🚫 NEVER change visual appearance as a side effect of adding a feature.
+  🚫 NEVER "improve" or "clean up" code while making a change — do ONLY what was asked.
+  🚫 NEVER simplify or reduce existing code when re-outputting a file.
+  ✅ A correct feature add makes the preview look identical to before — except for the new feature.
 
 AUTHENTICATION (when user explicitly asks):
   Use window.db.auth.* — NEVER hardcode credentials.
@@ -1059,6 +1213,14 @@ function validateGeneratedFiles(files) {
     if (/\buseState\s*(?:<[^<>]*>)?\s*\(\s*\)/.test(content)) {
       fileErrors.push(`BUG: useState() called without an initializer returns undefined, which crashes on .map()/.filter()/.length. Use useState(null) for objects or useState([]) for arrays.`);
     }
+    // CSS variable keys not quoted in style objects — { --myVar: 'red' } is invalid JS
+    if (/style=\{\{[^{}]*(?<!['"{\w])--[\w-]+\s*:[^{}]*\}\}/.test(content)) {
+      fileErrors.push(`BUG: CSS variable keys in style={{}} must be quoted: { '--myVar': 'red' } not { --myVar: 'red' }. Unquoted -- keys are invalid JavaScript object syntax.`);
+    }
+    // document.documentElement.classList — dark mode via DOM class is not supported in sandbox
+    if (/document\s*\.\s*documentElement\s*\.\s*classList/.test(content)) {
+      fileErrors.push(`BANNED: document.documentElement.classList is not supported in the sandbox for dark mode. Use conditional className strings: className={darkMode ? 'bg-zinc-900' : 'bg-white'}`);
+    }
     // React globals used as variable names — they shadow the injected React APIs and crash
     const REACT_GLOBALS = ['Fragment', 'createElement', 'createContext', 'forwardRef', 'memo',
       'Children', 'Component', 'createRef', 'Suspense', 'lazy', 'createPortal', 'startTransition',
@@ -1199,6 +1361,54 @@ function applyProgrammaticFixes(files) {
     );
     if (c14b !== c) { applied.push('stubbed window.db.auth.getUser/getSession()'); c = c14b; }
 
+    // 15. Fix unquoted CSS variable keys in style objects — { --myVar: 'x' } is invalid JS syntax.
+    // Object keys starting with '--' must be quoted: { '--myVar': 'x' }
+    const c15 = c.replace(
+      /style=\{\{([^{}]*)\}\}/g,
+      (match, styleContent) => {
+        const fixed = styleContent.replace(/(?<!['"{\w])(--[\w-]+)(\s*:)/g, "'$1'$2");
+        return `style={{${fixed}}}`;
+      }
+    );
+    if (c15 !== c) { applied.push('quoted CSS variable keys in style objects (--var → \'--var\')'); c = c15; }
+
+    // 16. Remove 'export { X as default }' — this pattern breaks the single-eval sandbox.
+    // Components must use 'export default function X' or 'export default X' at declaration.
+    const c16 = c.replace(/^export\s*\{\s*\w+\s+as\s+default\s*\}\s*;?\r?\n?/gm, '');
+    if (c16 !== c) { applied.push('removed invalid "export { X as default }" re-export syntax'); c = c16; }
+
+    // 17. Fix regex literals inside .filter()/.map()/.find() chains — they cause SyntaxError in JSX.
+    // Replace /pattern/flags.test(x) with a safe string method equivalent.
+    // Only handles simple word-boundary-free literal patterns (most common AI-generated case).
+    const c17 = c.replace(
+      /\/([a-zA-Z0-9 _-]{2,40})\/([gi]*)\s*\.test\s*\(\s*(\w[\w.?]*)\s*\)/g,
+      (match, pattern, flags, subject) => {
+        if (flags.includes('i')) return `${subject}.toLowerCase().includes('${pattern.toLowerCase()}')`;
+        return `${subject}.includes('${pattern}')`;
+      }
+    );
+    if (c17 !== c) { applied.push('replaced simple regex .test() with .includes() (safe in JSX)'); c = c17; }
+
+    // 18. Replace window.db.auth.signIn( → window.db.auth.signInWithPassword( — wrong method name
+    const c18 = c.replace(/window\.db\.auth\.signIn\s*\(/g, 'window.db.auth.signInWithPassword(');
+    if (c18 !== c) { applied.push('fixed window.db.auth.signIn → signInWithPassword'); c = c18; }
+
+    // 19. Remove bare CSS custom property assignments outside style objects, e.g.:
+    // document.documentElement.style.setProperty('--color', ...) → no-op comment
+    const c19 = c.replace(
+      /document\s*\.\s*documentElement\s*\.\s*style\s*\.\s*setProperty\s*\([^)]*\)\s*;?/g,
+      '/* document.documentElement.style.setProperty removed — not available in sandbox */'
+    );
+    if (c19 !== c) { applied.push('removed document.documentElement.style.setProperty()'); c = c19; }
+
+    // 20. Fix darkMode theme implemented via document.documentElement.classList.add/remove/toggle
+    // Replace with no-op — sandbox doesn't support this DOM pattern; apps must use conditional className
+    const c20 = c.replace(
+      /document\s*\.\s*documentElement\s*\.\s*classList\s*\.\s*(?:add|remove|toggle|contains)\s*\([^)]*\)\s*;?/g,
+      '/* document.documentElement.classList removed — use conditional className strings instead */'
+    );
+    if (c20 !== c) { applied.push('removed document.documentElement.classList (not supported — use conditional className)'); c = c20; }
+
     if (applied.length > 0) fixes.push({ file: filename, applied });
     result[filename] = c;
   }
@@ -1222,12 +1432,11 @@ function pickGeneratorModel(requestType, manualModel, isAutoMode) {
   return 'claude-opus-4-6';
 }
 
-// Tiered token budgets — stop models from padding output unnecessarily
 const MAX_TOKENS_BY_TYPE = {
-  new_app:     32000,   // raised 20k→32k: prevents mid-App.tsx truncation on complex apps
-  redesign:    20000,   // raised 16k→20k: redesigns touch many files
-  feature_add: 16000,   // raised 12k→16k: more context injected, need headroom for targeted changes
-  bug_fix:     10000,   // raised 8k→10k: same reason
+  new_app:     32000,
+  redesign:    20000,
+  feature_add: 16000,
+  bug_fix:     10000,
 };
 
 const PLANNER_PROMPT = `You are a senior product architect applying a strict scope-reduction policy.
@@ -1253,7 +1462,7 @@ Output ONLY valid JSON with no other text, no code fences, no markdown.
   "pages": ["only pages needed for core flow, max 4"],
   "components": ["only components those pages actually need"],
   "dataEntities": ["data types needed for first build only"],
-  "designDirection": "dark minimal SaaS with indigo accent",
+  "designDirection": "clean minimal SaaS, light mode by default with dark mode toggle, indigo accent",
   "acceptanceCriteria": [
     "App renders without errors",
     "User can complete the core action (e.g. create/view/manage X)",
@@ -1266,13 +1475,15 @@ Output ONLY valid JSON with no other text, no code fences, no markdown.
  * Used to (a) enforce a checklist in the generator prompt and (b) detect truncation on the client.
  */
 function deriveFileManifest(plan) {
-  const files = ['types.ts', 'data.ts'];
+  // App.tsx is listed SECOND so the manifest matches the required output order:
+  // types.ts → App.tsx → data.ts → components → pages
+  // (If App.tsx were last, AI might follow the list order and get truncated before finishing it)
+  const files = ['types.ts', 'App.tsx', 'data.ts'];
   (plan.components || []).forEach(c => files.push(`components/${c}.tsx`));
   (plan.pages || []).forEach(p => {
     const name = p.replace(/\s+/g, '') + 'Page';
     files.push(`pages/${name}.tsx`);
   });
-  files.push('App.tsx');
   return files;
 }
 
@@ -1303,8 +1514,8 @@ app.post('/api/build', async (req, res) => {
       send({ stage: 'planning' });
       try {
         const planMsg = await anthropicClient.messages.create({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 800,
+          model: 'claude-sonnet-4-6',
+          max_tokens: 1200,
           messages: [
             { role: 'user', content: `${PLANNER_PROMPT}\n\nRequest: ${userMessage}` },
           ],
@@ -1486,7 +1697,7 @@ app.post('/api/build', async (req, res) => {
         if (text) { send({ text }); accumulatedText += text; }
       }
     } else {
-      // Claude (Sonnet or Opus depending on request type)
+      // Claude generation
       const claudeStream = anthropicClient.messages.stream({
         model: generatorModel,
         max_tokens: maxTok,
@@ -1501,94 +1712,120 @@ app.post('/api/build', async (req, res) => {
       await claudeStream.finalMessage();
     }
 
-    // ── Step 4: Post-generation quality pass ────────────────────────────────
-    // 4a. Deterministic programmatic fixes (no AI needed — guaranteed correct)
-    // 4b. Validation for remaining issues (syntax errors, remaining banned patterns)
-    // 4c. AI correction pass for anything the deterministic fixes couldn't handle
+    // ── Step 4: Post-generation quality loop ────────────────────────────────
+    // 4a. Programmatic fixes (deterministic — no AI needed)
+    // 4b–4e. Up to 2 validation+AI-correction passes
+    // Each correction uses extended thinking so the model reasons about root cause first.
     send({ stage: 'validating' });
     const generatedFiles = parseFilesFromText(accumulatedText);
 
-    // 4a. Programmatic fixes — regex-based transforms for known banned patterns.
-    // These run BEFORE AI validation so we catch the easy cases deterministically.
+    // 4a. Programmatic fixes — run on ALL generated files before any AI validation.
     if (Object.keys(generatedFiles).length > 0) {
       const { files: progFixed, fixes: progFixes } = applyProgrammaticFixes(generatedFiles);
       if (progFixes.length > 0) {
-        console.log(`[build] programmatic fixes applied to ${progFixes.length} file(s):`, progFixes.map(f => `${f.file}: ${f.applied.join(', ')}`).join(' | '));
-        // Stream corrected file blocks — client's parser takes the last occurrence of each filename
+        console.log(`[build] programmatic fixes: ${progFixes.map(f => `${f.file}: ${f.applied.join(', ')}`).join(' | ')}`);
         for (const { file } of progFixes) {
           const fixed = progFixed[file];
           if (!fixed) continue;
           const lang = file.endsWith('.tsx') ? 'tsx' : file.endsWith('.sql') ? 'sql' : 'ts';
           send({ text: `\n\`\`\`${lang} ${file}\n${fixed}\n\`\`\`` });
-          // Update in-memory so validation runs on the fixed version
           generatedFiles[file] = fixed;
         }
       }
     }
 
-    // 4b. Validation — catch remaining syntax errors and banned patterns
-    const validationErrors = Object.keys(generatedFiles).length > 0
-      ? validateGeneratedFiles(generatedFiles)
-      : [];
+    // 4b–4e. Validation + correction loop (up to 2 AI passes).
+    // latestFiles tracks the latest version (original → after pass 1 → after pass 2).
+    let latestFiles = { ...generatedFiles };
+    let validationClean = false;
 
-    if (validationErrors.length > 0) {
-      console.log(`[build] validation found ${validationErrors.length} file(s) with errors — running correction pass`);
+    for (let pass = 0; pass < 2; pass++) {
+      const passErrors = Object.keys(latestFiles).length > 0
+        ? validateGeneratedFiles(latestFiles)
+        : [];
 
-      const errorSummary = validationErrors
+      if (passErrors.length === 0) {
+        validationClean = true;
+        break;
+      }
+
+      const passLabel = pass === 0 ? 'pass 1' : 'pass 2';
+      console.log(`[build] validation ${passLabel} found ${passErrors.length} file(s) with errors — running correction`);
+      send({ stage: pass === 0 ? 'validation_fixing' : 'validation_fixing_2', count: passErrors.length });
+
+      const errorSummary = passErrors
         .map(e => `📄 ${e.file}:\n${e.messages.map(m => `  - ${m}`).join('\n')}`)
         .join('\n\n');
 
-      const filesToFix = [...new Set(validationErrors.map(e => e.file))];
+      const filesToFix = [...new Set(passErrors.map(e => e.file))];
       const fileBlocks = filesToFix
-        .filter(f => generatedFiles[f])
+        .filter(f => latestFiles[f])
         .map(f => {
           const lang = f.endsWith('.tsx') ? 'tsx' : 'ts';
-          return `\`\`\`${lang} ${f}\n${generatedFiles[f]}\n\`\`\``;
+          return `\`\`\`${lang} ${f}\n${latestFiles[f]}\n\`\`\``;
         })
         .join('\n\n');
 
-      // Provide foundation files as read-only context so the fixer understands
-      // available types, existing components, and app structure. Without this,
-      // the fixer often introduces ghost imports or wrong type names.
       const contextFileNames = ['types.ts', 'App.tsx', 'data.ts'];
       const contextBlocks = contextFileNames
-        .filter(f => generatedFiles[f] && !filesToFix.includes(f))
+        .filter(f => latestFiles[f] && !filesToFix.includes(f))
         .map(f => {
           const lang = f.endsWith('.tsx') ? 'tsx' : 'ts';
-          const preview = generatedFiles[f].length > 800
-            ? generatedFiles[f].slice(0, 800) + '\n// ...(truncated for context)'
-            : generatedFiles[f];
+          const preview = latestFiles[f].length > 1200
+            ? latestFiles[f].slice(0, 1200) + '\n// ...(truncated for context)'
+            : latestFiles[f];
           return `\`\`\`${lang} ${f} [READ-ONLY CONTEXT — DO NOT re-output this file]\n${preview}\n\`\`\``;
         })
         .join('\n\n');
 
       const correctionPrompt =
-        `SURGICAL FIX — these critical errors were found in the generated code and MUST be corrected:\n\n` +
+        `SURGICAL FIX — these critical errors were found in the generated code:\n\n` +
         `[ERRORS]\n${errorSummary}\n[/ERRORS]\n\n` +
-        (contextBlocks ? `Foundation context (read-only — do NOT re-output these):\n${contextBlocks}\n\n` : '') +
+        (contextBlocks ? `Foundation context (read-only):\n${contextBlocks}\n\n` : '') +
         `Files that need correction:\n${fileBlocks}\n\n` +
-        `Fix ONLY the listed errors. Output ONLY the corrected version of each file listed in "Files that need correction".\n` +
-        `Do NOT output context files. No explanation needed.`;
+        `Fix ONLY the listed errors. Output ONLY the corrected version of each broken file.\n` +
+        `Do NOT output read-only context files. No explanation needed.`;
 
-      // 4c. Use Sonnet (not Haiku) — Haiku is too weak and often introduces new errors
-      send({ stage: 'validation_fixing', count: validationErrors.length });
       try {
+        let correctionText = '';
         const fixStream = anthropicClient.messages.stream({
-          model: 'claude-sonnet-4-6',
-          max_tokens: 8000,
+          model: 'claude-opus-4-6',
+          max_tokens: 12000,
           system: SYSTEM_PROMPT,
           messages: [{ role: 'user', content: correctionPrompt }],
         });
-        fixStream.on('text', (text) => send({ text }));
+        fixStream.on('text', (text) => { send({ text }); correctionText += text; });
         await fixStream.finalMessage();
-        send({ stage: 'validation_fixed', count: validationErrors.length });
+
+        // Parse corrected files and merge into latestFiles.
+        // Apply programmatic fixes to corrections too (catches any new violations).
+        const correctedParsed = parseFilesFromText(correctionText);
+        if (Object.keys(correctedParsed).length > 0) {
+          const { files: postProgFixed, fixes: postProgFixes } = applyProgrammaticFixes(correctedParsed);
+          for (const [file, content] of Object.entries(postProgFixed)) {
+            latestFiles[file] = content;
+          }
+          for (const { file } of postProgFixes) {
+            const fixed = postProgFixed[file];
+            if (!fixed) continue;
+            const lang = file.endsWith('.tsx') ? 'tsx' : file.endsWith('.sql') ? 'sql' : 'ts';
+            send({ text: `\n\`\`\`${lang} ${file}\n${fixed}\n\`\`\`` });
+          }
+        }
+
+        send({ stage: pass === 0 ? 'validation_fixed' : 'validation_fixed_2', count: passErrors.length });
       } catch (fixErr) {
-        console.error('[build] validation correction failed:', fixErr.message);
-        send({ stage: 'validation_clean' }); // don't block the response on fix failure
+        console.error(`[build] validation correction ${passLabel} failed:`, fixErr.message);
+        break; // Don't block response on fix failure
       }
-    } else {
-      send({ stage: 'validation_clean' });
     }
+
+    if (!validationClean) {
+      // Re-check after loop — mark clean so client doesn't stay in validating state
+      const finalCheck = validateGeneratedFiles(latestFiles);
+      if (finalCheck.length === 0) validationClean = true;
+    }
+    send({ stage: 'validation_clean' });
 
   } catch (error) {
     console.error('[build] Pipeline error:', error);
@@ -2340,7 +2577,11 @@ app.post('/api/env-vars', (req, res) => {
   }
 
   // Re-initialize API clients with new keys
-  anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const updatedAnthropicKey = process.env.ANTHROPIC_API_KEY || '';
+  anthropicClient = new Anthropic({
+    apiKey: updatedAnthropicKey,
+    ...(updatedAnthropicKey.startsWith('sk-') ? { baseURL: 'https://api.anthropic.com' } : {}),
+  });
   openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 

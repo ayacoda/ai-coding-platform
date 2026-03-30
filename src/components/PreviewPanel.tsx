@@ -6,11 +6,10 @@ import { buildPreviewHTML } from '../lib/preview';
 import { sendChatMessage } from '../lib/chat';
 import { saveVersion } from '../lib/versions';
 
-// Fix budget: max 2 attempts for the same error fingerprint before stopping.
-const STUCK_THRESHOLD = 2;
-// Stop auto-fixing after this many DISTINCT errors in one session — indicates architectural failure.
-// 2 distinct errors = the fix introduced a new problem = stop patching, ask user to regenerate.
-const DISTINCT_ERROR_LIMIT = 2;
+// Fix budget: max 3 identical consecutive errors before marking "stuck".
+const STUCK_THRESHOLD = 3;
+// Total repair cap — stop after this many total attempts regardless of error type.
+const MAX_REPAIRS = 6;
 
 /** Normalize an error string so minor variations (line numbers) don't defeat stuck detection.
  *  IMPORTANT: keep the identifier in "X is not defined" errors so that fixing AppointmentsPage
@@ -357,7 +356,7 @@ function ErrorOverlay({
     ? 'Auto-fix stopped'
     : 'Runtime Error';
   const subtitleText = shouldRegenerate
-    ? 'Fix introduced a new error — patching stopped to avoid loops. Describe what you want and I\'ll rebuild cleanly.'
+    ? 'Too many fix attempts without success. Describe what you want in chat and I\'ll rebuild cleanly.'
     : isStuck
     ? 'Same error keeps repeating — click Try Again or describe the fix in chat'
     : 'Auto-fix will start shortly…';
@@ -747,9 +746,13 @@ export default function PreviewPanel() {
   const shouldRegenerateRef = useRef(false);
   // Track last N error fingerprints for same-error stuck detection
   const recentErrors = useRef<string[]>([]);
-  // Track distinct error fingerprints across the whole session for architectural failure detection
-  const distinctErrorFingerprints = useRef<Set<string>>(new Set());
   const autoFixTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Timer to debounce globalRepairCount reset after preview-ready.
+  // The count is only cleared after 5s of stable preview — if preview-error fires
+  // within that window, the timer is cancelled and the count is preserved.
+  // This prevents the infinite loop where: preview-ready resets count → async error
+  // immediately fires → repair starts from 0 → preview-ready again → count reset → repeat.
+  const previewStableTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Persistent repair counter — NOT reset when repair outputs new files, only on genuine new builds
   const globalRepairCount = useRef(0);
   // Flag: was the last file update caused by a repair? If so, don't reset the global counter.
@@ -768,7 +771,6 @@ export default function PreviewPanel() {
 
   useEffect(() => {
     setPreviewError(null);
-    recentErrors.current = [];
     setIsFixing(false);
     isFixingRef.current = false;
     if (autoFixTimer.current) {
@@ -776,12 +778,15 @@ export default function PreviewPanel() {
       autoFixTimer.current = null;
     }
     if (fileChangeFromRepair.current) {
-      // Files changed because a repair ran — keep the global count, don't reset UI attempt counter
+      // Files changed because a repair ran — keep the global count and recentErrors so stuck
+      // detection can accumulate across attempts (each error = one entry in recentErrors).
+      // Clearing recentErrors here would reset the STUCK_THRESHOLD counter every time,
+      // causing the auto-fixer to loop indefinitely instead of stopping after N identical errors.
       fileChangeFromRepair.current = false;
     } else {
-      // Genuine new build — fully reset ALL repair state including distinct error tracking
+      // Genuine new build — fully reset ALL repair state including stuck detection history
+      recentErrors.current = [];
       globalRepairCount.current = 0;
-      distinctErrorFingerprints.current = new Set();
       setFixAttempt(0);
       setIsStuck(false);
       isStuckRef.current = false;
@@ -798,22 +803,17 @@ export default function PreviewPanel() {
     globalRepairCount.current += 1;
     const attemptNumber = globalRepairCount.current;
 
+    // Global cap — after MAX_REPAIRS total attempts, give up to avoid infinite loops.
+    if (globalRepairCount.current > MAX_REPAIRS) {
+      setShouldRegenerate(true);
+      shouldRegenerateRef.current = true;
+      return;
+    }
+
     // Fuzzy stuck detection — normalize errors before comparing.
     const fingerprint = normalizeError(error);
 
-    // Track distinct error fingerprints — if we've seen DISTINCT_ERROR_LIMIT different errors,
-    // the module is architecturally broken. Stop patching, prompt user to regenerate.
-    if (!distinctErrorFingerprints.current.has(fingerprint)) {
-      distinctErrorFingerprints.current.add(fingerprint);
-      if (distinctErrorFingerprints.current.size >= DISTINCT_ERROR_LIMIT) {
-        setShouldRegenerate(true);
-        shouldRegenerateRef.current = true;
-        setIsStuck(false);
-        return;
-      }
-    }
-
-    // Same-error stuck detection — max STUCK_THRESHOLD attempts for identical errors.
+    // Same-error stuck detection — max STUCK_THRESHOLD consecutive identical errors.
     recentErrors.current = [...recentErrors.current.slice(-(STUCK_THRESHOLD - 1)), fingerprint];
     if (
       recentErrors.current.length >= STUCK_THRESHOLD &&
@@ -873,11 +873,16 @@ export default function PreviewPanel() {
       ? /^proj_default$/.test(errorSymbol) || /^p_[0-9a-f]{6,10}$/.test(errorSymbol)
       : false;
 
+    // SQL/CSS reserved keyword used as an uppercase variable name — e.g. "TO is not defined", "SET is not defined".
+    // Happens when AI generates `const TO = '#color'` or `const SET = [...]` and the import is stripped.
+    const SQL_CSS_KEYWORDS = new Set(['TO', 'FROM', 'SET', 'AS', 'ON', 'INTO', 'ORDER', 'GROUP', 'BY', 'IN', 'LIMIT', 'OFFSET', 'BEGIN', 'END', 'TRANSACTION']);
+    const isKeywordVariableCrash = errorSymbol ? SQL_CSS_KEYWORDS.has(errorSymbol) : false;
+
     // For interface-as-component or Supabase crashes, send ALL files — fix must be cross-file consistent.
     // For other errors, only send suspect files to keep context small.
     const suspectFiles = new Set<string>();
     suspectFiles.add('App.tsx');
-    if (!isInterfaceAsComponentCrash && !isSupabaseCrash && !isWindowDbCrash && !isIllegalReturnCrash && !isInvalidLhsCrash && !isSchemaNameCrash && errorSymbol) {
+    if (!isInterfaceAsComponentCrash && !isSupabaseCrash && !isWindowDbCrash && !isIllegalReturnCrash && !isInvalidLhsCrash && !isSchemaNameCrash && !isKeywordVariableCrash && errorSymbol) {
       for (const [fname, code] of Object.entries(currentFiles)) {
         if (code.includes(errorSymbol)) suspectFiles.add(fname);
       }
@@ -891,7 +896,7 @@ export default function PreviewPanel() {
 
     // Attempt 2+: always escalate to ALL files for broader context.
     const needsAllFiles = isInterfaceAsComponentCrash || isSupabaseCrash || isWindowDbCrash ||
-      isIllegalReturnCrash || isInvalidLhsCrash || isSchemaNameCrash || attemptNumber >= 2 ||
+      isIllegalReturnCrash || isInvalidLhsCrash || isSchemaNameCrash || isKeywordVariableCrash || attemptNumber >= 2 ||
       !symbolFoundInFiles;
     const allFilesLabel = isInterfaceAsComponentCrash ? 'interface-as-component rename'
       : isSupabaseCrash ? 'Supabase import fix'
@@ -899,6 +904,7 @@ export default function PreviewPanel() {
       : isIllegalReturnCrash ? 'illegal return — must scan every file'
       : isInvalidLhsCrash ? 'invalid LHS — must find JS syntax error in style/expression'
       : isSchemaNameCrash ? 'schema-name-as-variable — must replace in all files'
+      : isKeywordVariableCrash ? `SQL/CSS keyword "${errorSymbol}" used as variable — rename across all files`
       : !symbolFoundInFiles ? `${errorSymbol} not found in any file — async error, full context`
       : `attempt ${attemptNumber} — full context`;
     const filesSummary = needsAllFiles
@@ -1010,6 +1016,15 @@ export default function PreviewPanel() {
       extraHint = `\n• "X is not a function" — check: imported value is actually a function, not an object/array. Check the export matches the import (default vs named).`;
     } else if (/maximum update depth|too many re-renders/i.test(error)) {
       extraHint = `\n• Infinite re-render loop — check: setState being called directly in render body (not inside handler/useEffect), or useEffect missing dependency array.`;
+    } else if (isKeywordVariableCrash) {
+      extraHint = `\n⚠️ ROOT CAUSE: "${errorSymbol}" is a reserved SQL/CSS keyword used as a JavaScript variable name.\n` +
+        `In the sandbox, files are merged and evaluated — imports are stripped, so any module-level variable named "${errorSymbol}" that was imported from another file will be undefined.\n` +
+        `REQUIRED FIX — search ALL .tsx and .ts files and rename "${errorSymbol}" to a descriptive name:\n` +
+        `  ❌ const ${errorSymbol} = ...          →  ✅ const ${errorSymbol}_COLOR = ... (or other descriptive suffix)\n` +
+        `  ❌ const { ${errorSymbol} } = obj      →  ✅ const { ${errorSymbol}: ${errorSymbol.toLowerCase()}Value } = obj\n` +
+        `  ❌ import { ${errorSymbol} } from ...  →  ✅ rename the export and all usages\n` +
+        `Rename EVERY usage consistently across all files.\n` +
+        `✅ Output EVERY file you changed as a full code block.`;
     } else if (isSchemaNameCrash) {
       extraHint = `\n⚠️ ROOT CAUSE: "${errorSymbol}" is a Supabase PostgreSQL schema name that was accidentally used as a JavaScript variable.\n` +
         `The schema name only belongs in schema.sql — it must NEVER appear as a JS identifier in .tsx or .ts files.\n` +
@@ -1083,6 +1098,16 @@ export default function PreviewPanel() {
         `✅ Convert hyphenated CSS property names to camelCase (e.g. fontSize not font-size).\n` +
         `✅ Remove any \`--\` decrement operators applied to non-numeric values.\n` +
         `✅ Output EVERY file you changed as a full code block.`
+      : isKeywordVariableCrash
+      ? `RESERVED KEYWORD VARIABLE FIX REQUIRED — "${errorSymbol}" is an SQL/CSS reserved keyword used as a JavaScript variable name.\n` +
+        `This crashes because the sandbox merges all files and strips imports — bare keyword variables become undefined.\n` +
+        `Search ALL .tsx and .ts files and rename EVERY usage of "${errorSymbol}" to a descriptive name:\n` +
+        `  ❌ const ${errorSymbol} = '#3B82F6'             →  ✅ const ${errorSymbol}_COLOR = '#3B82F6'\n` +
+        `  ❌ const { ${errorSymbol} } = obj               →  ✅ const { ${errorSymbol}: renamed } = obj\n` +
+        `  ❌ function fn({ ${errorSymbol} }: { ${errorSymbol}: T })  →  ✅ rename the param\n` +
+        `  ❌ import { ${errorSymbol} } from './file'      →  ✅ rename the export in the source file too\n` +
+        `Rename EVERY occurrence — declaration and all usages — consistently across all files.\n` +
+        `✅ Output EVERY file you changed as a full code block.`
       : isSchemaNameCrash
       ? `SCHEMA-NAME-AS-VARIABLE FIX REQUIRED — the Supabase schema name "${errorSymbol}" was used as a JavaScript identifier.\n` +
         `The schema name ONLY belongs in schema.sql — it must NEVER appear as a JS variable in .tsx or .ts files.\n` +
@@ -1129,6 +1154,16 @@ export default function PreviewPanel() {
         const msg: string = e.data.message;
         setPreviewError(msg);
 
+        // Cancel any pending "stable preview" counter-reset — the preview is NOT stable.
+        // This is the critical fix for the infinite repair loop:
+        //   preview-ready fires → would reset counter after 5s
+        //   preview-error fires within that window → cancel reset, counter is preserved
+        //   Now the MAX_REPAIRS cap accumulates correctly across rapid ready/error cycles.
+        if (previewStableTimer.current) {
+          clearTimeout(previewStableTimer.current);
+          previewStableTimer.current = null;
+        }
+
         // Discard any pending version save — don't save a broken version
         const { pendingVersionSave, setPendingVersionSave } = useStore.getState();
         if (pendingVersionSave) {
@@ -1146,16 +1181,24 @@ export default function PreviewPanel() {
           }, 1500);
         }
       } else if (e.data?.type === 'preview-ready') {
-        // Successfully rendered — reset everything including the persistent repair counter
+        // Successfully rendered — reset error/stuck state immediately
         recentErrors.current = [];
-        globalRepairCount.current = 0;
-        distinctErrorFingerprints.current = new Set();
         setFixAttempt(0);
         setIsStuck(false);
         isStuckRef.current = false;
         setShouldRegenerate(false);
         shouldRegenerateRef.current = false;
         setPreviewError(null);
+
+        // Debounced counter reset: only clear globalRepairCount after the preview
+        // has been STABLE for 5 seconds. If preview-error fires within that window,
+        // the timer above cancels this and the repair count is preserved — preventing
+        // the infinite loop where a brief render success resets progress back to 0.
+        if (previewStableTimer.current) clearTimeout(previewStableTimer.current);
+        previewStableTimer.current = setTimeout(() => {
+          globalRepairCount.current = 0;
+          previewStableTimer.current = null;
+        }, 5000);
 
         // Consume and save the pending version snapshot
         const { pendingVersionSave, setPendingVersionSave } = useStore.getState();
@@ -1170,6 +1213,7 @@ export default function PreviewPanel() {
     return () => {
       window.removeEventListener('message', handleMessage);
       if (autoFixTimer.current) clearTimeout(autoFixTimer.current);
+      if (previewStableTimer.current) clearTimeout(previewStableTimer.current);
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1183,7 +1227,6 @@ export default function PreviewPanel() {
   function handleManualRetry() {
     if (previewError) {
       recentErrors.current = [];
-      distinctErrorFingerprints.current = new Set();
       globalRepairCount.current = 0;
       setIsStuck(false);
       isStuckRef.current = false;

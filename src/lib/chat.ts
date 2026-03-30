@@ -716,9 +716,11 @@ export async function sendChatMessage(
                 break;
               }
               case 'validation_fixing':
+              case 'validation_fixing_2':
                 // Validation found errors and is running a correction — no UI change needed
                 break;
               case 'validation_fixed':
+              case 'validation_fixed_2':
               case 'validation_clean': {
                 updateStage('validating', 'done');
                 break;
