@@ -1,9 +1,9 @@
 import { useState, useRef, useEffect, KeyboardEvent, ClipboardEvent } from 'react';
 import { useStore } from '../store/useStore';
-import { sendChatMessage, sendAskMessage, cancelGeneration } from '../lib/chat';
+import { sendChatMessage, sendAskMessage, cancelGeneration, approvePlan } from '../lib/chat';
 import type { Message, ModelId, PipelineStageInfo, ChatAttachment } from '../types';
-import StorageSelector from './StorageSelector';
 import { detectIntegrations, detectIntegrationsInFiles, type ServiceKeyDef } from '../lib/integrations';
+import StorageSelector from './StorageSelector';
 
 // ─── Attachment helpers ───────────────────────────────────────────────────────
 
@@ -940,11 +940,6 @@ export default function ChatPanel() {
         </div>
       )}
 
-      {/* Storage selector */}
-      <div className="flex-shrink-0 border-t border-zinc-800 pb-2">
-        <StorageSelector />
-      </div>
-
       {/* API Key collection card — shown when a third-party integration is detected */}
       {pendingKeyRequest && (
         <div className="mx-4 mb-3 rounded-xl border border-indigo-500/30 bg-indigo-500/5 p-3.5 space-y-3 flex-shrink-0">
@@ -1011,6 +1006,11 @@ export default function ChatPanel() {
           </div>
         </div>
       )}
+
+      {/* Storage mode indicator */}
+      <div className="border-t border-zinc-800/60 pb-2">
+        <StorageSelector />
+      </div>
 
       {/* Input */}
       <div className="px-4 pb-4 flex-shrink-0">
@@ -1282,6 +1282,129 @@ export default function ChatPanel() {
   );
 }
 
+// ─── Plan Approval Card ────────────────────────────────────────────────────────
+
+function PlanApprovalCard({ message }: { message: Message }) {
+  const isGenerating = useStore(s => s.isGenerating);
+  const { updateMessage } = useStore.getState();
+  const approval = message.planApproval!;
+  const plan = approval.plan;
+
+  function handleApprove() {
+    approvePlan(message.id);
+  }
+
+  function handleCancel() {
+    updateMessage(message.id, {
+      isStreaming: false,
+      planApproval: { ...approval, status: 'cancelled' },
+    });
+  }
+
+  return (
+    <div className="mt-1 rounded-xl border border-zinc-700/50 bg-zinc-900/60 overflow-hidden">
+      {/* Header */}
+      <div className="px-4 pt-4 pb-3 border-b border-zinc-800/80">
+        <div className="flex items-start gap-3">
+          <div className="w-8 h-8 rounded-lg bg-indigo-600/15 border border-indigo-500/25 flex items-center justify-center shrink-0 mt-0.5">
+            <svg className="w-4 h-4 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+            </svg>
+          </div>
+          <div className="min-w-0">
+            <h3 className="text-[13px] font-semibold text-zinc-100 leading-tight">{plan.title || 'Build Plan'}</h3>
+            <p className="text-[12px] text-zinc-400 mt-1 leading-relaxed">{plan.description}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Body */}
+      <div className="px-4 pt-3 pb-2 space-y-3">
+        {/* Pages */}
+        {plan.pages && plan.pages.length > 0 && (
+          <div>
+            <span className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Pages</span>
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
+              {plan.pages.map(p => (
+                <span key={p} className="inline-flex items-center px-2 py-0.5 rounded-md bg-indigo-600/10 border border-indigo-500/20 text-[11px] text-indigo-300">{p}</span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Included features */}
+        {plan.firstBuildScope && plan.firstBuildScope.length > 0 && (
+          <div>
+            <span className="text-[10px] font-semibold text-emerald-500/70 uppercase tracking-wider">Included</span>
+            <ul className="mt-1.5 space-y-1">
+              {plan.firstBuildScope.map((item, i) => (
+                <li key={i} className="flex items-start gap-1.5 text-[12px] text-zinc-400">
+                  <svg className="w-3 h-3 text-emerald-500 mt-0.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+                  </svg>
+                  {item}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* Deferred */}
+        {plan.deferredScope && plan.deferredScope.length > 0 && (
+          <div>
+            <span className="text-[10px] font-semibold text-zinc-600 uppercase tracking-wider">Deferred</span>
+            <ul className="mt-1.5 space-y-1">
+              {plan.deferredScope.slice(0, 3).map((item, i) => (
+                <li key={i} className="flex items-start gap-1.5 text-[12px] text-zinc-600">
+                  <svg className="w-3 h-3 text-zinc-700 mt-0.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18 12H6" />
+                  </svg>
+                  {item}
+                </li>
+              ))}
+              {plan.deferredScope.length > 3 && (
+                <li className="text-[11px] text-zinc-700 pl-4">+{plan.deferredScope.length - 3} more deferred</li>
+              )}
+            </ul>
+          </div>
+        )}
+      </div>
+
+      {/* Actions */}
+      {approval.status === 'pending' && !isGenerating && (
+        <div className="px-4 pb-4 pt-1 flex gap-2">
+          <button
+            onClick={handleApprove}
+            className="flex-1 flex items-center justify-center gap-2 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-[13px] font-medium transition-colors"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
+            {plan.requestType === 'feature_add' ? 'Apply Changes' : plan.requestType === 'bug_fix' ? 'Apply Fix' : 'Generate App'}
+          </button>
+          <button
+            onClick={handleCancel}
+            className="px-4 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 text-[13px] font-medium transition-colors"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+      {approval.status === 'pending' && isGenerating && (
+        <div className="px-4 pb-4 pt-1">
+          <div className="flex items-center gap-2 text-[12px] text-zinc-500">
+            <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 00-8 8h4z" />
+            </svg>
+            Processing…
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Message Bubble ───────────────────────────────────────────────────────────
 
 function MessageBubble({ message, onRePrompt, onFix, onImplement, onBuildFromAsk }: { message: Message; onRePrompt?: (content: string) => void; onFix?: (errorText: string) => void; onImplement?: (text: string) => void; onBuildFromAsk?: (prompt: string) => void }) {
@@ -1366,6 +1489,14 @@ function MessageBubble({ message, onRePrompt, onFix, onImplement, onBuildFromAsk
         ⚡
       </div>
       <div className="flex-1 min-w-0">
+        {/* Plan approval card — shown while awaiting user confirmation */}
+        {message.planApproval?.status === 'pending' && (
+          <PlanApprovalCard message={message} />
+        )}
+        {message.planApproval?.status === 'cancelled' && !message.pipeline && (
+          <p className="text-xs text-zinc-500 mt-1">Generation cancelled.</p>
+        )}
+
         {/* Pipeline progress card (shown while pipeline is running or complete) */}
         {message.pipeline && <PipelineCard pipeline={message.pipeline} />}
 
@@ -1517,7 +1648,16 @@ function MarkdownContent({ content, isStreaming, onImplement, hideCode, hideText
             />
           );
         }
-        if (hideText) return null;
+        if (hideText) {
+          // Always show the last text segment if it comes after code blocks — this is the
+          // completion summary (✅ Done! block) that the AI outputs after all file code blocks.
+          const hasCodeBefore = segments.slice(0, i).some((s) => s.type === 'code');
+          const isLastText = !segments.slice(i + 1).some((s) => s.type === 'text');
+          if (hasCodeBefore && isLastText) {
+            return <TextBlock key={i} text={seg.content} onImplement={onImplement} />;
+          }
+          return null;
+        }
         return <TextBlock key={i} text={seg.content} onImplement={onImplement} />;
       })}
       {/* File chips — shown during AND after generation instead of raw code blocks */}
@@ -1549,8 +1689,8 @@ function MarkdownContent({ content, isStreaming, onImplement, hideCode, hideText
           })}
         </div>
       )}
-      {/* Blinking cursor at the end while streaming text (not when inside a code block, not when text is hidden) */}
-      {isStreaming && segments.length > 0 && segments[segments.length - 1].type === 'text' && !hideCode && !hideText && (
+      {/* Blinking cursor at the end while streaming text (not when inside a code block) */}
+      {isStreaming && segments.length > 0 && segments[segments.length - 1].type === 'text' && !hideCode && (
         <span className="inline-block w-0.5 h-4 bg-indigo-400 ml-0.5 animate-pulse align-middle" />
       )}
     </div>
@@ -1572,8 +1712,91 @@ function renderInline(text: string): React.ReactNode[] {
   });
 }
 
+// ─── Done! summary block ──────────────────────────────────────────────────────
+
+function DoneBlock({ text }: { text: string }) {
+  const lines = text.split('\n').filter((l) => l.trim());
+  const summaryLine = lines.find((l) => l.startsWith('✅'));
+  const changedLine = lines.find((l) => /^Changed:/i.test(l));
+  const worksLine = lines.find((l) => /^Works:/i.test(l));
+  const noteLine = lines.find((l) => /^Note:/i.test(l));
+
+  const summary = summaryLine?.replace(/^✅\s*Done!\s*/i, '').trim() ?? '';
+  const changedRaw = changedLine?.replace(/^Changed:\s*/i, '').trim() ?? '';
+  const worksText = worksLine?.replace(/^Works:\s*/i, '').trim() ?? '';
+  const noteText = noteLine?.replace(/^Note:\s*/i, '').trim() ?? '';
+
+  const changedFiles = changedRaw
+    ? changedRaw.split(',').map((f) => f.trim()).filter(Boolean)
+    : [];
+
+  return (
+    <div className="mt-2 rounded-xl border border-emerald-500/20 bg-emerald-500/5 overflow-hidden text-[13px]">
+      {/* Header */}
+      <div className="flex items-center gap-2 px-3 py-2.5 border-b border-emerald-500/15 bg-emerald-500/8">
+        <span className="text-base leading-none">✅</span>
+        <span className="font-semibold text-emerald-300">{summary}</span>
+      </div>
+
+      <div className="px-3 py-2.5 space-y-2.5">
+        {/* Changed files */}
+        {changedFiles.length > 0 && (
+          <div>
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500 block mb-1.5">Changed</span>
+            <div className="flex flex-wrap gap-1.5">
+              {changedFiles.map((f) => {
+                const ext = f.split('.').pop() ?? '';
+                const colorMap: Record<string, string> = {
+                  tsx: 'bg-cyan-500/10 border-cyan-500/25 text-cyan-300',
+                  ts: 'bg-blue-500/10 border-blue-500/25 text-blue-300',
+                  jsx: 'bg-yellow-500/10 border-yellow-500/25 text-yellow-300',
+                  js: 'bg-yellow-500/10 border-yellow-500/25 text-yellow-300',
+                  css: 'bg-pink-500/10 border-pink-500/25 text-pink-300',
+                  json: 'bg-orange-500/10 border-orange-500/25 text-orange-300',
+                };
+                const color = colorMap[ext] ?? 'bg-zinc-700/40 border-zinc-600/40 text-zinc-300';
+                const short = f.includes('/') ? f.split('/').pop()! : f;
+                return (
+                  <span
+                    key={f}
+                    title={f}
+                    className={`inline-flex items-center h-5 px-2 rounded-md border text-[11px] font-mono ${color}`}
+                  >
+                    {short}
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Works */}
+        {worksText && (
+          <div>
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500 block mb-1">Works</span>
+            <p className="text-zinc-300 leading-relaxed">{worksText}</p>
+          </div>
+        )}
+
+        {/* Note */}
+        {noteText && (
+          <div className="flex items-start gap-2 pt-1 border-t border-zinc-700/40">
+            <span className="text-amber-400 text-[11px] font-semibold uppercase tracking-wider shrink-0 mt-0.5">Note</span>
+            <p className="text-zinc-400 leading-relaxed">{noteText}</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function TextBlock({ text, onImplement }: { text: string; onImplement?: (text: string) => void }) {
   if (!text.trim()) return null;
+
+  // Detect ✅ Done! block and render it with special formatting
+  if (/✅\s*Done!/i.test(text) && /Changed:|Works:/i.test(text)) {
+    return <DoneBlock text={text} />;
+  }
 
   const lines = text.split('\n');
   const elements: React.ReactNode[] = [];

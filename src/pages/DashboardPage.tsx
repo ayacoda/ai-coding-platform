@@ -264,6 +264,7 @@ export default function DashboardPage() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState('');
   const [dbSetupNeeded, setDbSetupNeeded] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
 
   const fetchProjects = useCallback(async () => {
     setLoading(true);
@@ -349,6 +350,9 @@ export default function DashboardPage() {
 
   const userName = user?.user_metadata?.name || user?.email?.split('@')[0] || 'there';
   const userInitials = userName.slice(0, 2).toUpperCase();
+  const filteredProjects = searchQuery.trim()
+    ? projects.filter((p) => p.name.toLowerCase().includes(searchQuery.toLowerCase()))
+    : projects;
 
   return (
     <div className="min-h-screen bg-[#080810] text-zinc-100">
@@ -404,9 +408,36 @@ export default function DashboardPage() {
             <p className="text-[13px] text-zinc-500 mt-0.5">
               {projects.length === 0 && !loading
                 ? 'No projects yet — create your first one'
+                : searchQuery.trim()
+                ? `${filteredProjects.length} of ${projects.length} project${projects.length !== 1 ? 's' : ''}`
                 : `${projects.length} project${projects.length !== 1 ? 's' : ''}`}
             </p>
           </div>
+          <div className="flex items-center gap-3">
+            {projects.length > 0 && (
+              <div className="relative">
+                <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-500 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-4.35-4.35M17 11A6 6 0 1 0 5 11a6 6 0 0 0 12 0z" />
+                </svg>
+                <input
+                  type="text"
+                  placeholder="Search projects…"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="h-9 pl-8 pr-3 w-52 bg-zinc-900 border border-zinc-800 hover:border-zinc-700 focus:border-indigo-500 focus:outline-none rounded-xl text-[13px] text-zinc-200 placeholder-zinc-600 transition-colors"
+                />
+                {searchQuery && (
+                  <button
+                    onClick={() => setSearchQuery('')}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-600 hover:text-zinc-400 transition-colors"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+            )}
           <button
             onClick={createProject}
             disabled={creating}
@@ -424,6 +455,7 @@ export default function DashboardPage() {
             )}
             New project
           </button>
+          </div>
         </div>
 
         {/* Projects grid */}
@@ -454,9 +486,24 @@ export default function DashboardPage() {
               Create project
             </button>
           </div>
+        ) : filteredProjects.length === 0 ? (
+          <div className="text-center py-20">
+            <div className="w-16 h-16 rounded-2xl bg-zinc-900 border border-zinc-800 flex items-center justify-center mx-auto mb-4">
+              <svg className="w-7 h-7 text-zinc-700" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-4.35-4.35M17 11A6 6 0 1 0 5 11a6 6 0 0 0 12 0z" />
+              </svg>
+            </div>
+            <h3 className="text-[15px] font-medium text-zinc-400 mb-2">No projects match "{searchQuery}"</h3>
+            <button
+              onClick={() => setSearchQuery('')}
+              className="text-[13px] text-indigo-400 hover:text-indigo-300 transition-colors"
+            >
+              Clear search
+            </button>
+          </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {projects.map((project) => {
+            {filteredProjects.map((project) => {
               const fileCount = Object.keys(project.files || {}).length;
               const storageInfo = STORAGE_LABELS[project.storage_mode] || STORAGE_LABELS.localstorage;
               const theme = getProjectTheme(project.id);
