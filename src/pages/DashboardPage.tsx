@@ -320,17 +320,31 @@ export default function DashboardPage() {
     const project = projects.find((p) => p.id === id);
     const schemaId = (project?.project_config as { id?: string } | null)?.id;
 
-    // If it has a Supabase schema, delete resources first (non-blocking on failure)
-    if (schemaId && project?.storage_mode === 'supabase') {
-      await fetch('/api/delete-project-resources', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ schemaId }),
-      }).catch(() => {});
+    // Clean up DB schema + storage files for any project that has a schemaId
+    // (storage files can exist regardless of storage_mode)
+    if (schemaId) {
+      try {
+        const res = await fetch('/api/delete-project-resources', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ schemaId }),
+        });
+        const result = await res.json().catch(() => ({}));
+        if (result.errors?.length) {
+          console.warn('[delete] Resource cleanup warnings:', result.errors);
+        }
+      } catch (err) {
+        console.warn('[delete] Resource cleanup failed (continuing):', err);
+      }
     }
 
+    // Delete the project row — cascade removes project_versions automatically
     const { error } = await supabase.from('projects').delete().eq('id', id);
-    if (!error) {
+    if (error) {
+      console.error('[dashboard] delete error:', error.message, error.code);
+      // Show the error inline rather than silently failing
+      alert(`Failed to delete project: ${error.message}`);
+    } else {
       setProjects((prev) => prev.filter((p) => p.id !== id));
     }
     setDeletingId(null);

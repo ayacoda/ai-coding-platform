@@ -2,7 +2,7 @@ import { useStore } from '../store/useStore';
 import { parseFilesFromResponse } from './parseFiles';
 import { saveVersion } from './versions';
 import { supabase } from './supabase';
-import type { Message, ModelId, PipelineStageInfo, ChatAttachment } from '../types';
+import type { Message, ModelId, PipelineStageInfo, ChatAttachment, FullPlan, PlanApproval } from '../types';
 
 let idCounter = 0;
 export function genId() {
@@ -21,6 +21,49 @@ export function sanitizeGeneratedFiles(
   files: Record<string, string>,
   contextFiles: Record<string, string> = {}
 ): Record<string, string> {
+  // ── 0. Auto-fix known AI-generated crash patterns before preview/storage ────────
+  // Applied to every .tsx/.ts file. Skips .sql files.
+  const autoFixed: Record<string, string> = {};
+  for (const [fname, code] of Object.entries(files)) {
+    if (fname.endsWith('.sql')) { autoFixed[fname] = code; continue; }
+    let c = code;
+    const orig = c;
+
+    // ① "new toISOString()" — treats a Date method as a constructor.
+    //    Causes "Unexpected identifier 'toISOString'" parse error in sandbox.
+    c = c.replace(/\bnew\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
+
+    // ② "Date.now().toISOString()" — Date.now() returns a number, not a Date object.
+    //    .toISOString() on a number crashes with "X.toISOString is not a function".
+    c = c.replace(/\bDate\.now\(\)\.toISOString\(\)/g, 'new Date().toISOString()');
+
+    // ③ "new Date.toISOString()" — missing () after Date; new Date is a constructor call.
+    //    This is parsed as "new (Date.toISOString)()" → crashes with "not a constructor".
+    c = c.replace(/\bnew\s+Date\.toISOString\s*\(\)/g, 'new Date().toISOString()');
+
+    // ④ PostgreSQL UUID functions called in frontend JS — they only exist in SQL.
+    //    Causes "gen_random_uuid is not a function" / "uuid_generate_v4 is not a function".
+    c = c.replace(/\bgen_random_uuid\s*\(\)/g, 'crypto.randomUUID()');
+    c = c.replace(/\buuid_generate_v4\s*\(\)/g, 'crypto.randomUUID()');
+
+    // ⑤ Supabase createClient import — stripped by the sandbox, crashes with "createClient is not defined".
+    //    window.db is pre-loaded; no import needed.
+    c = c.replace(/^[ \t]*import\s+\{[^}]*createClient[^}]*\}\s+from\s+['"]@supabase\/supabase-js['"][^\n]*\n?/gm, '');
+    c = c.replace(/^[ \t]*import\s+createClient\s+from\s+['"]@supabase\/supabase-js['"][^\n]*\n?/gm, '');
+
+    // ⑥ Bare "db.from(" / "supabase.from(" without window. prefix — crashes with "db is not defined".
+    //    Only rewrites standalone identifiers (preceded by = ( , { [ ; or start of expression).
+    c = c.replace(/(^|[=(,{[\s;!&|?:])(?:db|supabase)\.from\s*\(/gm, '$1window.db.from(');
+    c = c.replace(/(^|[=(,{[\s;!&|?:])(?:db|supabase)\.auth\b/gm, '$1window.db.auth');
+    c = c.replace(/(^|[=(,{[\s;!&|?:])(?:db|supabase)\.storage\b/gm, '$1window.db.storage');
+
+    if (c !== orig) {
+      console.log(`[sanitize] auto-fixed crash patterns in ${fname}`);
+    }
+    autoFixed[fname] = c;
+  }
+  files = autoFixed;
+
   // Use full context (existing + new files) for collision detection.
   // For surgical fixes, 'files' may only be 1-2 changed files while
   // 'contextFiles' holds the rest (e.g. types.ts with "interface Project").
@@ -120,6 +163,9 @@ let navigationCancel = false;
 export function cancelGeneration(suppressRevert = false) {
   if (suppressRevert) navigationCancel = true;
   currentAbortController?.abort();
+  // Immediately update UI so the stop feels instant — the async cleanup
+  // (file revert, message removal) still runs in the catch/finally block.
+  useStore.getState().setIsGenerating(false);
 }
 
 /**
@@ -147,6 +193,7 @@ async function triggerCompletionContinuation(
     `Complete the build now — output EACH missing file as a full, complete code block. ` +
     `App.tsx is the most critical — output it last after all components and pages.`;
 
+  if (currentAbortController?.signal.aborted) return;
   try {
     const response = await fetch('/api/chat', {
       method: 'POST',
@@ -155,6 +202,7 @@ async function triggerCompletionContinuation(
         messages: [{ role: 'user', content: prompt }],
         model: 'claude-opus-4-6',
       }),
+      signal: currentAbortController?.signal,
     });
     if (!response.ok) {
       console.warn('[chat] completion continuation: server error', response.status);
@@ -171,6 +219,7 @@ async function triggerCompletionContinuation(
     const baseContent = lastMsg?.role === 'assistant' ? (lastMsg.content ?? '') : '';
 
     while (true) {
+      if (currentAbortController?.signal.aborted) return;
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
@@ -203,8 +252,8 @@ async function triggerCompletionContinuation(
 }
 
 /**
- * Detect page files that are stubs — too short or contain placeholder text.
- * These need a follow-up completion call.
+ * Detect page files that are stubs — explicitly contain placeholder text or are nearly empty.
+ * Only flags pages with clear stub indicators, NOT just short pages (short ≠ incomplete).
  */
 function detectStubPages(files: Record<string, string>): string[] {
   const stubs: string[] = [];
@@ -215,13 +264,12 @@ function detectStubPages(files: Record<string, string>): string[] {
     const lines = code.trim().split('\n').length;
     const lower = code.toLowerCase();
     const isStub =
-      lines < 25 ||
+      lines < 8 ||  // truly empty/skeleton — not just "short"
       lower.includes('coming soon') ||
       lower.includes('under construction') ||
       lower.includes('page coming soon') ||
       lower.includes('not implemented') ||
-      lower.includes('placeholder') ||
-      (lines < 50 && (lower.includes('return null') || lower.includes('return <div></div>')));
+      (lines < 15 && (lower.includes('return null') || lower.includes('return <div></div>')));
     if (isStub) stubs.push(name);
   }
   return stubs;
@@ -273,6 +321,7 @@ async function triggerPageCompletion(
     `Output ONLY the listed page files. Do NOT re-output App.tsx, types.ts, data.ts, or any other file.`;
 
   try {
+    if (currentAbortController?.signal.aborted) return;
     const { storageMode, projectConfig } = useStore.getState();
     const resp = await fetch('/api/chat', {
       method: 'POST',
@@ -283,6 +332,7 @@ async function triggerPageCompletion(
         storageMode,
         projectConfig,
       }),
+      signal: currentAbortController?.signal,
     });
     if (!resp.ok) { console.warn('[chat] page completion HTTP error:', resp.status); return; }
 
@@ -297,6 +347,7 @@ async function triggerPageCompletion(
     updateLastAssistantMessage(baseContent + '\n\n---\n*Completing missing pages…*');
 
     while (true) {
+      if (currentAbortController?.signal.aborted) return;
       const { done, value } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
@@ -462,6 +513,8 @@ export async function sendChatMessage(
     attachments?: ChatAttachment[];
     /** Force a specific model for this request (bypasses auto-mode, used for repair escalation). */
     overrideModel?: string;
+    /** Skip the plan-approval gate — used for queued items that the user already committed to. */
+    skipPlanApproval?: boolean;
   }
 ) {
   const store = useStore.getState();
@@ -569,6 +622,65 @@ export async function sendChatMessage(
       }
     } else {
       history = [{ role: 'user', content: userContent, ...(images ? { images } : {}) }];
+    }
+  }
+
+  // ── Plan approval gate ─────────────────────────────────────────────────────
+  // Fetch a brief plan and show it to the user before generation starts.
+  // They can approve or cancel. Applies to all non-repair requests.
+  // Skipped for queued items — the user already committed to those when they queued them.
+  if (!isRepair && !options?.skipPlanApproval) {
+    let planToShow: FullPlan | null = null;
+    try {
+      const currentFileNames = Object.keys(useStore.getState().files);
+      const planResp = await fetch('/api/plan-only', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: history, hasFiles, currentFileNames }),
+        signal,
+      });
+      if (planResp.ok) {
+        const { plan, shouldApprove } = await planResp.json();
+        if (shouldApprove && plan) planToShow = plan;
+      }
+    } catch (planErr: unknown) {
+      // Re-throw abort errors — user cancelled
+      if (planErr instanceof Error && planErr.name === 'AbortError') throw planErr;
+      console.warn('[chat] /api/plan-only failed:', planErr);
+    }
+
+    // For change requests where the server plan failed, use a minimal fallback
+    // so we always show an approval card instead of silently proceeding
+    if (!planToShow && hasFiles) {
+      planToShow = {
+        title: 'Apply Changes',
+        description: "I'll update the app based on your request.",
+        requestType: 'feature_add',
+        firstBuildScope: ['Apply the requested changes'],
+        deferredScope: [],
+        pages: [],
+        components: [],
+      } as FullPlan;
+    }
+
+    if (planToShow) {
+      const { updateMessage } = useStore.getState();
+      const msgs = useStore.getState().messages;
+      const lastAssistant = [...msgs].reverse().find(m => m.role === 'assistant');
+      if (lastAssistant) {
+        updateMessage(lastAssistant.id, {
+          isStreaming: false,
+          content: '',
+          planApproval: {
+            plan: planToShow,
+            buildContext: { messages: history, storageMode, projectConfig, model: selectedModel, isAutoMode },
+            status: 'pending',
+          },
+        });
+      }
+      setIsGenerating(false);
+      currentAbortController = null;
+      return;
     }
   }
 
@@ -793,19 +905,37 @@ export async function sendChatMessage(
         await triggerPageCompletion(toCompleteAfterCont, allFilesAfterCont);
       }
     } else if (Object.keys(newFiles).length > 0) {
+      // Apply schema BEFORE rendering so tables exist when the preview queries them
+      if (storageMode === 'supabase' && newFiles['schema.sql']) {
+        try {
+          const schemaResp = await fetch('/api/run-schema', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sql: newFiles['schema.sql'], projectId: projectConfig?.id }),
+          });
+          const schemaResult = await schemaResp.json();
+          if (schemaResult.success) {
+            console.log('[chat] schema.sql applied before preview render');
+          } else {
+            console.warn('[chat] schema.sql apply failed:', schemaResult.error);
+          }
+        } catch (e) {
+          console.warn('[chat] schema.sql apply error:', (e as Error).message);
+        }
+      }
+
       setFiles(newFiles);
       setRightPanel('preview');
 
-      // For new_app: scan for stub/missing pages and complete them with a follow-up call.
-      // This ensures every page has full implementation — not stubs or "coming soon" placeholders.
+      // For new_app: only complete pages that are explicit stubs (contain placeholder text).
+      // Do NOT use the manifest to find "missing" pages here — the generation completed normally
+      // (App.tsx present) so the AI chose what to generate. Forcing extra pages causes unwanted
+      // second-pass generation when the app first loads.
       if (!isRepair && isNewApp) {
         const allFiles = { ...existingFiles, ...newFiles };
         const stubPages = detectStubPages(allFiles);
-        const missingManifestPages = (capturedManifest ?? [])
-          .filter(f => f.startsWith('pages/') && !allFiles[f]);
-        const pagesToComplete = [...new Set([...stubPages, ...missingManifestPages])];
-        if (pagesToComplete.length > 0) {
-          await triggerPageCompletion(pagesToComplete, allFiles);
+        if (stubPages.length > 0) {
+          await triggerPageCompletion(stubPages, allFiles);
         }
       }
 
@@ -828,24 +958,6 @@ export async function sendChatMessage(
       }
 
 
-      // Auto-apply schema.sql when storage mode is supabase
-      if (storageMode === 'supabase' && newFiles['schema.sql']) {
-        fetch('/api/run-schema', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sql: newFiles['schema.sql'], projectId: projectConfig?.id }),
-        })
-          .then((r) => r.json())
-          .then((result) => {
-            if (result.success) {
-              console.log('[chat] schema.sql auto-applied to Supabase');
-            } else {
-              console.warn('[chat] schema.sql auto-apply failed:', result.error);
-            }
-          })
-          .catch((e) => console.warn('[chat] schema.sql auto-apply error:', e.message));
-      }
-
       // Queue a version snapshot — only saved if the preview renders successfully (no errors).
       // PreviewPanel consumes pendingVersionSave on 'preview-ready' and discards on 'preview-error'.
       const { currentProjectId } = useStore.getState();
@@ -857,8 +969,55 @@ export async function sendChatMessage(
           setPendingVersionSave({ projectId: currentProjectId, userId: session.user.id, files: fullFiles, label });
         }
       }
-    } else {
-      console.warn('[chat] no files parsed. Response preview:\n', fullContent.slice(0, 500));
+    } else if (!isRepair && fullContent.length > 100) {
+      // Generation produced text but no parseable files — retry once with an explicit prompt
+      console.warn('[chat] no files parsed from response, firing retry. Preview:\n', fullContent.slice(0, 300));
+      updateLastAssistantMessage(fullContent + '\n\n---\n*No code blocks found — retrying generation…*');
+      try {
+        const retryResp = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: [{
+              role: 'user',
+              content: `Your previous response contained no code blocks. Output the complete application now — every file as a fenced code block with the filename: \`\`\`tsx App.tsx\n...\`\`\`. Do not include any prose, just the code blocks.`,
+            }],
+            model: 'claude-opus-4-6',
+            storageMode,
+            projectConfig,
+          }),
+        });
+        if (retryResp.ok) {
+          const retryReader = retryResp.body!.getReader();
+          const retryDecoder = new TextDecoder();
+          let retryContent = '';
+          let retryBuf = '';
+          while (true) {
+            const { done, value } = await retryReader.read();
+            if (done) break;
+            retryBuf += retryDecoder.decode(value, { stream: true });
+            const retryLines = retryBuf.split('\n');
+            retryBuf = retryLines.pop() ?? '';
+            for (const l of retryLines) {
+              if (!l.startsWith('data: ')) continue;
+              const d = l.slice(6).trim();
+              if (d === '[DONE]') break;
+              try {
+                const p = JSON.parse(d);
+                if (p.text) { retryContent += p.text; updateLastAssistantMessage(fullContent + '\n\n' + retryContent); }
+              } catch { /* skip */ }
+            }
+          }
+          const retryFiles = parseFilesFromResponse(retryContent);
+          if (Object.keys(retryFiles).length > 0) {
+            const sanitizedRetry = sanitizeGeneratedFiles(retryFiles, useStore.getState().files);
+            setFiles(sanitizedRetry);
+            setRightPanel('preview');
+          }
+        }
+      } catch (retryErr) {
+        console.warn('[chat] retry failed:', retryErr);
+      }
     }
 
     setLastMessageStreaming(false);
@@ -874,6 +1033,271 @@ export async function sendChatMessage(
     } else {
       const msg = err instanceof Error ? err.message : String(err);
       setLastMessageError(msg);
+    }
+  } finally {
+    currentAbortController = null;
+    setIsGenerating(false);
+  }
+}
+
+/**
+ * Called when the user approves the plan shown in the plan approval card.
+ * Transitions the message to generating state and calls /api/build with the pre-approved plan.
+ */
+export async function approvePlan(messageId: string) {
+  const {
+    messages,
+    updateMessage,
+    updateLastAssistantMessage,
+    updateLastAssistantPipeline,
+    setIsGenerating,
+    setLastMessageStreaming,
+    setLastMessageError,
+    setFiles,
+    setRightPanel,
+    setHasApiKey,
+    setSelectedModel,
+    setPendingVersionSave,
+  } = useStore.getState();
+
+  const msg = messages.find(m => m.id === messageId);
+  if (!msg?.planApproval || msg.planApproval.status !== 'pending') return;
+
+  const { plan, buildContext } = msg.planApproval;
+
+  // Transition to generating state — clear approval card, start pipeline
+  updateMessage(messageId, {
+    isStreaming: true,
+    content: '',
+    planApproval: { ...msg.planApproval, status: 'approved' },
+    pipeline: { stages: [] },
+  });
+
+  setIsGenerating(true);
+  currentAbortController = new AbortController();
+  const { signal } = currentAbortController;
+
+  const filesSnapshot = { ...useStore.getState().files };
+  const existingFiles = useStore.getState().files;
+
+  try {
+    const { storageMode, projectConfig } = useStore.getState();
+
+    const actualHasFiles = Object.keys(existingFiles).length > 0;
+    const response = await fetch('/api/build', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: buildContext.messages,
+        hasFiles: actualHasFiles,
+        currentFiles: actualHasFiles ? existingFiles : {},
+        model: buildContext.model,
+        isAutoMode: buildContext.isAutoMode,
+        storageMode: buildContext.storageMode,
+        projectConfig: buildContext.projectConfig,
+        preMadePlan: plan,
+        apiSecrets: useStore.getState().projectSecrets,
+      }),
+      signal,
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ error: 'Unknown error' }));
+      if (response.status === 400 && (err.error?.includes('ANTHROPIC_API_KEY') || err.error?.includes('OPENAI_API_KEY'))) {
+        setHasApiKey(false);
+      }
+      throw new Error(err.error || `HTTP ${response.status}`);
+    }
+
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let fullContent = '';
+    let buffer = '';
+    let pipelineState: Message['pipeline'] = { stages: [] };
+    let capturedManifest: string[] | null = null;
+
+    function updatePipeline(update: Partial<NonNullable<Message['pipeline']>>) {
+      pipelineState = { ...pipelineState!, ...update };
+      updateLastAssistantPipeline(pipelineState);
+    }
+
+    function updateStage(name: PipelineStageInfo['name'], status: 'running' | 'done', model?: string) {
+      const stages = pipelineState?.stages ?? [];
+      const existing = stages.find(s => s.name === name);
+      if (existing) {
+        updatePipeline({ stages: stages.map(s => s.name === name ? { ...s, status, model } : s) });
+      } else {
+        updatePipeline({ stages: [...stages, { name, status, model }] });
+      }
+    }
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') break;
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) throw new Error(parsed.error);
+          if (parsed.title) {
+            const { currentProjectId, setCurrentProjectName } = useStore.getState();
+            if (currentProjectId) {
+              setCurrentProjectName(parsed.title as string);
+              supabase.from('projects').update({ name: parsed.title }).eq('id', currentProjectId)
+                .then(({ error }) => { if (error) console.warn('[chat] approvePlan rename failed:', error.message); });
+            }
+          } else if (parsed.stage !== undefined) {
+            switch (parsed.stage) {
+              case 'routing':
+                updatePipeline({ requestType: parsed.requestType, stages: [{ name: 'routing', status: 'done' }] });
+                break;
+              case 'planning':
+                updateStage('routing', 'done');
+                updateStage('planning', 'running');
+                break;
+              case 'plan':
+                if (pipelineState?.stages?.some(s => s.name === 'planning')) updateStage('planning', 'done');
+                updatePipeline({ plan: parsed.plan });
+                if (parsed.plan?.title && pipelineState?.requestType === 'new_app') {
+                  const { currentProjectId, setCurrentProjectName } = useStore.getState();
+                  if (currentProjectId) {
+                    setCurrentProjectName(parsed.plan.title as string);
+                    supabase.from('projects').update({ name: parsed.plan.title }).eq('id', currentProjectId)
+                      .then(({ error }) => { if (error) console.warn('[chat] approvePlan rename (plan) failed:', error.message); });
+                  }
+                }
+                break;
+              case 'generating':
+                if (pipelineState?.stages?.some(s => s.name === 'planning')) updateStage('planning', 'done');
+                updateStage('generating', 'running', parsed.model);
+                if (buildContext.isAutoMode && parsed.model) setSelectedModel(parsed.model as ModelId);
+                break;
+              case 'polishing':
+                updateStage('generating', 'done');
+                updateStage('polishing', 'running');
+                break;
+              case 'validating':
+                updateStage('generating', 'done');
+                updateStage('polishing', 'done');
+                updateStage('validating', 'running');
+                break;
+              case 'validation_fixing':
+              case 'validation_fixing_2':
+                break;
+              case 'validation_fixed':
+              case 'validation_fixed_2':
+              case 'validation_clean':
+                updateStage('validating', 'done');
+                break;
+              case 'manifest':
+                capturedManifest = parsed.files as string[];
+                break;
+            }
+          } else if (parsed.text) {
+            fullContent += parsed.text;
+            updateLastAssistantMessage(fullContent);
+          }
+        } catch (e) {
+          if (e instanceof Error && e.message !== 'Unexpected end of JSON input') throw e;
+        }
+      }
+    }
+
+    if (pipelineState) {
+      updatePipeline({ stages: (pipelineState.stages ?? []).map(s => ({ ...s, status: 'done' as const })) });
+    }
+
+    const rawFiles = parseFilesFromResponse(fullContent);
+    const newFiles = sanitizeGeneratedFiles(rawFiles, existingFiles);
+    console.log('[chat] approvePlan files:', Object.keys(newFiles), '| content length:', fullContent.length);
+
+    const isNewApp = pipelineState?.requestType === 'new_app';
+    const hasSomeFiles = Object.keys(rawFiles).length > 2;
+    const isTruncated = isNewApp && hasSomeFiles && !rawFiles['App.tsx'];
+
+    if (isTruncated) {
+      console.warn('[chat] approvePlan: App.tsx missing — firing completion continuation');
+      if (Object.keys(newFiles).length > 0) {
+        setFiles(newFiles);
+        setRightPanel('preview');
+      }
+      const allFilesNow = { ...existingFiles, ...newFiles };
+      const missingFiles = (capturedManifest ?? ['App.tsx']).filter(f => !rawFiles[f]);
+      await triggerCompletionContinuation(missingFiles, allFilesNow);
+      const allFilesAfterCont = useStore.getState().files;
+      const stubsAfterCont = detectStubPages(allFilesAfterCont);
+      const missingPagesAfterCont = (capturedManifest ?? []).filter(f => f.startsWith('pages/') && !allFilesAfterCont[f]);
+      const toComplete = [...new Set([...stubsAfterCont, ...missingPagesAfterCont])];
+      if (toComplete.length > 0) await triggerPageCompletion(toComplete, allFilesAfterCont);
+    } else if (Object.keys(newFiles).length > 0) {
+      // Apply schema BEFORE rendering so tables exist when the preview queries them
+      if (storageMode === 'supabase' && newFiles['schema.sql']) {
+        try {
+          const schemaResp = await fetch('/api/run-schema', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sql: newFiles['schema.sql'], projectId: projectConfig?.id }),
+          });
+          const schemaResult = await schemaResp.json();
+          if (schemaResult.success) {
+            console.log('[chat] approvePlan schema.sql applied before preview render');
+          } else {
+            console.warn('[chat] approvePlan schema.sql apply failed:', schemaResult.error);
+          }
+        } catch (e) {
+          console.warn('[chat] approvePlan schema.sql apply error:', (e as Error).message);
+        }
+      }
+
+      setFiles(newFiles);
+      setRightPanel('preview');
+
+      if (isNewApp) {
+        const allFiles = { ...existingFiles, ...newFiles };
+        const stubPages = detectStubPages(allFiles);
+        if (stubPages.length > 0) await triggerPageCompletion(stubPages, allFiles);
+      }
+
+      // Fallback rename
+      const { currentProjectId, currentProjectName, setCurrentProjectName } = useStore.getState();
+      if (currentProjectId && (!currentProjectName || currentProjectName === 'Untitled Project')) {
+        const allCode = Object.values(newFiles).join('\n');
+        const titleMatch = allCode.match(/<title>([^<]{3,60})<\/title>/i)
+          ?? allCode.match(/document\.title\s*=\s*['\"`]([^'\"`]{3,60})['\"`]/i);
+        if (titleMatch) {
+          const extracted = titleMatch[1].trim();
+          setCurrentProjectName(extracted);
+          supabase.from('projects').update({ name: extracted }).eq('id', currentProjectId)
+            .then(({ error }) => { if (error) console.warn('[chat] approvePlan fallback rename failed:', error.message); });
+        }
+      }
+
+      // Queue version save
+      const { currentProjectId: projId } = useStore.getState();
+      if (projId) {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (session?.user?.id) {
+          const label = (buildContext.messages.find(m => m.role === 'user')?.content ?? 'App generation').slice(0, 80);
+          const fullFiles = useStore.getState().files;
+          setPendingVersionSave({ projectId: projId, userId: session.user.id, files: fullFiles, label });
+        }
+      }
+    }
+
+    setLastMessageStreaming(false);
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      setFiles(filesSnapshot, true);
+      setPendingVersionSave(null);
+      navigationCancel = false;
+    } else {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      setLastMessageError(errMsg);
     }
   } finally {
     currentAbortController = null;

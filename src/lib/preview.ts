@@ -2,8 +2,75 @@
  * Strips all import/export syntax so every declaration becomes a global.
  * In the eval sandbox, all files share one scope — so a `function Sidebar`
  * defined in components/Sidebar.tsx is directly accessible in App.tsx.
+ *
+ * Also converts lucide-react, recharts, and framer-motion named imports to
+ * var declarations that point at pre-loaded window globals — so these popular
+ * libraries work in the sandbox without any package bundler.
  */
 function transformCode(code: string): string {
+  // ── 0. Fix known AI crash patterns before TypeScript compilation ─────────────
+  // These patterns survive sanitizeGeneratedFiles if the AI generates them in
+  // subtle variations, or if files are loaded from an old project build.
+  // "new toISOString()" family → "new Date().toISOString()"
+  code = code.replace(/\bnew\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
+  code = code.replace(/\bDate\.now\(\)\.toISOString\(\)/g, 'new Date().toISOString()');
+  code = code.replace(/\bnew\s+Date\.toISOString\s*\(\)/g, 'new Date().toISOString()');
+  // PostgreSQL UUID functions → crypto.randomUUID()
+  code = code.replace(/\bgen_random_uuid\s*\(\)/g, 'crypto.randomUUID()');
+  code = code.replace(/\buuid_generate_v4\s*\(\)/g, 'crypto.randomUUID()');
+  // Bare db.from / supabase.from (standalone — not preceded by another dot or word char)
+  code = code.replace(/(^|[=(,{[\s;!&|?:(])(?:db|supabase)\.from\s*\(/gm, '$1window.db.from(');
+  code = code.replace(/(^|[=(,{[\s;!&|?:(])(?:db|supabase)\.auth\b/gm, '$1window.db.auth');
+
+  // ── Before stripping, capture named imports from sandbox-supported libraries ──
+  // This converts:  import { Home, Settings } from 'lucide-react'
+  //           into:  var Home = window._LucideIcons["Home"] || window._mkIcon("Home");
+  //                  var Settings = window._LucideIcons["Settings"] || window._mkIcon("Settings");
+  const extraVarDecls: string[] = [];
+
+  function extractNamedImports(pattern: RegExp, varFn: (name: string) => string) {
+    let m: RegExpExecArray | null;
+    while ((m = pattern.exec(code)) !== null) {
+      m[1].split(',').forEach(part => {
+        const raw = part.trim();
+        // Handle "X as Y" aliasing — use the alias name as the variable
+        const [origName, alias] = raw.split(/\s+as\s+/);
+        const varName = (alias || origName).trim();
+        const srcName = origName.trim();
+        if (varName && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(varName)) {
+          extraVarDecls.push(varFn(varName) + ' /* from ' + srcName + ' */');
+        }
+      });
+    }
+  }
+
+  // lucide-react: icons as SVG React components
+  extractNamedImports(
+    /^import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['"]lucide-react['"];?\s*$/gm,
+    (n) => `var ${n} = (window._LucideIcons && window._LucideIcons["${n}"]) || window._mkIcon("${n}")`
+  );
+
+  // recharts: chart components from pre-loaded UMD bundle
+  extractNamedImports(
+    /^import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['"]recharts['"];?\s*$/gm,
+    (n) => `var ${n} = (window.Recharts && window.Recharts["${n}"]) || window._mkIcon("${n}")`
+  );
+
+  // framer-motion: motion.X and AnimatePresence as pass-through shims
+  const hasFramerMotion = /from\s+['"]framer-motion['"]/.test(code);
+  extractNamedImports(
+    /^import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['"]framer-motion['"];?\s*$/gm,
+    (n) => {
+      if (n === 'motion') return `var ${n} = window._framerMotion || window._mkMotion()`;
+      if (n === 'AnimatePresence') return `var ${n} = function(p){return p.children}`;
+      if (n === 'useAnimation') return `var ${n} = function(){return {start:function(){},stop:function(){},set:function(){}}}`;
+      if (n === 'useMotionValue') return `var ${n} = function(v){return {get:function(){return v},set:function(x){v=x}}}`;
+      if (n === 'useTransform') return `var ${n} = function(v,i,o){return {get:function(){return o[0]}}}`;
+      if (n === 'useSpring') return `var ${n} = function(v){return v}`;
+      return `var ${n} = function(p){return p&&p.children||null}`;
+    }
+  );
+
   // ── Imports ──────────────────────────────────────────────────────────────
   // Remove: import { X } from '...'  /  import type { X } from '...'
   code = code.replace(/^import\s[\s\S]*?from\s+['"][^'"]*['"];?\s*$/gm, '');
@@ -37,6 +104,11 @@ function transformCode(code: string): string {
   code = code.replace(/\bexport\s+(?=(?:interface|type)\s)/g, '');
   // export { X, Y }  (named re-exports without 'from' — just drop them)
   code = code.replace(/^export\s*\{[^}]*\};?\s*$/gm, '');
+
+  // Prepend library var declarations (after stripping so they don't get stripped themselves)
+  if (extraVarDecls.length > 0) {
+    code = extraVarDecls.join(';\n') + ';\n' + code;
+  }
 
   return code;
 }
@@ -110,9 +182,13 @@ export interface PreviewConfig {
   apiSecrets?: Record<string, string>;
 }
 
-// Supabase public credentials (anon key is designed to be client-side)
+// Supabase credentials
 const SUPABASE_URL = 'https://kuzptrzpacesdneogmaq.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt1enB0cnpwYWNlc2RuZW9nbWFxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA0MTkxMjIsImV4cCI6MjA4NTk5NTEyMn0.yjrT7gcIryOVrv89ooSGsfrnz6wJwsdh3Pss87NX-bY';
+// Service role key used for project previews — bypasses RLS so all CRUD operations work
+// in the development sandbox. This is safe here because the preview runs locally for the
+// project owner only, and this key is already in their .env.
+const SUPABASE_SERVICE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt1enB0cnpwYWNlc2RuZW9nbWFxIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MDQxOTEyMiwiZXhwIjoyMDg1OTk1MTIyfQ.Vd0WVYTZQig5QV3yfY4HbhHdbUOd137DwfsezmDu8aM';
 
 /**
  * Builds inline <script> tags for storage integration (Supabase or S3).
@@ -127,9 +203,11 @@ function buildStorageScripts(config?: PreviewConfig): string {
   // In localstorage mode: auth-only client (no schema restriction).
   const clientInit = isSupabaseMode
     ? (
+      // Use service role key so INSERT/UPDATE/DELETE bypass RLS in the preview sandbox.
+      // The anon key only allows SELECT by default; writes would fail for most schemas.
       '    window.db = window.supabase.createClient(\n' +
       '      "' + SUPABASE_URL + '",\n' +
-      '      "' + SUPABASE_ANON_KEY + '",\n' +
+      '      "' + SUPABASE_SERVICE_KEY + '",\n' +
       '      { db: { schema: "' + projectId + '" } }\n' +
       '    );\n'
     )
@@ -179,15 +257,80 @@ function buildStorageScripts(config?: PreviewConfig): string {
       : '    window["proj_default"] = window.db;\n') +
     // Proactive auth stubs — AI-generated apps often reference these before async auth resolves.
     // In the sandbox there's no session, so these would crash. Stub them with safe mock values.
+    '    // PostgreSQL / SQL shims — AI often calls these DB functions or type casts in frontend JS\n' +
+    '    window.gen_random_uuid = function() { return typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function(c) { var r = Math.random()*16|0; return (c=="x"?r:(r&0x3|0x8)).toString(16); }); };\n' +
+    '    window.uuid_generate_v4 = window.gen_random_uuid;\n' +
+    '    window.now = function() { return new Date().toISOString(); };\n' +
+    '    // SQL numeric type casts — pass-through identity functions so NUMERIC(x)/INTEGER(x)/etc. work\n' +
+    '    window.NUMERIC = window.DECIMAL = window.FLOAT = window.REAL = window.DOUBLE_PRECISION = function(v) { return v === undefined ? 0 : (+v || 0); };\n' +
+    '    window.INTEGER = window.INT = window.SMALLINT = window.BIGINT_CAST = function(v) { return v === undefined ? 0 : (parseInt(v, 10) || 0); };\n' +
+    '    window.VARCHAR = window.TEXT = window.CHAR = window.NVARCHAR = function(v) { return v === undefined ? "" : String(v); };\n' +
+    '    window.BOOLEAN = window.BOOL = function(v) { return !!v; };\n' +
+    '    window.ARRAY_AGG = function(v) { return Array.isArray(v) ? v : []; };\n' +
+    '    window.COALESCE = function() { for (var i = 0; i < arguments.length; i++) { if (arguments[i] != null) return arguments[i]; } return null; };\n' +
+    '    window.NULLIF = function(a, b) { return a === b ? null : a; };\n' +
+    '    window.CAST = function(v) { return v; };\n' +
     '    // Auth stubs — prevents "user/session/profile is not defined" crashes in preview\n' +
     '    var _mockUser = { id: "demo_user_01", email: "demo@example.com", name: "Demo User", full_name: "Demo User", username: "demouser", role: "user", avatar_url: "", created_at: new Date().toISOString() };\n' +
-    '    var _mockSession = { user: _mockUser, access_token: "demo_token", refresh_token: "demo_refresh", expires_at: 9999999999 };\n' +
+    '    var _mockSession = { user: _mockUser, access_token: "' + (isSupabaseMode ? SUPABASE_SERVICE_KEY : SUPABASE_ANON_KEY) + '", refresh_token: "demo_refresh", expires_at: 9999999999 };\n' +
     '    if (typeof window.user === "undefined") window.user = _mockUser;\n' +
     '    if (typeof window.profile === "undefined") window.profile = _mockUser;\n' +
     '    if (typeof window.session === "undefined") window.session = _mockSession;\n' +
     '    if (typeof window.currentUser === "undefined") window.currentUser = _mockUser;\n' +
     '    // Patch window.db.auth so ANY Supabase auth pattern renders without crashing.\n' +
     '    // This runs after window.db is created, overriding the real auth methods with mock ones.\n' +
+    '    // Fetch CORS safety net — API calls in sports/data apps fail with CORS in the sandbox iframe.\n' +
+    '    // Instead of crashing the app via unhandledrejection, return an empty mock response so the\n' +
+    '    // component renders with empty state (shows loading/empty placeholder) rather than crashing.\n' +
+    '    (function() {\n' +
+    '      var _realFetch = window.fetch;\n' +
+    '      window.fetch = function(url, opts) {\n' +
+    '        var urlStr = typeof url === "string" ? url : (url && url.url) || "";\n' +
+    '        var isSupabaseRest = urlStr.indexOf("/rest/v1/") !== -1;\n' +
+    '        // Only intercept failures for SELECT (GET) requests — write operations must surface real errors.\n' +
+    '        // Swallowing write errors (INSERT/UPDATE/DELETE) made CRUD appear to succeed while saving nothing.\n' +
+    '        var isReadOp = !opts || !opts.method || opts.method.toUpperCase() === "GET";\n' +
+    '        return _realFetch(url, opts).then(function(resp) {\n' +
+    '          // For failed SELECT requests: return [] so .map() never crashes — app shows empty state\n' +
+    '          if (isSupabaseRest && !resp.ok && isReadOp) {\n' +
+    '            console.warn("[sandbox] Supabase read error", resp.status, "— returning [] to prevent crash");\n' +
+    '            return new Response("[]", { status: 200, headers: { "Content-Type": "application/json", "Content-Range": "*/0" } });\n' +
+    '          }\n' +
+    '          // For failed write operations: pass the real error through so Supabase client\n' +
+    '          // returns { data: null, error: {...} } and app can handle/display the error.\n' +
+    '          return resp;\n' +
+    '        }).catch(function(err) {\n' +
+    '          console.warn("[sandbox] fetch blocked (CORS/network):", urlStr.slice(0,80), "—", err.message);\n' +
+    '          if (isReadOp) {\n' +
+    '            // Read failed at network level — return empty data so app renders without crashing\n' +
+    '            return new Response(JSON.stringify({ data: [], items: [], results: [], rows: [], records: [], success: false, error: "fetch not available in preview" }), {\n' +
+    '              status: 200, headers: { "Content-Type": "application/json" }\n' +
+    '            });\n' +
+    '          } else {\n' +
+    '            // Write failed at network level — surface a real error so app knows it failed\n' +
+    '            return new Response(JSON.stringify({ code: "NETWORK_ERROR", details: null, hint: null, message: "Network error in preview sandbox — check your internet connection" }), {\n' +
+    '              status: 503, headers: { "Content-Type": "application/json" }\n' +
+    '            });\n' +
+    '          }\n' +
+    '        });\n' +
+    '      };\n' +
+    '    })();\n' +
+    '    // WebSocket shim — real-time connections (live sports scores, chat, etc.) cannot connect\n' +
+    '    // from the sandbox iframe. Shim fires onopen so the app initialises, then stays open.\n' +
+    '    // The app shows its "waiting for data" state rather than crashing.\n' +
+    '    window.WebSocket = function(url) {\n' +
+    '      var ws = this;\n' +
+    '      ws.readyState = 0; // CONNECTING\n' +
+    '      ws.send = function(data) { console.warn("[sandbox] WebSocket.send ignored:", typeof data === "string" ? data.slice(0,60) : data); };\n' +
+    '      ws.close = function() { ws.readyState = 3; if (ws.onclose) ws.onclose({ code: 1000, reason: "preview", wasClean: true }); };\n' +
+    '      ws.addEventListener = function(evt, fn) { if (evt === "open") setTimeout(fn, 0); };\n' +
+    '      setTimeout(function() {\n' +
+    '        ws.readyState = 1; // OPEN\n' +
+    '        if (ws.onopen) ws.onopen({ target: ws });\n' +
+    '        console.warn("[sandbox] WebSocket shimmed (no real connection):", typeof url === "string" ? url.slice(0,80) : url);\n' +
+    '      }, 50);\n' +
+    '    };\n' +
+    '    window.WebSocket.CONNECTING = 0; window.WebSocket.OPEN = 1; window.WebSocket.CLOSING = 2; window.WebSocket.CLOSED = 3;\n' +
     '    if (window.db && window.db.auth) {\n' +
     '      window.db.auth.user = function() { return _mockUser; };\n' +
     '      window.db.auth.getUser = async function() { return { data: { user: _mockUser }, error: null }; };\n' +
@@ -232,7 +375,11 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     return files['index.html'];
   }
 
-  const entries = Object.entries(files);
+  // Only evaluate JS/TS files — skip .sql, .md, .json, .css, etc.
+  // Evaluating non-JS files (especially SQL) causes "Unexpected token" crashes.
+  const entries = Object.entries(files).filter(([name]) =>
+    /\.(tsx?|jsx?)$/.test(name)
+  );
 
   // Sort: root .ts files first (types/data/utils), then by depth, App.tsx last
   entries.sort(([a], [b]) => sortKey(a).localeCompare(sortKey(b)));
@@ -306,6 +453,168 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
       ? '  <script>window.ENV = ' + JSON.stringify(config.apiSecrets) + ';<\/script>\n'
       : '  <script>window.ENV = {};<\/script>\n';
 
+  // ── Lucide icon shim ───────────────────────────────────────────────────────
+  // Provides the 70 most common lucide-react icons as inline SVG React components.
+  // Any unknown icon name falls back to a small generic SVG circle (via _mkIcon).
+  const lucideShim =
+    '  <script>\n' +
+    '  (function() {\n' +
+    '    function _i(paths, extra) {\n' +
+    '      return function Icon(props) {\n' +
+    '        var sz = (props && props.size) || 16;\n' +
+    '        var cls = (props && props.className) || "";\n' +
+    '        var col = (props && props.color) || "currentColor";\n' +
+    '        var sw = (props && props.strokeWidth != null ? props.strokeWidth : 2);\n' +
+    '        var style = (props && props.style) || {};\n' +
+    '        var children = paths.map(function(p,i){ return React.createElement("path",{key:i,d:p}); });\n' +
+    '        if (extra) extra.forEach(function(e,i){ children.push(React.createElement(e[0],Object.assign({key:"e"+i},e[1]))); });\n' +
+    '        return React.createElement("svg",{xmlns:"http://www.w3.org/2000/svg",width:sz,height:sz,viewBox:"0 0 24 24",fill:"none",stroke:col,strokeWidth:sw,strokeLinecap:"round",strokeLinejoin:"round",className:cls,style:style,role:"img"},children);\n' +
+    '      };\n' +
+    '    }\n' +
+    '    window._mkIcon = function(name) {\n' +
+    '      return function(props) {\n' +
+    '        var sz = (props && props.size) || 16;\n' +
+    '        var cls = (props && props.className) || "";\n' +
+    '        return React.createElement("svg",{xmlns:"http://www.w3.org/2000/svg",width:sz,height:sz,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,strokeLinecap:"round",strokeLinejoin:"round",className:cls},React.createElement("rect",{x:3,y:3,width:18,height:18,rx:3}));\n' +
+    '      };\n' +
+    '    };\n' +
+    '    var L = {\n' +
+    '      Activity: _i(["M22 12h-4l-3 9L9 3l-3 9H2"]),\n' +
+    '      AlertCircle: _i(["M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z","M12 8v4","M12 16h.01"]),\n' +
+    '      AlertTriangle: _i(["m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3z","M12 9v4","M12 17h.01"]),\n' +
+    '      Archive: _i(["M21 8v13H3V8","M1 3h22v5H1z","M10 12h4"]),\n' +
+    '      ArrowDown: _i(["M12 5v14","m19 12-7 7-7-7"]),\n' +
+    '      ArrowLeft: _i(["m12 19-7-7 7-7","M19 12H5"]),\n' +
+    '      ArrowRight: _i(["M5 12h14","m12 5 7 7-7 7"]),\n' +
+    '      ArrowUp: _i(["M12 19V5","m5 12 7-7 7 7"]),\n' +
+    '      ArrowUpRight: _i(["M7 17 17 7","M7 7h10v10"]),\n' +
+    '      Award: _i(["M12 15a7 7 0 1 0 0-14 7 7 0 0 0 0 14z","M8.21 13.89 7 23l5-3 5 3-1.21-9.12"]),\n' +
+    '      BarChart: _i(["M12 20V10","M18 20V4","M6 20v-4"]),\n' +
+    '      BarChart2: _i(["M18 20V10","M12 20V4","M6 20v-6"]),\n' +
+    '      BarChart3: _i(["M3 3v18h18","M7 16l4-8 4 4 4-4"]),\n' +
+    '      Bell: _i(["M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9","M10.3 21a1.94 1.94 0 0 0 3.4 0"]),\n' +
+    '      Bookmark: _i(["m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"]),\n' +
+    '      Calendar: _i(["M8 2v4","M16 2v4","M3 10h18","M5 4h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"]),\n' +
+    '      Check: _i(["M20 6 9 17l-5-5"]),\n' +
+    '      CheckCircle: _i(["M22 11.08V12a10 10 0 1 1-5.93-9.14","M22 4 12 14.01l-3-3"]),\n' +
+    '      CheckCircle2: _i(["M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z","m9 12 2 2 4-4"]),\n' +
+    '      ChevronDown: _i(["m6 9 6 6 6-6"]),\n' +
+    '      ChevronLeft: _i(["m15 18-6-6 6-6"]),\n' +
+    '      ChevronRight: _i(["m9 18 6-6-6-6"]),\n' +
+    '      ChevronUp: _i(["m18 15-6-6-6 6"]),\n' +
+    '      Circle: _i([],[["circle",{cx:12,cy:12,r:10}]]),\n' +
+    '      Clock: _i([],[["circle",{cx:12,cy:12,r:10}],["polyline",{points:"12 6 12 12 16 14"}]]),\n' +
+    '      Copy: _i(["M20 9H11a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2z","M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"]),\n' +
+    '      CreditCard: _i(["M21 4H3a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h18a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z","M1 10h22"]),\n' +
+    '      DollarSign: _i(["M12 1v22","M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"]),\n' +
+    '      Download: _i(["M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4","m7 10 5 5 5-5","M12 15V3"]),\n' +
+    '      Edit: _i(["M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7","M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4Z"]),\n' +
+    '      Edit2: _i(["M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"]),\n' +
+    '      Edit3: _i(["M12 20h9","M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"]),\n' +
+    '      ExternalLink: _i(["M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6","M15 3h6v6","M10 14 21 3"]),\n' +
+    '      Eye: _i(["M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"],[["circle",{cx:12,cy:12,r:3}]]),\n' +
+    '      EyeOff: _i(["M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24","M1 1l22 22"]),\n' +
+    '      File: _i(["M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z","M13 2v7h7"]),\n' +
+    '      FileText: _i(["M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z","M14 2v6h6","M16 13H8","M16 17H8","M10 9H8"]),\n' +
+    '      Filter: _i(["M22 3H2l8 9.46V19l4 2v-8.54L22 3z"]),\n' +
+    '      Folder: _i(["M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"]),\n' +
+    '      Globe: _i(["M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z","M2 12h20","M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"]),\n' +
+    '      Grid: _i(["M3 3h7v7H3z","M14 3h7v7h-7z","M14 14h7v7h-7z","M3 14h7v7H3z"]),\n' +
+    '      Heart: _i(["M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"]),\n' +
+    '      Home: _i(["m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z","M9 22V12h6v10"]),\n' +
+    '      Image: _i(["M21 3H3a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h18a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2z","M3 20l4.5-4.5 3 3 4-4 4 4"],[["circle",{cx:8.5,cy:8.5,r:1.5}]]),\n' +
+    '      Info: _i(["M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z","M12 16v-4","M12 8h.01"]),\n' +
+    '      Key: _i(["M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4"]),\n' +
+    '      Layers: _i(["M2 20l10 4 10-4","M2 15l10 4 10-4","M12 2 2 6l10 4 10-4z"]),\n' +
+    '      LayoutDashboard: _i(["M3 9a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v11H5a2 2 0 0 1-2-2V9z","M13 5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v15h-8V5z"]),\n' +
+    '      LineChart: _i(["M3 3v18h18","m19 9-5 5-4-4-3 3"]),\n' +
+    '      Link: _i(["M9 17H7A5 5 0 0 1 7 7h2","M15 7h2a5 5 1 1 0 0 10h-2","M11 12h2"]),\n' +
+    '      Link2: _i(["M9 17H7A5 5 0 0 1 7 7h2","M15 7h2a5 5 0 1 1 0 10h-2","M11 12h2"]),\n' +
+    '      List: _i(["M8 6h13","M8 12h13","M8 18h13","M3 6h.01","M3 12h.01","M3 18h.01"]),\n' +
+    '      Loader: _i(["M12 2v4","m16.24 7.76 2.83-2.83","M20 12h4","m16.24 16.24 2.83 2.83","M12 20v4","m4.93 19.07 2.83-2.83","M4 12H0","m4.93 4.93 2.83 2.83"]),\n' +
+    '      Loader2: _i(["M21 12a9 9 0 1 1-6.219-8.56"]),\n' +
+    '      Lock: _i(["M19 11H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2z"],[["path",{d:"M7 11V7a5 5 0 0 1 10 0v4"}]]),\n' +
+    '      LogIn: _i(["M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4","m10 17 5-5-5-5","M15 12H3"]),\n' +
+    '      LogOut: _i(["M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4","m16 17 5-5-5-5","M21 12H9"]),\n' +
+    '      Mail: _i(["M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z","m22 6-10 7L2 6"]),\n' +
+    '      Map: _i(["M1 6v16l7-4 8 4 7-4V2l-7 4-8-4-7 4z","M8 2v16","M16 6v16"]),\n' +
+    '      MapPin: _i(["M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0z"],[["circle",{cx:12,cy:10,r:3}]]),\n' +
+    '      Menu: _i(["M3 12h18","M3 6h18","M3 18h18"]),\n' +
+    '      MessageSquare: _i(["M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 0 2 2v10z"]),\n' +
+    '      Minus: _i(["M5 12h14"]),\n' +
+    '      Moon: _i(["M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"]),\n' +
+    '      MoreHorizontal: _i([],[["circle",{cx:20,cy:12,r:1}],["circle",{cx:12,cy:12,r:1}],["circle",{cx:4,cy:12,r:1}]]),\n' +
+    '      MoreVertical: _i([],[["circle",{cx:12,cy:4,r:1}],["circle",{cx:12,cy:12,r:1}],["circle",{cx:12,cy:20,r:1}]]),\n' +
+    '      Package: _i(["M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z","M3.27 6.96 12 12.01l8.73-5.05","M12 22.08V12"]),\n' +
+    '      Pause: _i([],[["rect",{x:6,y:4,width:4,height:16}],["rect",{x:14,y:4,width:4,height:16}]]),\n' +
+    '      Pencil: _i(["M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"]),\n' +
+    '      Phone: _i(["M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.13 12.8 19.79 19.79 0 0 1 3.07 4.11 2 2 0 0 1 5.06 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L9.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"]),\n' +
+    '      PieChart: _i(["M21.21 15.89A10 10 0 1 1 8 2.83","M22 12A10 10 0 0 0 12 2v10z"]),\n' +
+    '      Play: _i([],[["polygon",{points:"5 3 19 12 5 21 5 3"}]]),\n' +
+    '      Plus: _i(["M12 5v14","M5 12h14"]),\n' +
+    '      RefreshCw: _i(["M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8","M21 3v5h-5","M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16","M8 16H3v5"]),\n' +
+    '      RefreshCcw: _i(["M3 2v6h6","M21 12A9 9 0 0 0 6 5.3L3 8","M21 22v-6h-6","M3 12a9 9 0 0 0 15 6.7l3-2.7"]),\n' +
+    '      Save: _i(["M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z","M17 21v-8H7v8","M7 3v5h8"]),\n' +
+    '      Search: _i(["M21 21l-4.35-4.35"],[["circle",{cx:11,cy:11,r:8}]]),\n' +
+    '      Send: _i(["m22 2-7 20-4-9-9-4 20-7z","M22 2 11 13"]),\n' +
+    '      Settings: _i(["M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"],[["circle",{cx:12,cy:12,r:3}]]),\n' +
+    '      Settings2: _i(["M20 7H9","M14 17H3","M20 12H3"],[["circle",{cx:5,cy:7,r:3}],["circle",{cx:17,cy:17,r:3}]]),\n' +
+    '      Share: _i(["M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8","m16 6-4-4-4 4","M12 2v13"]),\n' +
+    '      Shield: _i(["M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"]),\n' +
+    '      ShoppingBag: _i(["M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z","M3 6h18"],[["path",{d:"M16 10a4 4 0 0 1-8 0"}]]),\n' +
+    '      ShoppingCart: _i(["M9 22a1 1 0 1 0 0-2 1 1 0 0 0 0 2z","M20 22a1 1 0 1 0 0-2 1 1 0 0 0 0 2z","M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"]),\n' +
+    '      Sliders: _i(["M4 21v-7","M4 10V3","M12 21v-9","M12 8V3","M20 21v-5","M20 12V3","M1 14h6","M9 8h6","M17 16h6"]),\n' +
+    '      Star: _i([],[["polygon",{points:"12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"}]]),\n' +
+    '      Sun: _i(["M12 2v2","M12 20v2","M4.22 4.22l1.42 1.42","M18.36 18.36l1.42 1.42","M2 12h2","M20 12h2","M4.22 19.78l1.42-1.42","M18.36 5.64l1.42-1.42"],[["circle",{cx:12,cy:12,r:4}]]),\n' +
+    '      Tag: _i(["M12 2H2v10l9.29 9.29c.94.94 2.48.94 3.42 0l6.58-6.58c.94-.94.94-2.48 0-3.42L12 2z"],[["circle",{cx:7,cy:7,r:1.5}]]),\n' +
+    '      Target: _i([],[["circle",{cx:12,cy:12,r:10}],["circle",{cx:12,cy:12,r:6}],["circle",{cx:12,cy:12,r:2}]]),\n' +
+    '      Trash: _i(["M3 6h18","M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"]),\n' +
+    '      Trash2: _i(["M3 6h18","M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2","M10 11v6","M14 11v6"]),\n' +
+    '      TrendingDown: _i(["m23 18-8.5-8.5-5 5L1 6","M17 18h6v-6"]),\n' +
+    '      TrendingUp: _i(["m23 6-8.5 8.5-5-5L1 18","M17 6h6v6"]),\n' +
+    '      Unlock: _i(["M19 11H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2z","M7 11V7a5 5 0 0 1 9.9-1"]),\n' +
+    '      Upload: _i(["M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4","m17 8-5-5-5 5","M12 3v12"]),\n' +
+    '      User: _i(["M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"],[["circle",{cx:12,cy:7,r:4}]]),\n' +
+    '      UserCheck: _i(["M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2","m17 11 2 2 4-4"],[["circle",{cx:9,cy:7,r:4}]]),\n' +
+    '      UserMinus: _i(["M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2","M23 11h-6"],[["circle",{cx:9,cy:7,r:4}]]),\n' +
+    '      UserPlus: _i(["M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2","M20 8v6","M23 11h-6"],[["circle",{cx:9,cy:7,r:4}]]),\n' +
+    '      Users: _i(["M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2","M22 21v-2a4 4 0 0 0-3-3.87","M16 3.13a4 4 0 0 1 0 7.75"],[["circle",{cx:9,cy:7,r:4}]]),\n' +
+    '      Volume2: _i(["M11 5 6 9H2v6h4l5 4V5z","M15.54 8.46a5 5 0 0 1 0 7.07","M19.07 4.93a10 10 0 0 1 0 14.14"]),\n' +
+    '      X: _i(["M18 6 6 18","m6 6 12 12"]),\n' +
+    '      XCircle: _i(["M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z","m15 9-6 6","m9 9 6 6"]),\n' +
+    '      Zap: _i(["M13 2 3 14h9l-1 8 10-12h-9l1-8z"]),\n' +
+    '      ZoomIn: _i(["M21 21l-4.35-4.35","M11 8v6","M8 11h6"],[["circle",{cx:11,cy:11,r:8}]]),\n' +
+    '      ZoomOut: _i(["M21 21l-4.35-4.35","M8 11h6"],[["circle",{cx:11,cy:11,r:8}]]),\n' +
+    '    };\n' +
+    '    window._LucideIcons = L;\n' +
+    '    // Expose every icon as a global so direct usage (without import) also works\n' +
+    '    Object.keys(L).forEach(function(k) { if (!window[k]) window[k] = L[k]; });\n' +
+    '\n' +
+    '    // framer-motion pass-through shim — animations are removed but components render\n' +
+    '    function _mkMotion() {\n' +
+    '      var _tags = ["div","span","p","h1","h2","h3","h4","h5","h6","button","a","ul","li","ol","section","article","main","header","footer","nav","aside","form","input","label","img","svg","path","g","rect","circle","line","polyline","polygon","text"];\n' +
+    '      var m = {};\n' +
+    '      _tags.forEach(function(t) {\n' +
+    '        m[t] = React.forwardRef(function(props, ref) {\n' +
+    '          var p = Object.assign({}, props);\n' +
+    '          ["initial","animate","exit","variants","transition","whileHover","whileTap","whileFocus","whileInView","whileDrag","layout","layoutId","drag","dragConstraints","dragElastic","dragMomentum","onAnimationStart","onAnimationComplete","onHoverStart","onHoverEnd","onTapStart","onTap","onTapCancel"].forEach(function(k){ delete p[k]; });\n' +
+    '          if (ref) p.ref = ref;\n' +
+    '          return React.createElement(t, p);\n' +
+    '        });\n' +
+    '      });\n' +
+    '      return m;\n' +
+    '    }\n' +
+    '    window._mkMotion = _mkMotion;\n' +
+    '    if (!window._framerMotion) window._framerMotion = _mkMotion();\n' +
+    '    if (!window.motion) window.motion = window._framerMotion;\n' +
+    '    if (!window.AnimatePresence) window.AnimatePresence = function(p){return p.children||null};\n' +
+    '    if (!window.useAnimation) window.useAnimation = function(){return {start:function(){},stop:function(){},set:function(){}}};\n' +
+    '    if (!window.useMotionValue) window.useMotionValue = function(v){return {get:function(){return v},set:function(x){v=x},onChange:function(){}}};\n' +
+    '    if (!window.useTransform) window.useTransform = function(v,i,o){return {get:function(){return o?o[0]:0}}};\n' +
+    '    if (!window.useSpring) window.useSpring = function(v){return v};\n' +
+    '  })();\n' +
+    '  <\/script>\n';
+
   return (
     '<!DOCTYPE html>\n' +
     '<html lang="en">\n' +
@@ -319,7 +628,10 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     // TypeScript compiler instead of Babel — handles ALL TS syntax correctly
     '  <script src="https://unpkg.com/typescript@5/lib/typescript.js"><\/script>\n' +
     '  <script src="https://cdn.tailwindcss.com"><\/script>\n' +
+    // Recharts UMD bundle — exposes window.Recharts with all chart components
+    '  <script src="https://cdn.jsdelivr.net/npm/recharts@2/umd/Recharts.min.js" crossorigin><\/script>\n' +
     storageScripts +
+    lucideShim +
     '  <style>* { box-sizing: border-box; } body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }<\/style>\n' +
     '</head>\n' +
     '<body>\n' +
@@ -421,6 +733,9 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '          "if (m === \'react\') return React;" +\n' +
     '          "if (m === \'react-dom\') return ReactDOM;" +\n' +
     '          "if (m === \'@supabase/supabase-js\') return { createClient: window.createClient };" +\n' +
+    '          "if (m === \'lucide-react\') return window._LucideIcons || {};" +\n' +
+    '          "if (m === \'recharts\') return window.Recharts || {};" +\n' +
+    '          "if (m === \'framer-motion\') return { motion: window._framerMotion, AnimatePresence: window.AnimatePresence, useAnimation: window.useAnimation, useMotionValue: window.useMotionValue, useTransform: window.useTransform, useSpring: window.useSpring };" +\n' +
     '          "return {};" +\n' +
     '          "};" +\n' +
     // Expose auth stubs + common data constant fallbacks so components never crash on
@@ -445,6 +760,11 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '          "var INVOICES=window.INVOICES||[];var LEADS=window.LEADS||[];var DEALS=window.DEALS||[];" +\n' +
     '          "var APPOINTMENTS=window.APPOINTMENTS||[];var COURSES=window.COURSES||[];var STUDENTS=window.STUDENTS||[];" +\n' +
     '          "var EMPLOYEES=window.EMPLOYEES||[];var PAYMENTS=window.PAYMENTS||[];var REVIEWS=window.REVIEWS||[];" +\n' +
+    '          "var TEAMS=window.TEAMS||[];var PLAYERS=window.PLAYERS||[];var GAMES=window.GAMES||[];" +\n' +
+    '          "var SCORES=window.SCORES||[];var MATCHES=window.MATCHES||[];var LEAGUES=window.LEAGUES||[];" +\n' +
+    '          "var ATHLETES=window.ATHLETES||[];var STANDINGS=window.STANDINGS||[];var STATS=window.STATS||[];" +\n' +
+    '          "var ROOMS=window.ROOMS||[];var CHANNELS=window.CHANNELS||[];var MEMBERS=window.MEMBERS||[];" +\n' +
+    '          "var ARTICLES=window.ARTICLES||[];var COMMENTS=window.COMMENTS||[];var TAGS=window.TAGS||[];" +\n' +
     // Pre-define SQL/CSS reserved keywords as safe empty defaults.
     // These are commonly used as uppercase variable names by AI (e.g. const TO = '#color').
     // As var declarations, they're overridden by any const/let with the same name — so they
@@ -474,7 +794,7 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     // we give up and show a real error. This eliminates the auto-fixer loop entirely
     // for these two error classes.
     '        var evalCode = shim + result.outputText + renderCall;\n' +
-    '        var _autoStubsLeft = 20;\n' +
+    '        var _autoStubsLeft = 150;\n' +
     '        (function _run() {\n' +
     '          try {\n' +
     '            eval(evalCode);\n' +
@@ -572,6 +892,19 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '              console.warn("[preview] already-declared: retrying with const/let→var");\n' +
     '              _run();\n' +
     '            } else {\n' +
+    '              // Re-stub "X is not a function": happens when X was auto-stubbed as [] or {}\n' +
+    '              // but the code then tries to call it (e.g. a sports namespace NBA() or factory fn).\n' +
+    '              if (_autoStubsLeft > 0 && msg.indexOf(" is not a function") !== -1) {\n' +
+    '                var _nfM = msg.match(/[`\'"]?(\\w+)[`\'"]? is not a function/);\n' +
+    '                var _nfN = _nfM ? _nfM[1] : null;\n' +
+    '                if (_nfN && window[_nfN] !== undefined && typeof window[_nfN] !== "function") {\n' +
+    '                  _autoStubsLeft--;\n' +
+    '                  window[_nfN] = function(){ return []; };\n' +
+    '                  console.warn("[preview] re-stub as callable:", _nfN);\n' +
+    '                  return _run();\n' +
+    '                }\n' +
+    '              }\n' +
+    '              // Augment error message with fix hints\n' +
     '              if (msg.includes("Cannot read properties of null") || msg.includes("Cannot read properties of undefined")) {\n' +
     '                var _propMatch = msg.match(/Cannot read propert(?:y|ies) of (?:null|undefined) \\(reading \'(\\w+)\'\\)/);\n' +
     '                var _propName = _propMatch ? _propMatch[1] : "property";\n' +

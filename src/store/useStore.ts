@@ -42,6 +42,7 @@ interface AppStore {
   messages: Message[];
   addMessage: (message: Message) => void;
   updateLastAssistantMessage: (content: string) => void;
+  updateMessage: (id: string, updates: Partial<Message>) => void;
   setLastMessageStreaming: (streaming: boolean) => void;
   setLastMessageError: (error: string) => void;
   clearMessages: () => void;
@@ -140,6 +141,10 @@ export const useStore = create<AppStore>()(
           }
           return { messages };
         }),
+      updateMessage: (id, updates) =>
+        set((state) => ({
+          messages: state.messages.map((m) => m.id === id ? { ...m, ...updates } : m),
+        })),
       setLastMessageStreaming: (streaming) =>
         set((state) => {
           const messages = [...state.messages];
@@ -223,7 +228,7 @@ export const useStore = create<AppStore>()(
       clearQueue: () => set({ promptQueue: [] }),
       setQueue: (queue, paused) => set({ promptQueue: queue, queuePaused: paused }),
 
-      storageMode: 'supabase',
+      storageMode: 'localstorage',
       setStorageMode: (mode) => set({ storageMode: mode }),
       projectConfig: null,
       setProjectConfig: (config) => set({ projectConfig: config }),
@@ -262,7 +267,8 @@ export const useStore = create<AppStore>()(
         rightPanel: state.rightPanel,
         promptQueue: state.promptQueue,
         queuePaused: state.queuePaused,
-        storageMode: state.storageMode,
+        // storageMode is intentionally NOT persisted — always defaults to 'localstorage'
+        // and is restored from the project record when a project is loaded.
         projectConfig: state.projectConfig,
       }),
     }

@@ -178,12 +178,19 @@ NOTHING ELSE. No planning prose. No architecture notes. No explanatory paragraph
 All reasoning happens INTERNALLY before the response is written — never in the response body.
 Exception — SURGICAL FIX mode: skip intent sentence, go straight to fix code block.
 
-✅ Done! block format — always end with this exact structure:
-  ✅ Done! [1 sentence describing what the app does]
-  Built: [comma-separated list of files generated]
-  Works: [what features are functional in this build]
-  Deferred: [what was intentionally excluded and why]
-  Risks: [any known limitations or fragile assumptions, or "none"]
+🚨 MANDATORY Done! block — you MUST end EVERY response with this. No exceptions. Missing it = incomplete response.
+  ✅ Done! [1 sentence describing what was built or changed]
+  Changed:
+  - filename.tsx: exactly what you added/changed/removed in this specific file (be concrete — name the element, function, behavior)
+  - other-file.tsx: exactly what changed here
+  Works: [what the user can now do, from the user's perspective]
+  Note: [any important caveats, or omit this line if none]
+
+  RULES for Changed:
+  - One bullet per file you actually output. Write "Changed:\n- none" if no files changed.
+  - Each bullet MUST be specific: "added dark mode toggle to header navbar" not "updated component"
+  - Bad: "- App.tsx: updated"   Good: "- App.tsx: added collapsible sidebar with toggle button in top-left"
+  - This block MUST appear after the last code block — never before it, never omitted.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📋 INTERNAL ENGINEERING PROCESS (execute silently before writing any code)
@@ -295,7 +302,8 @@ Every file belongs to exactly one layer. Cross-layer leakage = rejected file.
 FRONTEND files (.tsx / .ts under src/) MAY contain:
   ✅ UI components, rendering logic, event handlers
   ✅ Client-side state (useState, useReducer, context)
-  ✅ Safe data calls via window.db
+  ✅ Static data arrays exported from data.ts (DEFAULT — always use this unless Supabase mode)
+  ✅ Safe data calls via window.db (ONLY in Supabase mode — do NOT use if no DATABASE section appears below)
 
 FRONTEND files MUST NEVER contain:
   ❌ Raw SQL, DDL, migrations, schema definitions
@@ -361,11 +369,24 @@ Exception: Only use real auth (window.db.auth.*) when user explicitly asks for l
 
 【RULE 4 — FORBIDDEN PATTERNS】
    ❌ React Router / routing libs → use useState for page navigation
-   ❌ fetch / axios / HTTP calls → use static data arrays in data.ts
+   ❌ fetch / axios / HTTP calls → NON-SUPABASE: use static data arrays in data.ts. SUPABASE: use window.db + initialize useState with SEED data (not []).
    ❌ localStorage / sessionStorage → use useState
    ❌ require() / module.exports → CRASH: "exports is not defined"
-   ❌ npm packages (lucide-react, recharts, framer-motion, etc.)
+   ❌ npm packages NOT listed below — they crash (axios, lodash, @mui, antd, zustand, etc.)
+   ✅ lucide-react — PRE-LOADED. Use freely: import { Home, Settings, User } from 'lucide-react'
+   ✅ recharts — PRE-LOADED. Use freely: import { BarChart, LineChart, PieChart, ... } from 'recharts'
+   ✅ framer-motion — PRE-LOADED (animations pass-through). Use motion.div, AnimatePresence freely
+   ❌ gen_random_uuid() / uuid_generate_v4() — PostgreSQL functions, NOT JavaScript → use crypto.randomUUID()
+   ❌ NUMERIC(x) / INTEGER(x) / VARCHAR(x) / DECIMAL(x) / TEXT(x) etc. — PostgreSQL type casts, NOT JS functions → just use the raw value: 10.5 not NUMERIC(10.5)
    ❌ class decorators, process.env, const enum, namespace
+   DATE / TIMESTAMP RULES — these patterns cause instant crashes in the sandbox:
+   ❌ new toISOString()          → "Unexpected identifier 'toISOString'" parse error (LOOPS FOREVER)
+   ❌ Date.now().toISOString()   → Date.now() returns a NUMBER, not a Date — .toISOString() crashes
+   ❌ new Date.toISOString()     → missing () after Date — "not a constructor" crash
+   ✅ new Date().toISOString()   → ALWAYS use this. Note the () after Date — required.
+   ✅ someDate.toISOString()     → only when someDate is already a Date object (e.g. from new Date())
+   ✅ new Date(isoString)        → parse an ISO string into a Date object
+   ✅ Date.now()                 → milliseconds since epoch (number) — NOT a Date, cannot call .toISOString() on it
    ❌ Top-level async / await outside useEffect or handlers
       ✅ CORRECT: useEffect(() => { const load = async () => { const res = await ...; }; load(); }, [])
       ❌ WRONG:   const data = await fetch(...)  ← top-level await crashes in sandbox eval
@@ -398,18 +419,82 @@ Exception: Only use real auth (window.db.auth.*) when user explicitly asks for l
       — always provide defaults for every prop that could crash if absent
 
 SAFE DATA PATTERN for Supabase projects (use this EXACT pattern, no variations):
-   const [items, setItems] = useState<ItemType[]>([]);  // [] not null
+   // ⚠️ CRITICAL: ALWAYS declare SEED data and initialize state with it.
+   // The preview sandbox has NO authenticated session → window.db.insert() is BLOCKED by RLS.
+   // NEVER rely on seeding the DB at runtime — it will silently fail.
+   // NEVER initialize state as [] and expect the DB to populate it — DB may be empty or blocked.
+   // ALWAYS pre-populate state with realistic demo data so the app renders useful content immediately.
+   const SEED_ITEMS: ItemType[] = [
+     { id: '1', /* all required fields with realistic values matching the app domain */ },
+     { id: '2', /* second realistic item */ },
+     // ... 5-10 items matching the real schema
+   ];
+   const [items, setItems] = useState<ItemType[]>(SEED_ITEMS);  // ← SEED not [] — always populated
    const [loading, setLoading] = useState(true);
-   useEffect(() => {
-     window.db.from('tablename').select('*').then(({ data }) => {
-       setItems(data ?? []);  // ?? [] guards against null result
-       setLoading(false);
-     });
-   }, []);
-   // In JSX: {loading ? <Spinner /> : items.map(item => ...)}
+   const [dbError, setDbError] = useState<string | null>(null);  // always include error state
+   const fetchItems = async () => {
+     setLoading(true);
+     const { data, error } = await window.db.from('tablename').select('*').order('created_at', { ascending: false });
+     if (error) { setDbError('Failed to load: ' + error.message); setLoading(false); return; }
+     if (data && data.length > 0) setItems(data);  // ← only replace seed if DB has real rows
+     // If DB empty or blocked → SEED stays → app still renders with demo content
+     setDbError(null);
+     setLoading(false);
+   };
+   useEffect(() => { fetchItems(); }, []);
+   // In JSX — ALWAYS show error state and loading state:
+   // {dbError && <div className="text-red-400 bg-red-950/40 border border-red-800/40 rounded-lg p-3 mb-4 text-sm">{dbError}</div>}
+   // {loading ? <div className="flex items-center justify-center py-12"><div className="animate-spin w-6 h-6 border-2 border-indigo-500 border-t-transparent rounded-full" /></div> : items.map(item => ...)}
 
-SAFE DATA PATTERN for localStorage/static apps (preferred — no async issues):
-   // In data.ts — ALL data as static arrays, no async, no Supabase calls
+🔴 SUPABASE CRUD RULES — ALL mutations MUST follow these patterns EXACTLY:
+
+❌ FORBIDDEN — optimistic updates (the #1 cause of "changes don't persist"):
+   const handleDelete = (id) => {
+     setItems(prev => prev.filter(i => i.id !== id));  // ← UI updates but DB is NOT called
+     window.db.from('items').delete().eq('id', id);     // ← not awaited, error ignored
+   }
+
+✅ REQUIRED — DB-first pattern (always await, always check error, always re-fetch):
+   // INSERT
+   const handleCreate = async (formData: NewItem) => {
+     setSaving(true);
+     setDbError(null);
+     const { error } = await window.db.from('items').insert(formData);
+     if (error) { setDbError('Failed to save: ' + error.message); setSaving(false); return; }
+     await fetchItems();  // re-fetch from DB — UI reflects actual DB state
+     setSaving(false);
+     setShowForm(false);
+   };
+
+   // UPDATE
+   const handleUpdate = async (id: string, updates: Partial<Item>) => {
+     setSaving(true);
+     setDbError(null);
+     const { error } = await window.db.from('items').update(updates).eq('id', id);
+     if (error) { setDbError('Failed to update: ' + error.message); setSaving(false); return; }
+     await fetchItems();  // re-fetch confirms the change actually persisted
+     setSaving(false);
+   };
+
+   // DELETE
+   const handleDelete = async (id: string) => {
+     setDbError(null);
+     const { error } = await window.db.from('items').delete().eq('id', id);
+     if (error) { setDbError('Failed to delete: ' + error.message); return; }
+     await fetchItems();  // re-fetch — never remove from state manually
+   };
+
+MUTATION RULES (non-negotiable):
+   • ALWAYS use async/await on every window.db write call — never fire-and-forget
+   • ALWAYS check the error returned — show it via setDbError(), NEVER silently ignore it
+   • ALWAYS call fetchItems() (or equivalent) AFTER every successful mutation
+   • NEVER update local state directly (setItems) for create/update/delete — always re-fetch
+   • ALWAYS show a loading/saving state while the DB call is in progress
+   • ALWAYS display dbError in the JSX — user MUST see when a DB operation fails
+   • Reason: optimistic updates make the UI LIE — the user sees success but DB was never updated
+
+SAFE DATA PATTERN for localStorage/static apps (DEFAULT — use this unless DATABASE section appears below):
+   // In data.ts — ALL data as static arrays, no async, no window.db
    export const TICKETS: Ticket[] = [{ id: '1', ... }, { id: '2', ... }];
    // In component — use the static array directly, zero crash risk
 
@@ -425,14 +510,18 @@ SAFE DATA PATTERN for localStorage/static apps (preferred — no async issues):
 
 【RULE 7 — SANDBOX COMPLEXITY LIMIT】
 The sandbox evaluates all files as a single merged script. Complex patterns break it:
-   ❌ SQL/RPC function calls via schema variable: p_xxxx.myFunction() — only .from()/.auth()/.storage()/.rpc() exist
+   ❌ SQL/RPC function calls via schema variable: p_xxxx.myFunction() — BANNED
+   ❌ window.db.rpc() — BANNED. PostgreSQL functions don't exist in the user's Supabase project. Use window.db.from() for ALL data operations.
    ❌ Deep async chains: Promise.all, concurrent fetches, race conditions — use simple sequential useEffect
    ❌ Dynamic imports: import() — not supported in sandbox
    ❌ Web Workers, IndexedDB, Broadcast Channel — not available
    ❌ Complex class hierarchies, decorators, abstract classes — TypeScript erases them wrong
-   ✅ Supabase RPC calls: window.db.rpc('function_name', { param: value }) — NOT schema.function_name()
+   ✅ Use ONLY window.db.from('tableName').select/insert/update/delete for all Supabase data access
    ✅ Keep each component under 100 lines — smaller is more reliable
-   ✅ If in doubt: use a static data array instead of async Supabase call
+   ✅ In Supabase mode: ALWAYS initialize useState with inline SEED data (not []). DB fetch replaces seed only when rows exist.
+   ❌ In Supabase mode: NEVER initialize state as useState([]) and expect DB to populate it — DB may be empty or RLS-blocked.
+   ❌ In Supabase mode: NEVER use window.db.insert() to seed demo data at runtime — RLS blocks anonymous inserts silently.
+   ❌ NON-SUPABASE MODE ONLY: use a static data array in data.ts exported as a constant.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🎨 PHASE 5 — UI QUALITY STANDARDS
@@ -729,10 +818,17 @@ CRASH PREVENTION:
   □ window.db used everywhere — no bare db., supabase., or createClient imports
   □ No auth calls (getUser, getSession, onAuthStateChange) unless user asked for auth
   □ All useState initialized safely: [] for arrays, {} for objects, never null or undefined
+  □ Every window.db write (insert/update/delete) is awaited AND error-checked — no fire-and-forget
+  □ After every successful mutation, fetchItems() (or equivalent) is called to re-sync from DB
+  □ No optimistic setItems/setState for mutations — UI must reflect actual DB state, not guesses
+  □ (SUPABASE MODE) useState initialized with SEED_ITEMS (never []) — matching INSERT rows in schema.sql for every main table. fetchItems() replaces seed with real DB rows.
   □ Optional chaining on all prop/state access: user?.name ?? 'Unknown'
   □ No top-level async, no require(), no npm packages
   □ No two components with the same export name
   □ No reserved React global names used as local variables (Fragment, memo, Children, etc.)
+  □ All Date usage correct: new Date().toISOString() ✅ | new toISOString() ❌ | Date.now().toISOString() ❌ | new Date.toISOString() ❌
+  □ All UUID generation uses crypto.randomUUID() — NOT gen_random_uuid() or uuid_generate_v4() (those are SQL only)
+  □ No Supabase createClient import — window.db is pre-loaded, no import needed
 
 MODIFICATION INTEGRITY (feature_add / bug_fix only — skip for new_app/redesign):
   □ Did NOT change any CSS classes, colors, spacing, or visual layout beyond what was requested
@@ -779,7 +875,7 @@ UI COMPLETENESS:
   □ Empty states: shown when lists are empty
   □ Error states: shown when operations fail
   □ Language tag + space + filename on every code fence: \`\`\`tsx App.tsx
-  NOTE: Keep apps SIMPLE enough to work in the sandbox. No charting libraries, no sparklines, no external packages. Use clean cards, tables, and lists instead.
+  NOTE: lucide-react icons and recharts charts are PRE-LOADED — use them freely. Avoid other external packages.
 
 OUTPUT FORMAT:
   □ Start with the intent sentence
@@ -791,17 +887,27 @@ OUTPUT FORMAT:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 FEATURE ADD / MODIFICATION — surgical precision:
-  • Output ONLY the file(s) that must change. Every file you output REPLACES the existing version.
-  • Re-outputting App.tsx with simplified code DESTROYS the current App.tsx — DO NOT simplify it.
-  • Re-outputting a component with different styling DESTROYS its visual design — preserve every className.
-  • One change touches one file → output one file. No extras.
-  ① Read the request — EXACTLY what was asked? Nothing more, nothing less.
-  ② Identify the MINIMUM file(s) that must change.
-  ③ In those files: keep ALL existing structure, styles, variable names, and logic untouched.
-     Only insert/modify the exact lines required by the request.
-  ④ Output ONLY those files, complete and correct.
-  ⑤ Leave everything else untouched.
+  ⚠️ CRITICAL: You are modifying an EXISTING app. This is NOT a new build.
+  The user's current working app must be preserved exactly. You are only adding/changing ONE specific thing.
 
+  OUTPUT RULES (non-negotiable):
+  • Output ONLY the exact file(s) that contain your new/changed lines. That is usually 1-2 files.
+  • If you output a file, it COMPLETELY REPLACES the user's version — you must include ALL their existing code in it.
+  • Re-outputting App.tsx with simplified code DESTROYS all their existing screens — DO NOT simplify it.
+  • Re-outputting a component with different styling DESTROYS its visual design — preserve every className.
+  • Files you do NOT output are preserved automatically and silently.
+
+  ASK YOURSELF BEFORE OUTPUTTING EACH FILE:
+  "Did I actually change a line in this file for this specific request?"
+  If NO → do not output it. If YES → output it complete.
+
+  PROCESS:
+  ① Read the request — identify EXACTLY what needs to change. Nothing more.
+  ② Name the MINIMUM files that require changes (usually 1-2).
+  ③ Edit only those files, touching only the lines needed. Keep all other code identical.
+  ④ Output only those changed files, complete and correct.
+
+  🚫 NEVER output all files for a small request — that overwrites the entire app.
   🚫 NEVER change visual appearance as a side effect of adding a feature.
   🚫 NEVER "improve" or "clean up" code while making a change — do ONLY what was asked.
   🚫 NEVER simplify or reduce existing code when re-outputting a file.
@@ -929,25 +1035,51 @@ ${existingSchema}
 \`\`\`
 ➡️  When adding new tables, ADD them to this file using the SAME schema "${projectId}".
 ➡️  Keep all existing tables intact. Only append new CREATE TABLE IF NOT EXISTS blocks.`
-      : `REQUIRED — generate a schema.sql file using the project schema "${projectId}":
+      : `REQUIRED — generate a COMPLETE schema.sql file for this specific application.
+
+🚨 DO NOT USE PLACEHOLDER NAMES — "tableName" is FORBIDDEN. Use REAL table names based on what the app actually needs (e.g., "products", "orders", "tasks", "posts", "users", etc.).
+
+Your schema.sql MUST contain:
+  1. CREATE SCHEMA + GRANT (already shown)
+  2. ALL tables the app queries via window.db — EVERY table used in code MUST exist here
+  3. ALL columns the code accesses — no missing columns
+  4. RLS + GRANT for EVERY table
+  5. 3–5 realistic INSERT seed rows per main table (ON CONFLICT (id) DO NOTHING)
+
 \`\`\`sql schema.sql
 -- Project schema: ${projectId}
--- This schema is automatically created and tables are queryable via window.db
-
 CREATE SCHEMA IF NOT EXISTS "${projectId}";
 GRANT USAGE ON SCHEMA "${projectId}" TO anon, authenticated;
 
-CREATE TABLE IF NOT EXISTS "${projectId}".tableName (
+-- ⬇ REPLACE THE BLOCK BELOW with the ACTUAL tables for this app ⬇
+-- Example for a products/e-commerce app — use YOUR app's real table names:
+
+CREATE TABLE IF NOT EXISTS "${projectId}".products (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  -- add your columns here
+  name TEXT NOT NULL,
+  description TEXT,
+  price DECIMAL(10,2) NOT NULL DEFAULT 0,
+  category TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-ALTER TABLE "${projectId}".tableName ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Enable all access" ON "${projectId}".tableName FOR ALL USING (true);
-GRANT ALL ON "${projectId}".tableName TO anon, authenticated;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA "${projectId}" TO anon, authenticated;
-\`\`\``;
+ALTER TABLE "${projectId}".products ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Enable all access" ON "${projectId}".products FOR ALL USING (true) WITH CHECK (true);
+GRANT ALL ON "${projectId}".products TO anon, authenticated;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA "${projectId}" TO anon, authenticated;
+
+INSERT INTO "${projectId}".products (id, name, description, price, category, status, created_at) VALUES
+  ('aaaaaaaa-0000-0000-0000-000000000001', 'Example Product 1', 'A great product', 29.99, 'Electronics', 'active', NOW()),
+  ('aaaaaaaa-0000-0000-0000-000000000002', 'Example Product 2', 'Another product', 49.99, 'Clothing', 'active', NOW()),
+  ('aaaaaaaa-0000-0000-0000-000000000003', 'Example Product 3', 'A third product', 9.99, 'Books', 'active', NOW())
+ON CONFLICT (id) DO NOTHING;
+
+-- ADD ALL OTHER TABLES THE APP NEEDS (orders, categories, users, etc.)
+\`\`\`
+
+⚠️  The example above uses "products" — REPLACE IT with your app's actual tables and columns.
+⚠️  Every window.db.from('tableName') call in the code MUST have a matching CREATE TABLE above.`;
 
     return `
 ━━━ DATABASE & FILE STORAGE (Supabase) ━━━
@@ -994,13 +1126,43 @@ DATABASE:
 FILE UPLOADS:
   const url = await window.uploadFile(file)  // returns a public URL instantly
 
-✅ window.db for ALL data — real database, not in-memory arrays or state
+🌱 SEED DATA — REQUIRED (critical for CRUD to work on first build)
+
+The app MUST have data visible the moment it renders. Achieve this with TWO layers:
+
+LAYER 1 — schema.sql seed rows (runs once when schema is applied, persists in DB):
+  INSERT INTO "${projectId}".tableName (id, col1, col2, created_at) VALUES
+    ('aaaaaaaa-0000-0000-0000-000000000001', 'Realistic value 1', 'active', NOW()),
+    ('aaaaaaaa-0000-0000-0000-000000000002', 'Realistic value 2', 'pending', NOW()),
+    ('aaaaaaaa-0000-0000-0000-000000000003', 'Realistic value 3', 'completed', NOW())
+  ON CONFLICT (id) DO NOTHING;
+  → 3–5 rows per main table. Use realistic domain-specific content. Fixed UUIDs (aaaaaaaa-... pattern).
+
+LAYER 2 — useState seed (same data, for immediate render before DB responds):
+  const SEED_ITEMS: ItemType[] = [
+    { id: 'aaaaaaaa-0000-0000-0000-000000000001', col1: 'Realistic value 1', col2: 'active', created_at: new Date().toISOString() },
+    { id: 'aaaaaaaa-0000-0000-0000-000000000002', col1: 'Realistic value 2', col2: 'pending', created_at: new Date().toISOString() },
+    { id: 'aaaaaaaa-0000-0000-0000-000000000003', col1: 'Realistic value 3', col2: 'completed', created_at: new Date().toISOString() },
+  ];
+  const [items, setItems] = useState<ItemType[]>(SEED_ITEMS); // ← NEVER []
+  ...
+  const fetchItems = async () => {
+    const { data, error } = await window.db.from('tableName').select('*').order('created_at', { ascending: false });
+    if (error) { setDbError(error.message); return; }
+    if (data && data.length > 0) setItems(data); // replaces seed with real DB rows
+    // if DB has 0 rows, seed stays — app never appears broken
+  };
+
+This pattern guarantees: app renders immediately with content + DB has real data for CRUD + fetchItems replaces seed with live DB data.
+
+✅ window.db for ALL mutations and reads — real database
 ✅ window.uploadFile for file uploads — returns a public URL instantly
 ✅ Always generate/update schema.sql with new tables when adding features
+✅ Initialize useState with SEED_ITEMS (never []) — fetchItems() replaces with real DB rows
+✅ Include INSERT seed rows in schema.sql for every main table (ON CONFLICT (id) DO NOTHING)
 ✅ Handle loading states, errors, and fetch data on component mount
-✅ Use UUIDs for IDs: crypto.randomUUID() or let Supabase generate them
 ❌ Do NOT import supabase — window.db is already available globally
-❌ Do NOT use static data arrays or useState for data that needs to persist
+❌ NEVER initialize list state as []: const [items, setItems] = useState([]) — empty on first render
 ❌ NEVER use localStorage or sessionStorage under ANY circumstance in this project
 
 ${schemaBlock}
@@ -1027,23 +1189,30 @@ This is a Supabase project. The following rules are MANDATORY and NON-NEGOTIABLE
 
 2. AUTHENTICATION COMPLETENESS (when auth is included):
    - ALWAYS include a profiles table for user metadata.
-   - ALWAYS use auth.uid() in RLS policies for user-owned data, NOT "USING (true)".
-   - COMPLETE auth flow: sign up, sign in, sign out, session restore, loading state.
-   - INCLUDE email confirmation handling and proper error messages.
-   - RLS pattern for user-owned rows:
-     CREATE POLICY "Users manage own data" ON "${projectId}".tableName
-       FOR ALL USING (auth.uid() = user_id);
+   - 🚨 CRITICAL RLS RULE: ALWAYS use "USING (true)" in ALL RLS policies — NEVER use auth.uid().
+     The sandbox preview uses an anon JWT key with NO real user session. auth.uid() returns NULL
+     for every anon request, which silently blocks ALL SELECT/INSERT/UPDATE/DELETE operations.
+     Using auth.uid() = BROKEN PREVIEW. Using USING (true) = WORKING PREVIEW.
+   - 🚨 EMAIL CONFIRMATION IS DISABLED on this platform — NEVER add email confirmation handling.
+     signUp() immediately returns a valid session (user is logged in right away).
+     NEVER show "check your email", "confirm your email", or any email verification UI.
+     NEVER call signUp() and then wait for a confirmation step — treat signUp as instant login.
+     After a successful signUp, the user is immediately authenticated. Handle it exactly like signIn.
+   - COMPLETE auth flow: sign up (= instant login), sign in, sign out, session restore, loading state.
+   - RLS pattern for ALL tables (sandbox-safe):
+     CREATE POLICY "Enable all access" ON "${projectId}".tableName
+       FOR ALL USING (true) WITH CHECK (true);
    - Profiles table template:
      CREATE TABLE IF NOT EXISTS "${projectId}".profiles (
-       id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
        email TEXT,
        full_name TEXT,
        avatar_url TEXT,
        created_at TIMESTAMPTZ DEFAULT NOW()
      );
      ALTER TABLE "${projectId}".profiles ENABLE ROW LEVEL SECURITY;
-     CREATE POLICY "Users manage own profile" ON "${projectId}".profiles
-       FOR ALL USING (auth.uid() = id);
+     CREATE POLICY "Enable all access" ON "${projectId}".profiles
+       FOR ALL USING (true) WITH CHECK (true);
      GRANT ALL ON "${projectId}".profiles TO anon, authenticated;
 
 3. NO MISSING FILES:
@@ -1063,9 +1232,22 @@ This is a Supabase project. The following rules are MANDATORY and NON-NEGOTIABLE
 5. GRANT PERMISSIONS (required in schema.sql for every table):
    ALTER TABLE "${projectId}".tableName ENABLE ROW LEVEL SECURITY;
    GRANT ALL ON "${projectId}".tableName TO anon, authenticated;
-   GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA "${projectId}" TO anon, authenticated;
+   GRANT ALL ON ALL SEQUENCES IN SCHEMA "${projectId}" TO anon, authenticated;
 
-A Supabase project that is missing tables, missing files, missing auth, or has non-functional CRUD is REJECTED.
+6. DEMO SEED DATA (required — every main table MUST have data on first render):
+   - Add 3–5 INSERT rows per main table in schema.sql, after the CREATE TABLE block.
+   - Use realistic domain-specific values — NOT "Item 1", "Test", "Lorem ipsum".
+   - Use fixed UUIDs with the aaaaaaaa-0000-... pattern for easy matching in useState.
+   - Always use ON CONFLICT (id) DO NOTHING for idempotency (safe to apply repeatedly).
+   - The same IDs MUST appear in both schema.sql INSERTs AND useState SEED_ITEMS in .tsx files.
+   - Example for a tasks app:
+     INSERT INTO "${projectId}".tasks (id, title, description, status, priority, created_at) VALUES
+       ('aaaaaaaa-0000-0000-0000-000000000001', 'Design new onboarding flow', 'Create wireframes for step-by-step user signup', 'in_progress', 'high', NOW()),
+       ('aaaaaaaa-0000-0000-0000-000000000002', 'Fix search result ranking', 'Relevance scores inconsistent with expected order', 'todo', 'medium', NOW()),
+       ('aaaaaaaa-0000-0000-0000-000000000003', 'Add CSV export to reports', 'Finance team needs monthly data in spreadsheet format', 'todo', 'low', NOW())
+     ON CONFLICT (id) DO NOTHING;
+
+A Supabase project that is missing tables, missing seed data, missing files, missing auth, or has non-functional CRUD is REJECTED.
 `;
   }
 
@@ -1179,6 +1361,10 @@ function validateGeneratedFiles(files) {
     if (/(?<![.\w])supabase\.(from|auth|storage|rpc|channel|functions)\s*\(/.test(content)) {
       fileErrors.push(`BANNED: 'supabase.from(...)' is not defined. Use 'window.db.from(...)' — window.db is the only valid global.`);
     }
+    // window.db.rpc() — calls PostgreSQL functions that don't exist in the user's project
+    if (/window\.db\.rpc\s*\(/.test(content)) {
+      fileErrors.push(`BANNED: window.db.rpc() calls PostgreSQL functions that don't exist. Use window.db.from('tableName').select/insert/update/delete for all data operations.`);
+    }
     if (/\b(?:const|let|var)\s+(?:db|supabase)\s*=/.test(content)) {
       fileErrors.push(`BANNED: 'const db = ...' or 'const supabase = ...' creates a local variable that shadows nothing useful. Use window.db directly — no local alias needed.`);
     }
@@ -1198,8 +1384,9 @@ function validateGeneratedFiles(files) {
       fileErrors.push(`BANNED: fetch() HTTP calls are not available in the sandbox. Use static mock data arrays in data.ts, or window.db for Supabase projects.`);
     }
     // External package imports that will crash after import stripping
-    if (/from\s+['"](?:lucide-react|framer-motion|recharts|@headlessui|@heroicons|react-icons|axios|lodash|date-fns|moment|@mui|antd|@radix-ui|@tanstack\/react-query|zustand|react-hook-form)['"]/.test(content)) {
-      fileErrors.push(`BANNED IMPORT: External npm packages are not available in the sandbox. Use plain Tailwind CSS, React built-ins, and SVG icons instead.`);
+    // NOTE: lucide-react, recharts, and framer-motion are pre-loaded in the sandbox — do NOT ban them
+    if (/from\s+['"](?:@headlessui|@heroicons|react-icons|axios|lodash|date-fns|moment|@mui|antd|@radix-ui|@tanstack\/react-query|zustand|react-hook-form)['"]/.test(content)) {
+      fileErrors.push(`BANNED IMPORT: External npm packages are not available in the sandbox. Use lucide-react for icons (pre-loaded), recharts for charts (pre-loaded), and plain Tailwind CSS for everything else.`);
     }
     // Supabase auth subscriptions — async and crash in sandbox
     if (/window\.db\.auth\.onAuthStateChange/.test(content)) {
@@ -1302,8 +1489,9 @@ function applyProgrammaticFixes(files) {
     if (c6 !== c) { applied.push('fixed useState(null) → useState([]) for array-named state'); c = c6; }
 
     // 7. Remove imports of banned external packages (they crash after import stripping)
+    // NOTE: lucide-react, recharts, and framer-motion are pre-loaded in the sandbox — do NOT strip them
     // Keeps React/ReactDOM imports in case AI writes them (they're stripped but harmless)
-    const bannedPkgs = /^[^\n]*import[^'"]*from\s+['"](?:lucide-react|framer-motion|recharts|@headlessui|@heroicons|react-icons|react-router|react-router-dom|axios|lodash|date-fns|moment|clsx|classnames|tailwind-merge|@radix-ui|@tanstack|react-query|zustand|jotai|immer|zod|yup|react-hook-form|@mui|antd|chakra-ui|@chakra-ui)['"]\s*;?\n?/gm;
+    const bannedPkgs = /^[^\n]*import[^'"]*from\s+['"](?:@headlessui|@heroicons|react-icons|react-router|react-router-dom|axios|lodash|date-fns|moment|clsx|classnames|tailwind-merge|@radix-ui|@tanstack|react-query|zustand|jotai|immer|zod|yup|react-hook-form|@mui|antd|chakra-ui|@chakra-ui)['"]\s*;?\n?/gm;
     const c7 = c.replace(bannedPkgs, '');
     if (c7 !== c) { applied.push('removed banned external package import(s)'); c = c7; }
 
@@ -1316,6 +1504,11 @@ function applyProgrammaticFixes(files) {
     // 9. Remove Supabase onAuthStateChange subscriptions — async auth crashes sandbox
     const c9 = c.replace(/window\.db\.auth\.onAuthStateChange\s*\([^)]*\)\s*;?/g, '/* onAuthStateChange removed */');
     if (c9 !== c) { applied.push('removed onAuthStateChange subscription'); c = c9; }
+
+    // 9b. Replace window.db.rpc(...) with empty-result stub — RPC functions don't exist
+    // Pattern: window.db.rpc('fn_name', params) → Promise.resolve({ data: [], error: null })
+    const c9b = c.replace(/window\.db\.rpc\s*\([^)]*\)/g, 'Promise.resolve({ data: [], error: null })');
+    if (c9b !== c) { applied.push('replaced window.db.rpc() with empty stub'); c = c9b; }
 
     // 10. Fix useState() with no initializer → useState(null)
     // Missing initializer gives undefined, which crashes on .map()/.filter()/.length
@@ -1409,6 +1602,28 @@ function applyProgrammaticFixes(files) {
     );
     if (c20 !== c) { applied.push('removed document.documentElement.classList (not supported — use conditional className)'); c = c20; }
 
+    // 21. Replace PostgreSQL gen_random_uuid() / uuid_generate_v4() with crypto.randomUUID()
+    // AI often uses these SQL functions in frontend JS for generating IDs in mock data.
+    // They don't exist in browsers — replace with the correct Web Crypto API equivalent.
+    const c21 = c
+      .replace(/\bgen_random_uuid\s*\(\s*\)/g, '(crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2))')
+      .replace(/\buuid_generate_v4\s*\(\s*\)/g, '(crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2))');
+    if (c21 !== c) { applied.push('replaced gen_random_uuid()/uuid_generate_v4() with crypto.randomUUID()'); c = c21; }
+
+    // 22. Remove SQL type cast calls — AI writes NUMERIC(10.5), VARCHAR('text'), INTEGER(3) in JS.
+    // These are PostgreSQL type constructors that don't exist in JavaScript.
+    // Replacement: strip the cast wrapper and keep only the inner value.
+    const SQL_TYPE_CASTS = /\b(NUMERIC|DECIMAL|FLOAT|REAL|DOUBLE_PRECISION|INTEGER|INT|SMALLINT|VARCHAR|TEXT|NVARCHAR|CHAR|BOOLEAN|BOOL|BIGINT|DATE|TIMESTAMP|TIMESTAMPTZ)\s*\(([^)]*)\)/g;
+    const c22 = c.replace(SQL_TYPE_CASTS, '$2');
+    if (c22 !== c) { applied.push('removed SQL type cast wrappers (NUMERIC/VARCHAR/INTEGER/etc.)'); c = c22; }
+
+    // 23. Remove bare SQL keywords used as TypeScript types that slip into JS expressions
+    // e.g. `const x: NUMERIC = 5` → TS compiler strips the annotation BUT if someone wrote
+    // `NUMERIC` as a standalone expression it will crash. Convert to no-op comments.
+    const SQL_TYPE_IDENTS = /\b(NUMERIC|DECIMAL|FLOAT|REAL|INTEGER|INT|SMALLINT|VARCHAR|TEXT|BOOLEAN|BIGINT)\s*(?=[;,\)\}])/g;
+    const c23 = c.replace(SQL_TYPE_IDENTS, '/* $1 */');
+    if (c23 !== c) { applied.push('commented out bare SQL type identifiers used as expressions'); c = c23; }
+
     if (applied.length > 0) fixes.push({ file: filename, applied });
     result[filename] = c;
   }
@@ -1439,6 +1654,28 @@ const MAX_TOKENS_BY_TYPE = {
   bug_fix:     10000,
 };
 
+const CHANGE_PLANNER_PROMPT = `You are a senior engineer reviewing a change request for an existing React app.
+Read the user's request carefully and output a JSON plan that precisely summarizes what will be done.
+
+Rules:
+- title: 2-5 words naming the specific change (e.g. "Add Drag-and-Drop Builder", "Fix Login Bug", "Dark Mode Toggle")
+- description: one sentence starting with "I'll" that references the specific feature, component, or fix from the request — be concrete, not generic
+- firstBuildScope: 2-5 bullet points of specific actions, naming actual files, components, or features from the request
+- requestType: "feature_add" for new features/UI changes, "bug_fix" for error fixes
+- deferredScope, pages, components: always leave as empty arrays []
+
+Output ONLY valid JSON with no other text, no code fences, no markdown:
+
+{
+  "title": "short specific title",
+  "description": "I'll add/fix/update [specific thing] to [specific place/purpose]",
+  "requestType": "feature_add",
+  "firstBuildScope": ["specific action 1", "specific action 2", "specific action 3"],
+  "deferredScope": [],
+  "pages": [],
+  "components": []
+}`;
+
 const PLANNER_PROMPT = `You are a senior product architect applying a strict scope-reduction policy.
 Given a user's React app request, output a concise JSON build plan for the SMALLEST working first version.
 
@@ -1459,8 +1696,8 @@ Output ONLY valid JSON with no other text, no code fences, no markdown.
   "requestType": "new_app",
   "firstBuildScope": ["list of features included in this first build — be specific"],
   "deferredScope": ["list of features NOT in this build — auth, payments, admin, etc."],
-  "pages": ["only pages needed for core flow, max 4"],
-  "components": ["only components those pages actually need"],
+  "pages": ["short PascalCase names only — e.g. Dashboard, Tasks, Settings, Reports — NO spaces, NO parentheses, NO descriptions, max 4"],
+  "components": ["short PascalCase names only — e.g. TaskCard, Sidebar, DataTable — NO spaces, NO parentheses"],
   "dataEntities": ["data types needed for first build only"],
   "designDirection": "clean minimal SaaS, light mode by default with dark mode toggle, indigo accent",
   "acceptanceCriteria": [
@@ -1479,18 +1716,99 @@ function deriveFileManifest(plan) {
   // types.ts → App.tsx → data.ts → components → pages
   // (If App.tsx were last, AI might follow the list order and get truncated before finishing it)
   const files = ['types.ts', 'App.tsx', 'data.ts'];
-  (plan.components || []).forEach(c => files.push(`components/${c}.tsx`));
+  (plan.components || []).forEach(c => {
+    // Strip parenthetical descriptions first, then keep only alphanumeric
+    const clean = c.replace(/\([^)]*\)/g, '').replace(/[^A-Za-z0-9]/g, '');
+    if (clean) files.push(`components/${clean}.tsx`);
+  });
   (plan.pages || []).forEach(p => {
-    const name = p.replace(/\s+/g, '') + 'Page';
-    files.push(`pages/${name}.tsx`);
+    // Strip parenthetical descriptions first, keep only alphanumeric, avoid "PagePage"
+    const clean = p.replace(/\([^)]*\)/g, '').replace(/[^A-Za-z0-9]/g, '').replace(/Page$/i, '');
+    if (clean) files.push(`pages/${clean}Page.tsx`);
   });
   return files;
 }
 
+// ── /api/plan-only — runs just the planner, returns plan JSON ─────────────────
+// Used by the client to show a plan approval card before generation begins.
+
+app.post('/api/plan-only', async (req, res) => {
+  const { messages = [], hasFiles = false, currentFileNames = [] } = req.body;
+  const userMessage = getTextContent(messages[messages.length - 1]) || '';
+  const requestType = classifyRequest(userMessage, hasFiles);
+
+  // website_copy bypasses AI entirely — no plan needed
+  if (requestType === 'website_copy') {
+    return res.json({ requestType, plan: null, shouldApprove: false });
+  }
+
+  const isChange = requestType === 'feature_add' || requestType === 'bug_fix';
+
+  try {
+    let promptText;
+    let maxTokens;
+    if (isChange) {
+      const filesContext = currentFileNames.length > 0
+        ? `Current files: ${currentFileNames.join(', ')}\n\n`
+        : '';
+      promptText = `${CHANGE_PLANNER_PROMPT}\n\n${filesContext}Request: ${userMessage}`;
+      maxTokens = 800;
+    } else {
+      // new_app or redesign — full planner
+      promptText = `${PLANNER_PROMPT}\n\nRequest: ${userMessage}`;
+      maxTokens = 1200;
+    }
+
+    const planMsg = await anthropicClient.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: promptText }],
+    });
+    let planText = planMsg.content[0]?.type === 'text' ? planMsg.content[0].text : '{}';
+    // Strip code fences if model wrapped JSON in them
+    planText = planText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+    // If model added prose before/after JSON, extract the JSON object
+    const jsonMatch = planText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) planText = jsonMatch[0];
+    const plan = JSON.parse(planText);
+    plan.requestType = requestType;
+    if (plan.description) {
+      plan.description = plan.description
+        .replace(/^I built\b/i, "I'll build")
+        .replace(/^I created\b/i, "I'll create")
+        .replace(/^I designed\b/i, "I'll design")
+        .replace(/^I made\b/i, "I'll make")
+        .replace(/^I developed\b/i, "I'll develop")
+        .replace(/^I implemented\b/i, "I'll implement")
+        .replace(/^I added\b/i, "I'll add")
+        .replace(/^I wrote\b/i, "I'll write");
+    }
+    return res.json({ requestType, plan, shouldApprove: true });
+  } catch (err) {
+    console.error('[plan-only] error:', err.message);
+    // For changes, return a fallback plan so the approval card still appears
+    if (isChange) {
+      const fallbackPlan = {
+        title: requestType === 'bug_fix' ? 'Apply Fix' : 'Apply Changes',
+        description: "I'll update the app based on your request.",
+        requestType,
+        firstBuildScope: ['Apply the requested changes'],
+        deferredScope: [],
+        pages: [],
+        components: [],
+      };
+      return res.json({ requestType, plan: fallbackPlan, shouldApprove: true });
+    }
+    return res.status(500).json({ error: err.message, requestType, shouldApprove: false });
+  }
+});
+
 // ── /api/build — multi-model pipeline ────────────────────────────────────────
 
 app.post('/api/build', async (req, res) => {
-  const { messages, hasFiles = false, currentFiles = {}, model: preferredModel, isAutoMode = true, storageMode, projectConfig, apiSecrets = {} } = req.body;
+  const { messages, hasFiles = false, currentFiles = {}, model: preferredModel, isAutoMode = true, storageMode, projectConfig, apiSecrets = {},
+    /** Pre-approved plan from /api/plan-only — skips the planning step if provided */
+    preMadePlan = null } = req.body;
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -1505,47 +1823,60 @@ app.post('/api/build', async (req, res) => {
     const userMessage = getTextContent(messages[messages.length - 1]) || '';
 
     // ── Step 1: Route ─────────────────────────────────────────────────────────
-    const requestType = classifyRequest(userMessage, hasFiles);
+    // If a pre-approved plan is provided, trust its requestType instead of re-classifying.
+    // (approvePlan sends preMadePlan with the requestType from /api/plan-only)
+    const requestType = preMadePlan?.requestType ?? classifyRequest(userMessage, hasFiles);
     send({ stage: 'routing', requestType });
 
     // ── Step 2: Plan (new_app and redesign only) ────────────────────────────────
     let planContext = '';
     if (requestType === 'new_app' || requestType === 'redesign') {
-      send({ stage: 'planning' });
-      try {
-        const planMsg = await anthropicClient.messages.create({
-          model: 'claude-sonnet-4-6',
-          max_tokens: 1200,
-          messages: [
-            { role: 'user', content: `${PLANNER_PROMPT}\n\nRequest: ${userMessage}` },
-          ],
-        });
-        let planText = planMsg.content[0]?.type === 'text' ? planMsg.content[0].text : '{}';
-        // Strip markdown code fences if the model ignores instructions and wraps in ```json ... ```
-        planText = planText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
-        const plan = JSON.parse(planText);
-        plan.requestType = requestType;
-        // Normalize description to future tense (model often returns past tense despite instructions)
-        if (plan.description) {
-          plan.description = plan.description
-            .replace(/^I built\b/i, "I'll build")
-            .replace(/^I created\b/i, "I'll create")
-            .replace(/^I designed\b/i, "I'll design")
-            .replace(/^I made\b/i, "I'll make")
-            .replace(/^I developed\b/i, "I'll develop")
-            .replace(/^I implemented\b/i, "I'll implement")
-            .replace(/^I added\b/i, "I'll add")
-            .replace(/^I wrote\b/i, "I'll write")
-            .replace(/^I constructed\b/i, "I'll construct")
-            .replace(/^I assembled\b/i, "I'll assemble");
-        }
+      let plan;
+      if (preMadePlan) {
+        // Plan was already approved by the user — skip the planner entirely
+        plan = preMadePlan;
         send({ stage: 'plan', plan });
-
-        // Auto-rename project on new app creation
-        if (requestType === 'new_app' && plan.title) {
-          send({ title: plan.title });
+      } else {
+        send({ stage: 'planning' });
+        try {
+          const planMsg = await anthropicClient.messages.create({
+            model: 'claude-sonnet-4-6',
+            max_tokens: 1200,
+            messages: [
+              { role: 'user', content: `${PLANNER_PROMPT}\n\nRequest: ${userMessage}` },
+            ],
+          });
+          let planText = planMsg.content[0]?.type === 'text' ? planMsg.content[0].text : '{}';
+          planText = planText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+          plan = JSON.parse(planText);
+          plan.requestType = requestType;
+          if (plan.description) {
+            plan.description = plan.description
+              .replace(/^I built\b/i, "I'll build")
+              .replace(/^I created\b/i, "I'll create")
+              .replace(/^I designed\b/i, "I'll design")
+              .replace(/^I made\b/i, "I'll make")
+              .replace(/^I developed\b/i, "I'll develop")
+              .replace(/^I implemented\b/i, "I'll implement")
+              .replace(/^I added\b/i, "I'll add")
+              .replace(/^I wrote\b/i, "I'll write")
+              .replace(/^I constructed\b/i, "I'll construct")
+              .replace(/^I assembled\b/i, "I'll assemble");
+          }
+          send({ stage: 'plan', plan });
+        } catch (planErr) {
+          console.error('[build] Planner failed:', planErr.message);
+          send({ stage: 'plan', plan: null });
         }
+      }
+      // Auto-rename project on new app creation
+      if (plan && requestType === 'new_app' && plan.title) {
+        send({ title: plan.title });
+      }
 
+      // Only execute the plan block if we have a valid plan
+      if (plan) {
+        try {
         // Build deferred scope note — tells generator what NOT to build
         const deferredItems = (plan.deferredScope || []);
         const firstBuildItems = (plan.firstBuildScope || []);
@@ -1586,11 +1917,11 @@ app.post('/api/build', async (req, res) => {
           `App.tsx MUST be output SECOND so token truncation never cuts it off.\n` +
           `NEVER skip App.tsx — without it the app cannot render.\n` +
           `NEVER generate files not in this manifest — scope creep causes crashes.`;
-      } catch (planErr) {
-        console.error('[build] Planner failed:', planErr.message);
-        send({ stage: 'plan', plan: null });
-      }
-    }
+        } catch (planContextErr) {
+          console.error('[build] Plan context build failed:', planContextErr.message);
+        }
+      } // end if (plan)
+    } // end if (requestType === 'new_app' || 'redesign')
 
     // ── Step 3: Generate ──────────────────────────────────────────────────────
     const generatorModel = pickGeneratorModel(requestType, preferredModel, isAutoMode);
@@ -1625,31 +1956,37 @@ app.post('/api/build', async (req, res) => {
       const truncatedNames = [];
 
       for (const [name, content] of sorted) {
-        const lang = name.endsWith('.tsx') ? 'tsx' : name.endsWith('.ts') ? 'ts' : name.endsWith('.sql') ? 'sql' : 'txt';
         if (totalChars + content.length > TOTAL_CHAR_BUDGET) {
-          // Budget exhausted — show filename only so AI knows the file exists
           truncatedNames.push(name);
           continue;
         }
-        fileEntries.push(`\`\`\`${lang} ${name}\n${content}\n\`\`\``);
+        // Use a plain-text delimiter format (NOT code blocks) for context files.
+        // Code-block format looks identical to the AI's output format, causing it to
+        // reproduce every file. The <<< >>> delimiter clearly signals "read-only context".
+        fileEntries.push(`<<<FILE: ${name}\n${content}\nFILE_END>>>`);
         totalChars += content.length;
       }
 
-      // If some files didn't fit, list their names so AI doesn't accidentally overwrite them
       const existingFilesList = Object.keys(currentFiles).join(', ');
       const truncationNote = truncatedNames.length > 0
-        ? `\n⚠️ Budget limit reached — the following files exist but are not shown (DO NOT output them unless the user's request specifically requires changing them): ${truncatedNames.join(', ')}`
+        ? `\n⚠️ These files exist but weren't shown (DO NOT output them unless the request requires changing them): ${truncatedNames.join(', ')}`
         : '';
 
+      const fileCount = Object.keys(currentFiles).length;
       const header =
-        `[CURRENT APP FILES — ALL ${Object.keys(currentFiles).length} files shown below in full.\n` +
-        `Complete file list: ${existingFilesList}\n` +
-        `🚨 OUTPUT ONLY FILES THAT ACTUALLY NEED TO CHANGE. Every file you output overwrites the existing version.\n` +
-        `Any file NOT in your response is preserved exactly as-is — you do NOT need to re-output working files.` +
-        truncationNote +
-        `]`;
+        `[CURRENT APP — ${fileCount} files for context]\n` +
+        `All files: ${existingFilesList}\n\n` +
+        `🛑 MODIFICATION RULES — read carefully:\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `• The files below use <<<FILE: name>>> delimiters — they are READ-ONLY CONTEXT.\n` +
+        `• When you output changed files, use the normal code block format: \`\`\`tsx filename.tsx\n` +
+        `• Output ONLY files you actually changed. A typical change = 1-2 files.\n` +
+        `• If you find yourself outputting ALL ${fileCount} files, STOP — you're rebuilding, not modifying.\n` +
+        `• Unchanged files are preserved automatically. Re-outputting them OVERWRITES the user's code.\n` +
+        (truncationNote ? `\n${truncationNote}\n` : '') +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
 
-      filesContext = `\n\n${header}\n${fileEntries.join('\n\n')}\n[/CURRENT APP FILES]`;
+      filesContext = `\n\n${header}\n\n${fileEntries.join('\n\n')}\n[/CURRENT APP]`;
     }
 
     // Inject plan context + file context into the last user message
@@ -1968,16 +2305,21 @@ A response with zero code blocks is a FAILED repair — it changes nothing and w
 
 ABSOLUTE RULES:
 1. Output ONLY the files you actually changed. If a file is unchanged, DO NOT output it.
-2. Make the SMALLEST possible change. Fix only the reported error — do not refactor, redesign, or add features.
-3. Never rewrite an entire file unless the entire file is broken. Patch only the broken lines.
-4. Files labelled "READ-ONLY CONTEXT" — do NOT re-output them unless you changed them.
-5. Do NOT add comments, logs, or explanations inside code.
-6. Do NOT change file names, component names, or project structure.
+2. Typical fix = 1-2 files. If you find yourself outputting 4+ files, STOP — you are over-engineering.
+3. Make the SMALLEST possible change. Fix only the reported error — do not refactor, redesign, or add features.
+4. Never rewrite an entire file unless the entire file is broken. Patch only the broken lines.
+5. [READ-ONLY] files — read them for context, but NEVER include them in your response output.
+6. Do NOT add comments, logs, or explanations inside code.
+7. Do NOT change file names, component names, or project structure.
 
-Required output format (must include at least one code block):
+Required output format (code block first, then Done! summary):
 \`\`\`tsx filename.tsx
 // complete fixed file content here
-\`\`\``;
+\`\`\`
+✅ Done! [1 sentence: what error was fixed]
+Changed:
+- filename.tsx: exactly what line/function was changed and why
+Works: [what the user can now do that was broken before]`;
 
 app.post('/api/chat', async (req, res) => {
   const { messages, model = 'claude-opus-4-6', storageMode, projectConfig, currentFiles = {}, isRepairMode = false } = req.body;
@@ -2230,40 +2572,144 @@ app.post('/api/upload', async (req, res) => {
   }
 });
 
-// ── /api/provision/supabase — register a project (schema via Supabase SQL) ───
+// ── /api/provision/supabase — create project schema and register with PostgREST ───
 
 app.post('/api/provision/supabase', async (req, res) => {
   const { projectId } = req.body;
   if (!projectId) return res.status(400).json({ error: 'projectId required' });
 
-  // Attempt to create schema via Supabase admin REST endpoint
-  // This requires the service role key and a pre-created SQL execution function.
-  // If that's not available, we still return success (schema will be public).
-  try {
-    const response = await fetch(
-      `${SUPABASE_URL}/rest/v1/rpc/create_project_schema`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'apikey': SUPABASE_SERVICE_ROLE_KEY,
-          'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-        },
-        body: JSON.stringify({ schema_name: projectId }),
-      }
-    );
-
-    if (response.ok) {
-      console.log(`[Supabase] Created schema: ${projectId}`);
-    } else {
-      // Function may not exist — that's OK, AI will use public schema
-      console.warn(`[Supabase] Could not create schema (function may not exist): ${await response.text()}`);
-    }
-  } catch (err) {
-    console.warn('[Supabase] Provision warning:', err.message);
+  const dbUrl = process.env.SUPABASE_DB_URL;
+  if (!dbUrl) {
+    console.warn('[provision] SUPABASE_DB_URL not set — skipping schema creation');
+    return res.json({ success: true, projectId, supabaseUrl: SUPABASE_URL, warning: 'SUPABASE_DB_URL not configured' });
   }
 
-  res.json({ success: true, projectId, supabaseUrl: SUPABASE_URL });
+  const client = new PgClient({
+    connectionString: dbUrl,
+    ssl: { rejectUnauthorized: false },
+    connectionTimeoutMillis: 15000,
+  });
+
+  try {
+    await client.connect();
+
+    // Step 1: Create the schema and grant access
+    await client.query(`CREATE SCHEMA IF NOT EXISTS "${projectId}"`);
+    await client.query(`GRANT USAGE ON SCHEMA "${projectId}" TO anon, authenticated`);
+    await client.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA "${projectId}" GRANT ALL ON TABLES TO anon, authenticated`);
+
+    // Verify the schema actually exists before touching PostgREST config.
+    // If CREATE SCHEMA failed silently (e.g. pooler issue), adding it to pgrst.db_schemas
+    // would make PostgREST try to introspect a non-existent schema → PGRST002 (breaks all queries).
+    const { rows: verifyRows } = await client.query(
+      `SELECT schema_name FROM information_schema.schemata WHERE schema_name = $1`, [projectId]
+    );
+    if (verifyRows.length === 0) {
+      await client.end();
+      console.error(`[provision] Schema ${projectId} was not created — aborting pgrst.db_schemas update`);
+      return res.json({ success: false, projectId, error: 'Schema creation failed' });
+    }
+    console.log(`[provision] Created/verified schema: ${projectId}`);
+
+    // Step 2: Read current pgrst.db_schemas from authenticator role config
+    let currentSchemas = ['public'];
+    try {
+      const { rows } = await client.query(`
+        SELECT unnest(COALESCE(rolconfig, ARRAY[]::text[])) AS config
+        FROM pg_roles WHERE rolname = 'authenticator'
+      `);
+      const entry = rows.find(r => r.config && r.config.startsWith('pgrst.db_schemas='));
+      if (entry) {
+        currentSchemas = entry.config.replace('pgrst.db_schemas=', '').split(',').map(s => s.trim()).filter(Boolean);
+      }
+      // Fallback: check pg_db_role_setting (ALTER DATABASE level)
+      if (currentSchemas.length <= 1) {
+        const { rows: settingRows } = await client.query(`
+          SELECT unnest(setconfig) AS cfg
+          FROM pg_db_role_setting
+          WHERE setrole = 0 AND setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+        `).catch(() => ({ rows: [] }));
+        const dbEntry = settingRows.find(r => r.cfg && r.cfg.startsWith('pgrst.db_schemas='));
+        if (dbEntry) {
+          currentSchemas = dbEntry.cfg.replace('pgrst.db_schemas=', '').split(',').map(s => s.trim()).filter(Boolean);
+        }
+      }
+    } catch (e) {
+      console.warn('[provision] Could not read current pgrst.db_schemas:', e.message);
+    }
+
+    // Step 3: Add schema to PostgREST's db_schemas if not already present
+    if (!currentSchemas.includes(projectId)) {
+      const newSchemas = [...currentSchemas, projectId].join(',');
+      // Note: ALTER ROLE/DATABASE SET does NOT support $1 placeholders — must use string interpolation.
+      // newSchemas is safe: built from existing pg_roles config + our own p_xxx project ID.
+      let alterRoleOk = false;
+      try {
+        await client.query(`ALTER ROLE authenticator SET "pgrst.db_schemas" = '${newSchemas}'`);
+        alterRoleOk = true;
+        console.log(`[provision] ALTER ROLE authenticator → pgrst.db_schemas = '${newSchemas}'`);
+      } catch (e) {
+        console.warn('[provision] ALTER ROLE authenticator failed:', e.message);
+      }
+      if (!alterRoleOk) {
+        try {
+          await client.query(`ALTER DATABASE postgres SET "pgrst.db_schemas" = '${newSchemas}'`);
+          console.log(`[provision] ALTER DATABASE postgres → pgrst.db_schemas = '${newSchemas}'`);
+        } catch (e) {
+          console.warn('[provision] ALTER DATABASE also failed:', e.message);
+        }
+      }
+    } else {
+      console.log(`[provision] Schema "${projectId}" already in pgrst.db_schemas`);
+    }
+
+    // Step 4: Notify PostgREST to reload config AND schema cache
+    try {
+      await client.query(`NOTIFY pgrst, 'reload config'`);
+      await client.query(`NOTIFY pgrst, 'reload schema'`);
+      console.log(`[provision] NOTIFY pgrst 'reload config' + 'reload schema' sent`);
+    } catch (e) {
+      console.warn('[provision] NOTIFY pgrst failed:', e.message);
+    }
+
+    await client.end();
+
+    // Step 5: Poll until PostgREST has the schema registered (up to 15s)
+    if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+      const testClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+        db: { schema: projectId },
+        auth: { persistSession: false },
+      });
+      for (let attempt = 0; attempt < 15; attempt++) {
+        await new Promise(r => setTimeout(r, 1000));
+        const { error } = await testClient.from('_schema_check_').select('id').limit(0);
+        // PGRST106 = schema not in list; PGRST002 = cache rebuild in progress (both = not ready)
+        // Any other error (e.g. 42P01 table not found) = schema IS accessible by PostgREST
+        const notReady = error?.code === 'PGRST106'
+          || error?.code === 'PGRST002'
+          || error?.message?.includes('must be one of')
+          || error?.message?.includes('Invalid schema')
+          || error?.message?.includes('schema cache');
+        if (!notReady) {
+          console.log(`[provision] PostgREST ready for schema "${projectId}" (attempt ${attempt + 1})`);
+          break;
+        }
+        if (attempt % 3 === 2) {
+          // Re-send NOTIFY every 3 seconds
+          const renotifyClient = new PgClient({ connectionString: dbUrl, ssl: { rejectUnauthorized: false }, connectionTimeoutMillis: 5000 });
+          await renotifyClient.connect().then(() => renotifyClient.query(`NOTIFY pgrst, 'reload config'`)).then(() => renotifyClient.end()).catch(() => {});
+        }
+        console.log(`[provision] Waiting for PostgREST reload... ${attempt + 1}/15`);
+      }
+    }
+
+    res.json({ success: true, projectId, supabaseUrl: SUPABASE_URL });
+  } catch (err) {
+    await client.end().catch(() => {});
+    console.error('[provision] Error:', err.message);
+    // Still return success so the UI isn't blocked — schema.sql will handle retrying
+    res.json({ success: true, projectId, supabaseUrl: SUPABASE_URL, warning: err.message });
+  }
 });
 
 // ── /api/config — expose public config to frontend ───────────────────────────
@@ -2343,47 +2789,161 @@ app.post('/api/run-schema', async (req, res) => {
   try {
     await client.connect();
 
-    // Run the user's schema SQL
-    await client.query(sql);
+    // ── Auto-fix schema ID mismatch ──────────────────────────────────────────
+    // The AI uses the schema ID from the system prompt (set by StorageSelector).
+    // But if a different code path saved a different schema ID in project_config,
+    // the SQL will reference the wrong schema → tables created in the wrong schema.
+    // Detect and rewrite automatically so all future projects are always consistent.
+    let finalSql = sql;
+    if (projectId) {
+      const schemaInSql = (sql.match(/CREATE\s+SCHEMA\s+IF\s+NOT\s+EXISTS\s+"(p_[0-9a-f]+)"/i) ||
+                           sql.match(/CREATE\s+SCHEMA\s+IF\s+NOT\s+EXISTS\s+(p_[0-9a-f]+)/i))?.[1];
+      if (schemaInSql && schemaInSql !== projectId) {
+        console.log(`[run-schema] Auto-fixing schema ID mismatch: SQL has "${schemaInSql}", project expects "${projectId}" — rewriting`);
+        // Use split+join for exact literal replacement (no regex escaping needed)
+        finalSql = sql.split(schemaInSql).join(projectId);
+      }
+    }
+
+    // Patch the SQL: replace auth.uid()-based RLS policies with USING (true).
+    // The sandbox preview uses an anon key with no real JWT, so auth.uid() returns NULL
+    // and blocks all queries. USING (true) allows anon access, which is required for preview.
+    const patchedSql = finalSql
+      // Replace auth.uid()-based RLS policies with USING (true)
+      .replace(/FOR\s+ALL\s+USING\s*\(\s*auth\.uid\s*\(\s*\)\s*=\s*\w+\s*\)/gi, 'FOR ALL USING (true) WITH CHECK (true)')
+      .replace(/FOR\s+ALL\s+USING\s*\(\s*\w+\s*=\s*auth\.uid\s*\(\s*\)\s*\)/gi, 'FOR ALL USING (true) WITH CHECK (true)')
+      .replace(/USING\s*\(\s*auth\.uid\s*\(\s*\)\s*=\s*\w+\s*\)/gi, 'USING (true)')
+      .replace(/USING\s*\(\s*\w+\s*=\s*auth\.uid\s*\(\s*\)\s*\)/gi, 'USING (true)')
+      // Ensure WITH CHECK (true) is present on all FOR ALL / FOR INSERT / FOR UPDATE policies
+      // so INSERT and UPDATE are never silently blocked by RLS
+      .replace(/FOR\s+ALL\s+USING\s*\(true\)(?!\s*WITH\s+CHECK)/gi, 'FOR ALL USING (true) WITH CHECK (true)')
+      .replace(/FOR\s+UPDATE\s+USING\s*\(true\)(?!\s*WITH\s+CHECK)/gi, 'FOR UPDATE USING (true) WITH CHECK (true)')
+      .replace(/FOR\s+INSERT(?!\s+WITH\s+CHECK)(?!\s+USING)/gi, 'FOR INSERT WITH CHECK (true)');
+
+    // Run the (patched) user's schema SQL
+    await client.query(patchedSql);
     console.log('[run-schema] User schema applied successfully');
+
+    // Ensure service_role can access the schema (needed for preview's service key client)
+    if (projectId) {
+      try {
+        await client.query(`GRANT USAGE ON SCHEMA "${projectId}" TO anon, authenticated, service_role`);
+        await client.query(`GRANT ALL ON ALL TABLES IN SCHEMA "${projectId}" TO anon, authenticated, service_role`);
+        await client.query(`GRANT ALL ON ALL SEQUENCES IN SCHEMA "${projectId}" TO anon, authenticated, service_role`);
+      } catch (e) {
+        console.warn('[run-schema] Grant warning:', e.message);
+      }
+    }
 
     // Expose the project schema to PostgREST so window.db can query it
     if (projectId) {
-      await client.query(`
-        DO $expose$
-        DECLARE
-          v_current text;
-          v_schemas text[];
-        BEGIN
-          -- Read current pgrst.db_schemas for the authenticator role
-          SELECT setting INTO v_current
-          FROM pg_catalog.pg_db_role_setting rs
-          JOIN pg_catalog.pg_roles r ON r.oid = rs.setrole
-          WHERE r.rolname = 'authenticator'
-            AND EXISTS (
-              SELECT 1 FROM pg_catalog.pg_settings
-              WHERE name = 'pgrst.db_schemas'
-            );
+      // Step 1: Read the current pgrst.db_schemas from pg_roles (authenticator role)
+      let currentSchemas = ['public'];
+      try {
+        const { rows } = await client.query(`
+          SELECT unnest(COALESCE(rolconfig, ARRAY[]::text[])) AS config
+          FROM pg_roles WHERE rolname = 'authenticator'
+        `);
+        const entry = rows.find(r => r.config && r.config.startsWith('pgrst.db_schemas='));
+        if (entry) {
+          currentSchemas = entry.config.replace('pgrst.db_schemas=', '').split(',').map(s => s.trim()).filter(Boolean);
+        }
+        // Also check ALTER DATABASE level config as a fallback source
+        if (currentSchemas.length <= 1) {
+          const { rows: dbRows } = await client.query(`
+            SELECT unnest(COALESCE(datacl::text[], ARRAY[]::text[])) AS cfg
+            FROM pg_database WHERE datname = current_database()
+          `).catch(() => ({ rows: [] }));
+          // pg_db_role_setting is more reliable for ALTER DATABASE
+          const { rows: settingRows } = await client.query(`
+            SELECT unnest(setconfig) AS cfg
+            FROM pg_db_role_setting
+            WHERE setrole = 0 AND setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+          `).catch(() => ({ rows: [] }));
+          const dbEntry = settingRows.find(r => r.cfg && r.cfg.startsWith('pgrst.db_schemas='));
+          if (dbEntry) {
+            currentSchemas = dbEntry.cfg.replace('pgrst.db_schemas=', '').split(',').map(s => s.trim()).filter(Boolean);
+          }
+        }
+      } catch (e) {
+        console.warn('[run-schema] Could not read current pgrst.db_schemas:', e.message);
+      }
 
-          IF v_current IS NULL THEN
-            v_current := 'public';
-          END IF;
+      // Step 2: Add the schema if it isn't already in the list
+      if (!currentSchemas.includes(projectId)) {
+        const newSchemas = [...currentSchemas, projectId].join(',');
 
-          v_schemas := string_to_array(v_current, ',');
+        // Try ALTER ROLE authenticator first (PostgREST's preferred mechanism).
+        // Note: ALTER ROLE SET does NOT support $1 placeholders — must use string interpolation.
+        // newSchemas is safe: built from existing pg_roles config + our own p_xxx project ID.
+        let alterRoleOk = false;
+        try {
+          await client.query(`ALTER ROLE authenticator SET "pgrst.db_schemas" = '${newSchemas}'`);
+          alterRoleOk = true;
+          console.log(`[run-schema] ALTER ROLE authenticator → pgrst.db_schemas = '${newSchemas}'`);
+        } catch (e) {
+          console.warn('[run-schema] ALTER ROLE authenticator failed:', e.message);
+        }
 
-          IF NOT ($1 = ANY(v_schemas)) THEN
-            v_schemas := array_append(v_schemas, $1);
-            EXECUTE format(
-              'ALTER ROLE authenticator SET pgrst.db_schemas = %L',
-              array_to_string(v_schemas, ',')
-            );
-            NOTIFY pgrst, 'reload config';
-          END IF;
-        EXCEPTION WHEN OTHERS THEN
-          NULL; -- Non-fatal: schema visible in Table Editor even if REST not exposed
-        END $expose$;
-      `, [projectId]);
-      console.log(`[run-schema] Exposed schema "${projectId}" to PostgREST`);
+        // Fallback: ALTER DATABASE (applies to every role connecting to this DB)
+        if (!alterRoleOk) {
+          try {
+            await client.query(`ALTER DATABASE postgres SET "pgrst.db_schemas" = '${newSchemas}'`);
+            console.log(`[run-schema] ALTER DATABASE postgres → pgrst.db_schemas = '${newSchemas}'`);
+          } catch (e) {
+            console.warn('[run-schema] ALTER DATABASE also failed:', e.message);
+          }
+        }
+      } else {
+        console.log(`[run-schema] Schema "${projectId}" already in pgrst.db_schemas — skipping ALTER`);
+      }
+
+      // Step 3: Send BOTH reload notifications.
+      // 'reload config' → adds new schema to PostgREST's exposed list.
+      // 'reload schema' → re-introspects table/column structure for all schemas (needed after CREATE TABLE).
+      try {
+        await client.query(`NOTIFY pgrst, 'reload config'`);
+        await client.query(`NOTIFY pgrst, 'reload schema'`);
+        console.log(`[run-schema] NOTIFY pgrst 'reload config' + 'reload schema' sent`);
+      } catch (e) {
+        console.warn('[run-schema] NOTIFY pgrst failed:', e.message);
+      }
+
+      // Step 4: Poll until PostgREST has reloaded and the schema + tables are queryable.
+      // NOTIFY is async — PostgREST can take 1–5s to pick it up on Supabase hosted.
+      if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+        const testClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+          db: { schema: projectId },
+          auth: { persistSession: false },
+        });
+        let schemaReady = false;
+        for (let attempt = 0; attempt < 20; attempt++) {
+          await new Promise(r => setTimeout(r, 1000));
+          const { error } = await testClient.from('_schema_check_').select('id').limit(0);
+          // PGRST106 = schema not in list; PGRST002 = cache rebuilding; PGRST204 = table not in cache yet
+          // All three mean PostgREST hasn't finished reloading — keep waiting.
+          // Any other error (e.g. 42P01 table not found in PG) = schema cache IS loaded
+          const notReady = error?.code === 'PGRST106'
+            || error?.code === 'PGRST002'
+            || error?.code === 'PGRST204'
+            || error?.message?.includes('must be one of')
+            || error?.message?.includes('Invalid schema')
+            || error?.message?.includes('schema cache');
+          if (!notReady) {
+            console.log(`[run-schema] PostgREST ready for schema "${projectId}" (attempt ${attempt + 1})`);
+            schemaReady = true;
+            break;
+          }
+          if (attempt % 3 === 0) {
+            // Re-send NOTIFY every 3 seconds in case the first one was missed
+            await client.query(`NOTIFY pgrst, 'reload config'`).catch(() => {});
+          }
+          console.log(`[run-schema] Waiting for PostgREST reload... ${attempt + 1}/20`);
+        }
+        if (!schemaReady) {
+          console.warn(`[run-schema] Schema "${projectId}" may not be accessible via REST after 20s — preview may show DB errors`);
+        }
+      }
     }
 
     await client.end();
@@ -2404,7 +2964,7 @@ app.post('/api/delete-project-resources', async (req, res) => {
 
   const results = { schemaDropped: false, filesDeleted: 0, errors: [] };
 
-  // 1. Drop the PostgreSQL schema (CASCADE removes all tables inside)
+  // 1. Drop the PostgreSQL schema (CASCADE removes all app tables inside)
   const dbUrl = process.env.SUPABASE_DB_URL;
   if (dbUrl) {
     const client = new PgClient({
@@ -2414,37 +2974,36 @@ app.post('/api/delete-project-resources', async (req, res) => {
     });
     try {
       await client.connect();
+
+      // 1a. Drop the schema
       await client.query(`DROP SCHEMA IF EXISTS "${schemaId}" CASCADE`);
-      // Also remove schema from PostgREST's exposed list
-      await client.query(`
-        DO $drop$
-        DECLARE
-          v_current text;
-          v_schemas text[];
-          v_filtered text[];
-          v_item text;
-        BEGIN
-          SELECT setting INTO v_current
-          FROM pg_catalog.pg_db_role_setting rs
-          JOIN pg_catalog.pg_roles r ON r.oid = rs.setrole
-          WHERE r.rolname = 'authenticator';
-          IF v_current IS NOT NULL THEN
-            v_schemas := string_to_array(v_current, ',');
-            FOREACH v_item IN ARRAY v_schemas LOOP
-              IF trim(v_item) <> $1 THEN
-                v_filtered := array_append(v_filtered, trim(v_item));
-              END IF;
-            END LOOP;
-            EXECUTE format('ALTER ROLE authenticator SET pgrst.db_schemas = %L',
-              array_to_string(COALESCE(v_filtered, ARRAY['public']), ','));
-            NOTIFY pgrst, 'reload config';
-          END IF;
-        EXCEPTION WHEN OTHERS THEN NULL;
-        END $drop$;
-      `, [schemaId]);
+      console.log(`[delete-resources] Dropped schema "${schemaId}"`);
+
+      // 1b. Remove schema from PostgREST's pgrst.db_schemas
+      // Note: DO blocks and parameterized queries don't work for ALTER ROLE SET —
+      // must read current config and use string interpolation directly.
+      try {
+        const { rows: cfgRows } = await client.query(
+          `SELECT unnest(COALESCE(rolconfig, ARRAY[]::text[])) AS config
+           FROM pg_roles WHERE rolname = 'authenticator'`
+        );
+        const entry = cfgRows.find(r => r.config && r.config.startsWith('pgrst.db_schemas='));
+        if (entry) {
+          const currentSchemas = entry.config
+            .replace('pgrst.db_schemas=', '')
+            .split(',').map(s => s.trim()).filter(Boolean);
+          const filtered = currentSchemas.filter(s => s !== schemaId);
+          const newSchemas = filtered.length > 0 ? filtered.join(',') : 'public';
+          await client.query(`ALTER ROLE authenticator SET "pgrst.db_schemas" = '${newSchemas}'`);
+          await client.query(`NOTIFY pgrst, 'reload config'`);
+          console.log(`[delete-resources] pgrst.db_schemas updated to: ${newSchemas}`);
+        }
+      } catch (e) {
+        console.warn('[delete-resources] Could not update pgrst.db_schemas:', e.message);
+      }
+
       await client.end();
       results.schemaDropped = true;
-      console.log(`[delete-resources] Dropped schema "${schemaId}"`);
     } catch (err) {
       await client.end().catch(() => {});
       console.error('[delete-resources] Schema drop error:', err.message);
@@ -2452,25 +3011,41 @@ app.post('/api/delete-project-resources', async (req, res) => {
     }
   }
 
-  // 2. Delete storage files under the project's folder
+  // 2. Delete ALL storage files under the project's folder (paginated — no 1000-file cap)
   if (supabaseAdmin) {
     try {
-      // List all files under schemaId/
-      const { data: files } = await supabaseAdmin.storage
-        .from(UPLOADS_BUCKET)
-        .list(schemaId, { limit: 1000 });
+      let allPaths = [];
+      let offset = 0;
+      const PAGE_SIZE = 1000;
 
-      if (files && files.length > 0) {
-        const paths = files.map((f) => `${schemaId}/${f.name}`);
-        const { error } = await supabaseAdmin.storage
+      while (true) {
+        const { data: files, error: listErr } = await supabaseAdmin.storage
           .from(UPLOADS_BUCKET)
-          .remove(paths);
-        if (!error) {
-          results.filesDeleted = paths.length;
-          console.log(`[delete-resources] Deleted ${paths.length} files from storage`);
-        } else {
-          results.errors.push(`Storage: ${error.message}`);
+          .list(schemaId, { limit: PAGE_SIZE, offset });
+
+        if (listErr) {
+          results.errors.push(`Storage list: ${listErr.message}`);
+          break;
         }
+        if (!files || files.length === 0) break;
+
+        allPaths.push(...files.map((f) => `${schemaId}/${f.name}`));
+        if (files.length < PAGE_SIZE) break; // last page
+        offset += PAGE_SIZE;
+      }
+
+      if (allPaths.length > 0) {
+        // Delete in batches of 1000 (Supabase API limit per call)
+        for (let i = 0; i < allPaths.length; i += PAGE_SIZE) {
+          const batch = allPaths.slice(i, i + PAGE_SIZE);
+          const { error } = await supabaseAdmin.storage.from(UPLOADS_BUCKET).remove(batch);
+          if (error) {
+            results.errors.push(`Storage delete batch: ${error.message}`);
+          } else {
+            results.filesDeleted += batch.length;
+          }
+        }
+        console.log(`[delete-resources] Deleted ${results.filesDeleted} files from storage for "${schemaId}"`);
       }
     } catch (err) {
       console.error('[delete-resources] Storage delete error:', err.message);

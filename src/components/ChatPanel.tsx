@@ -435,7 +435,7 @@ export default function ChatPanel() {
       if (gen || paused || current.length === 0) return;
       const next = current[0];
       remove(next.id);
-      sendChatMessage(next.prompt);
+      sendChatMessage(next.prompt, { skipPlanApproval: true });
     }, 400);
     return () => clearTimeout(timer);
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1544,7 +1544,7 @@ function MessageBubble({ message, onRePrompt, onFix, onImplement, onBuildFromAsk
                 content={message.content}
                 isStreaming={!!message.isStreaming}
                 onImplement={(!message.pipeline && !message.isAskResponse) ? onImplement : undefined}
-                hideCode={(!!message.isAskResponse && !message.isStreaming) || (!!message.pipeline || !!message.isRepairMessage)}
+                hideCode={!message.isStreaming || !!message.pipeline || !!message.isRepairMessage}
                 hideText={!!message.pipeline || !!message.isRepairMessage}
                 noChips={!!message.isAskResponse}
               />
@@ -1649,11 +1649,15 @@ function MarkdownContent({ content, isStreaming, onImplement, hideCode, hideText
           );
         }
         if (hideText) {
-          // Always show the last text segment if it comes after code blocks — this is the
-          // completion summary (✅ Done! block) that the AI outputs after all file code blocks.
+          // During streaming: hide ALL text to prevent intermediate text (between code blocks)
+          // from flashing visible before the next code fence arrives.
+          // After streaming: show only the final text segment if it comes after code blocks
+          // (this is the ✅ Done! summary block).
+          if (isStreaming) return null;
           const hasCodeBefore = segments.slice(0, i).some((s) => s.type === 'code');
+          const hasCodeAfter = segments.slice(i + 1).some((s) => s.type === 'code');
           const isLastText = !segments.slice(i + 1).some((s) => s.type === 'text');
-          if (hasCodeBefore && isLastText) {
+          if (hasCodeBefore && isLastText && !hasCodeAfter) {
             return <TextBlock key={i} text={seg.content} onImplement={onImplement} />;
           }
           return null;
@@ -1714,21 +1718,65 @@ function renderInline(text: string): React.ReactNode[] {
 
 // ─── Done! summary block ──────────────────────────────────────────────────────
 
+// Parse file entries from Changed: section — supports both formats:
+//   Old: "Changed: file1.tsx, file2.tsx"
+//   New: "Changed:\n- file1.tsx: description\n- file2.tsx: description"
+function parseChangedEntries(lines: string[]): { file: string; desc: string }[] {
+  const changedIdx = lines.findIndex((l) => /^Changed:/i.test(l));
+  if (changedIdx === -1) return [];
+
+  const header = lines[changedIdx].replace(/^Changed:\s*/i, '').trim();
+
+  // New multi-line format: Changed: followed by "- file: desc" bullets
+  const bullets: { file: string; desc: string }[] = [];
+  for (let i = changedIdx + 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line || /^(Works:|Note:|✅)/i.test(line)) break;
+    const m = line.match(/^[-•*]\s+(.+)/);
+    if (!m) break;
+    const entry = m[1];
+    const colonIdx = entry.search(/\.(?:tsx?|jsx?|css|json|sql|md)\s*:/i);
+    if (colonIdx !== -1) {
+      // Find the end of the filename (up to and including the extension)
+      const extMatch = entry.match(/^([^\s:]+(?:\.tsx?|\.jsx?|\.css|\.json|\.sql|\.md))\s*:\s*(.*)/i);
+      if (extMatch) {
+        bullets.push({ file: extMatch[1].trim(), desc: extMatch[2].trim() });
+      } else {
+        bullets.push({ file: entry.split(':')[0].trim(), desc: entry.split(':').slice(1).join(':').trim() });
+      }
+    } else {
+      bullets.push({ file: entry.trim(), desc: '' });
+    }
+  }
+
+  if (bullets.length > 0) return bullets;
+
+  // Old comma-separated format: "Changed: file1.tsx, file2.tsx"
+  if (header && header.toLowerCase() !== 'none') {
+    return header.split(',').map((f) => ({ file: f.trim(), desc: '' })).filter((e) => e.file);
+  }
+  return [];
+}
+
 function DoneBlock({ text }: { text: string }) {
-  const lines = text.split('\n').filter((l) => l.trim());
+  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
   const summaryLine = lines.find((l) => l.startsWith('✅'));
-  const changedLine = lines.find((l) => /^Changed:/i.test(l));
   const worksLine = lines.find((l) => /^Works:/i.test(l));
   const noteLine = lines.find((l) => /^Note:/i.test(l));
 
   const summary = summaryLine?.replace(/^✅\s*Done!\s*/i, '').trim() ?? '';
-  const changedRaw = changedLine?.replace(/^Changed:\s*/i, '').trim() ?? '';
   const worksText = worksLine?.replace(/^Works:\s*/i, '').trim() ?? '';
   const noteText = noteLine?.replace(/^Note:\s*/i, '').trim() ?? '';
+  const changedEntries = parseChangedEntries(lines);
 
-  const changedFiles = changedRaw
-    ? changedRaw.split(',').map((f) => f.trim()).filter(Boolean)
-    : [];
+  const FILE_COLORS: Record<string, string> = {
+    tsx: 'bg-cyan-500/10 border-cyan-500/25 text-cyan-300',
+    ts: 'bg-blue-500/10 border-blue-500/25 text-blue-300',
+    jsx: 'bg-yellow-500/10 border-yellow-500/25 text-yellow-300',
+    js: 'bg-yellow-500/10 border-yellow-500/25 text-yellow-300',
+    css: 'bg-pink-500/10 border-pink-500/25 text-pink-300',
+    json: 'bg-orange-500/10 border-orange-500/25 text-orange-300',
+  };
 
   return (
     <div className="mt-2 rounded-xl border border-emerald-500/20 bg-emerald-500/5 overflow-hidden text-[13px]">
@@ -1739,31 +1787,27 @@ function DoneBlock({ text }: { text: string }) {
       </div>
 
       <div className="px-3 py-2.5 space-y-2.5">
-        {/* Changed files */}
-        {changedFiles.length > 0 && (
+        {/* Changed files — each with description */}
+        {changedEntries.length > 0 && (
           <div>
             <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500 block mb-1.5">Changed</span>
-            <div className="flex flex-wrap gap-1.5">
-              {changedFiles.map((f) => {
-                const ext = f.split('.').pop() ?? '';
-                const colorMap: Record<string, string> = {
-                  tsx: 'bg-cyan-500/10 border-cyan-500/25 text-cyan-300',
-                  ts: 'bg-blue-500/10 border-blue-500/25 text-blue-300',
-                  jsx: 'bg-yellow-500/10 border-yellow-500/25 text-yellow-300',
-                  js: 'bg-yellow-500/10 border-yellow-500/25 text-yellow-300',
-                  css: 'bg-pink-500/10 border-pink-500/25 text-pink-300',
-                  json: 'bg-orange-500/10 border-orange-500/25 text-orange-300',
-                };
-                const color = colorMap[ext] ?? 'bg-zinc-700/40 border-zinc-600/40 text-zinc-300';
-                const short = f.includes('/') ? f.split('/').pop()! : f;
+            <div className="space-y-2">
+              {changedEntries.map((entry, i) => {
+                const ext = entry.file.split('.').pop() ?? '';
+                const short = entry.file.includes('/') ? entry.file.split('/').pop()! : entry.file;
+                const color = FILE_COLORS[ext] ?? 'bg-zinc-700/40 border-zinc-600/40 text-zinc-300';
                 return (
-                  <span
-                    key={f}
-                    title={f}
-                    className={`inline-flex items-center h-5 px-2 rounded-md border text-[11px] font-mono ${color}`}
-                  >
-                    {short}
-                  </span>
+                  <div key={i} className="flex flex-col gap-0.5">
+                    <span
+                      title={entry.file}
+                      className={`inline-flex items-center h-5 px-2 rounded-md border text-[11px] font-mono self-start ${color}`}
+                    >
+                      {short}
+                    </span>
+                    {entry.desc && (
+                      <span className="text-zinc-400 text-[12px] leading-relaxed pl-1">{entry.desc}</span>
+                    )}
+                  </div>
                 );
               })}
             </div>
@@ -1794,7 +1838,7 @@ function TextBlock({ text, onImplement }: { text: string; onImplement?: (text: s
   if (!text.trim()) return null;
 
   // Detect ✅ Done! block and render it with special formatting
-  if (/✅\s*Done!/i.test(text) && /Changed:|Works:/i.test(text)) {
+  if (/✅\s*Done!/i.test(text)) {
     return <DoneBlock text={text} />;
   }
 

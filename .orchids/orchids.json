@@ -2,6 +2,11 @@
   "projectId": "e06705d7-bdb1-4d48-9964-0698d3afa92b",
   "createdAt": 1773721972965,
   "version": "1.0",
-  "startupCommands": ["npm install; npm run dev:client", "npm install; npm run dev:server"],
-  "templateId": "auto"
+  "startupCommands": [
+    "npm install; npm run dev:client",
+    "npm install; npm run dev:server"
+  ],
+  "templateId": "auto",
+  "deployedWithUserToken": true,
+  "vercelProjectId": "prj_ZRvELgzKjft3jJASfDkpCUeOWu0d"
 }

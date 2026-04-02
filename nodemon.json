@@ -1,0 +1,8 @@
+{
+  "watch": ["server"],
+  "ext": "js,json",
+  "ignore": ["node_modules"],
+  "delay": 500,
+  "signal": "SIGTERM",
+  "exec": "lsof -ti :3001 | xargs kill -9 2>/dev/null; sleep 0.5; node server/index.js"
+}

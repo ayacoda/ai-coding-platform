@@ -11,6 +11,29 @@ export interface PipelinePlan {
   designDirection?: string;
 }
 
+/** Full plan returned by the planner, used for the approval card */
+export interface FullPlan extends PipelinePlan {
+  title?: string;
+  firstBuildScope: string[];
+  deferredScope: string[];
+  acceptanceCriteria?: string[];
+}
+
+/** Stored on a message when it is awaiting user approval before generation starts */
+export interface PlanApproval {
+  plan: FullPlan;
+  /** Everything needed to resume /api/build once approved */
+  buildContext: {
+    messages: { role: string; content: string; images?: { data: string; mediaType: string }[] }[];
+    storageMode: string;
+    projectConfig: ProjectConfig | null;
+    model: string;
+    isAutoMode: boolean;
+  };
+  /** 'pending' | 'approved' | 'cancelled' */
+  status: 'pending' | 'approved' | 'cancelled';
+}
+
 export interface PipelineStageInfo {
   name: 'routing' | 'planning' | 'generating' | 'polishing' | 'validating';
   status: 'running' | 'done';
@@ -53,6 +76,8 @@ export interface Message {
   buildIntent?: string;
   /** Marks this as an Ask-mode response — code blocks hidden to prevent confusion. */
   isAskResponse?: boolean;
+  /** When set, the message shows a plan approval card instead of normal content */
+  planApproval?: PlanApproval;
 }
 
 export interface QueueItem {

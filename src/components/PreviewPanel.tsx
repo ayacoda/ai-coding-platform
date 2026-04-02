@@ -729,6 +729,7 @@ function TabletFrame({ children }: { children: React.ReactNode }) {
 
 export default function PreviewPanel() {
   const { files, isGenerating, messages, storageMode, projectConfig, projectSecrets } = useStore();
+  const setFiles = useStore((s) => s.setFiles);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [key, setKey] = useState(0);
@@ -757,6 +758,20 @@ export default function PreviewPanel() {
   const globalRepairCount = useRef(0);
   // Flag: was the last file update caused by a repair? If so, don't reset the global counter.
   const fileChangeFromRepair = useRef(false);
+  // Deferred version save — used when preview-ready fires before the project has a real DB ID.
+  // EditorPage.saveProject() creates the row ~1500ms after files are set; this ref holds the
+  // version data until currentProjectId changes from 'new' to a real UUID.
+  const deferredVersionSave = useRef<{ userId: string; files: Record<string, string>; label: string } | null>(null);
+  const currentProjectId = useStore((s) => s.currentProjectId);
+
+  // Flush deferred version once we have a real project ID
+  useEffect(() => {
+    if (deferredVersionSave.current && currentProjectId && currentProjectId !== 'new') {
+      const { userId, files: vFiles, label } = deferredVersionSave.current;
+      deferredVersionSave.current = null;
+      saveVersion(currentProjectId, userId, vFiles, label).catch(() => {});
+    }
+  }, [currentProjectId]);
 
   useEffect(() => { filesRef.current = files; }, [files]);
   useEffect(() => { isFixingRef.current = isFixing; }, [isFixing]);
@@ -795,10 +810,100 @@ export default function PreviewPanel() {
     }
   }, [files]);
 
+  /**
+   * Instantly fix known crash patterns without calling the AI.
+   * Returns updated files if a fix was applied, null if nothing matched.
+   * This fires BEFORE the AI repair cycle — no network, no latency.
+   */
+  function tryProgrammaticFix(error: string, currentFiles: Record<string, string>): Record<string, string> | null {
+    let anyChanged = false;
+    const result: Record<string, string> = {};
+
+    for (const [name, code] of Object.entries(currentFiles)) {
+      if (!name.endsWith('.tsx') && !name.endsWith('.ts') && !name.endsWith('.js')) {
+        result[name] = code;
+        continue;
+      }
+      let c = code;
+
+      // SQL type cast wrappers: NUMERIC(x) → x, INTEGER(x) → x, VARCHAR(x) → x, etc.
+      if (/\b(NUMERIC|DECIMAL|FLOAT|REAL|INTEGER|INT|SMALLINT|VARCHAR|TEXT|NVARCHAR|BOOLEAN|BIGINT|DATE|TIMESTAMP)\s*\(/i.test(c)) {
+        c = c.replace(
+          /\b(NUMERIC|DECIMAL|FLOAT|REAL|INTEGER|INT|SMALLINT|VARCHAR|TEXT|NVARCHAR|BOOLEAN|BIGINT|DATE|TIMESTAMP)\s*\(([^)]*)\)/gi,
+          '$2'
+        );
+      }
+
+      // PostgreSQL UUID functions → crypto.randomUUID()
+      c = c
+        .replace(/\bgen_random_uuid\s*\(\s*\)/g, '(crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2))')
+        .replace(/\buuid_generate_v4\s*\(\s*\)/g, '(crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2))');
+
+      // Date crash patterns — all produce parse/runtime errors in the sandbox:
+      //   new toISOString()         → "Unexpected identifier 'toISOString'" (parse error)
+      //   Date.now().toISOString()  → Date.now() is a Number, .toISOString() is not a function
+      //   new Date.toISOString()    → not a constructor
+      c = c.replace(/\bnew\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
+      c = c.replace(/\bDate\.now\(\)\.toISOString\(\)/g, 'new Date().toISOString()');
+      c = c.replace(/\bnew\s+Date\.toISOString\s*\(\)/g, 'new Date().toISOString()');
+
+      // Supabase createClient import — stripped by sandbox, crashes with "createClient is not defined".
+      // window.db is pre-loaded; no import needed.
+      c = c.replace(/^[ \t]*import\s+\{[^}]*createClient[^}]*\}\s+from\s+['"]@supabase\/supabase-js['"][^\n]*\n?/gm, '');
+      c = c.replace(/^[ \t]*import\s+createClient\s+from\s+['"]@supabase\/supabase-js['"][^\n]*\n?/gm, '');
+
+      // Bare "db.from(" / "supabase.from(" without window. — crashes with "db is not defined".
+      c = c.replace(/(^|[=(,{[\s;!&|?:])(?:db|supabase)\.from\s*\(/gm, '$1window.db.from(');
+      c = c.replace(/(^|[=(,{[\s;!&|?:])(?:db|supabase)\.auth\b/gm, '$1window.db.auth');
+
+      // CSS variable keys in style objects: { --myVar: x } → { '--myVar': x }
+      c = c.replace(/style=\{\{([^{}]*)\}\}/g, (match, styleContent) => {
+        const fixed = styleContent.replace(/(?<!['"{\w])(--[\w-]+)(\s*:)/g, "'$1'$2");
+        return fixed !== styleContent ? `style={{${fixed}}}` : match;
+      });
+
+      // window.db.auth.signIn( → window.db.auth.signInWithPassword(
+      c = c.replace(/window\.db\.auth\.signIn\s*\(/g, 'window.db.auth.signInWithPassword(');
+
+      if (c !== code) anyChanged = true;
+      result[name] = c;
+    }
+
+    return anyChanged ? result : null;
+  }
+
   function doFix(error: string) {
     if (isFixingRef.current || isGeneratingRef.current) return;
     // Don't attempt fixes if we've already determined regeneration is needed
     if (shouldRegenerateRef.current) return;
+
+    // Skip AI repair for Supabase backend errors — code changes can't fix DB config issues.
+    // These errors indicate missing tables, RLS policy blocks, or schema permission problems.
+    const isSupabaseBackendError =
+      /permission denied for (table|schema|relation)/i.test(error) ||
+      /relation ".*" does not exist/i.test(error) ||
+      /schema ".*" does not exist/i.test(error) ||
+      /invalid schema/i.test(error) ||
+      /must be one of the following/i.test(error) ||
+      /new row violates row-level security/i.test(error) ||
+      /\bpgrst\d{3}\b/i.test(error) ||
+      /JWT (expired|invalid|malformed)/i.test(error);
+    if (isSupabaseBackendError) {
+      console.warn('[preview] Supabase backend error — skipping AI repair (cannot fix DB config with code changes):', error.slice(0, 120));
+      return;
+    }
+
+    // ── Instant programmatic fix — no AI, no network call ──────────────────
+    // For known crash patterns (SQL type casts, UUID functions, CSS vars), apply
+    // the fix directly to the files. If it works, the preview will re-render clean.
+    // This runs BEFORE the AI repair cycle and doesn't count toward the repair budget.
+    const programmaticResult = tryProgrammaticFix(error, filesRef.current);
+    if (programmaticResult) {
+      console.log('[repair] instant programmatic fix applied — skipping AI call');
+      fileChangeFromRepair.current = true;
+      setFiles(programmaticResult);
+      return;
+    }
 
     globalRepairCount.current += 1;
     const attemptNumber = globalRepairCount.current;
@@ -826,9 +931,9 @@ export default function PreviewPanel() {
 
     const currentFiles = filesRef.current;
 
-    // Detect if the error is "X is not defined" where X is a TypeScript interface
-    // (the #1 crash pattern: interface named same as a JSX component).
+    // Detect if the error is "X is not defined" or "X is not a function" where X is a bad identifier.
     const errorSymbol = error.match(/[`'"]?(\w+)[`'"]? is not defined/i)?.[1]
+      ?? error.match(/[`'"]?(\w+)[`'"]? is not a function/i)?.[1]
       ?? error.match(/Cannot read propert(?:y|ies) of (?:null|undefined).*?'(\w+)'/i)?.[1]
       ?? '';
 
@@ -873,16 +978,37 @@ export default function PreviewPanel() {
       ? /^proj_default$/.test(errorSymbol) || /^p_[0-9a-f]{6,10}$/.test(errorSymbol)
       : false;
 
-    // SQL/CSS reserved keyword used as an uppercase variable name — e.g. "TO is not defined", "SET is not defined".
-    // Happens when AI generates `const TO = '#color'` or `const SET = [...]` and the import is stripped.
-    const SQL_CSS_KEYWORDS = new Set(['TO', 'FROM', 'SET', 'AS', 'ON', 'INTO', 'ORDER', 'GROUP', 'BY', 'IN', 'LIMIT', 'OFFSET', 'BEGIN', 'END', 'TRANSACTION']);
+    // SQL/CSS reserved keywords and PostgreSQL type names used as JS identifiers.
+    // Covers both "X is not defined" (used as variable) and "X is not a function" (called as type cast).
+    const SQL_CSS_KEYWORDS = new Set([
+      // SQL DML/DDL keywords
+      'TO', 'FROM', 'SET', 'AS', 'ON', 'INTO', 'ORDER', 'GROUP', 'BY', 'IN', 'LIMIT',
+      'OFFSET', 'BEGIN', 'END', 'TRANSACTION', 'WHERE', 'JOIN', 'LEFT', 'RIGHT', 'INNER',
+      'OUTER', 'FULL', 'HAVING', 'UNION', 'EXCEPT', 'INTERSECT', 'VALUES', 'RETURNING',
+      // PostgreSQL data types used as JS identifiers or type-cast functions
+      'NUMERIC', 'DECIMAL', 'FLOAT', 'REAL', 'INTEGER', 'INT', 'BIGINT', 'SMALLINT',
+      'VARCHAR', 'TEXT', 'CHAR', 'NVARCHAR', 'BOOLEAN', 'BOOL', 'DATE', 'TIMESTAMP',
+      'TIMESTAMPTZ', 'JSON', 'JSONB', 'UUID', 'ARRAY', 'BYTEA', 'DOUBLE',
+    ]);
     const isKeywordVariableCrash = errorSymbol ? SQL_CSS_KEYWORDS.has(errorSymbol) : false;
+
+    // PostgreSQL function called in frontend JS — gen_random_uuid / uuid_generate_v4 are SQL, not JS.
+    const isPostgresUuidCrash = /gen_random_uuid is not a function|uuid_generate_v4 is not a function/i.test(error) ||
+      (errorSymbol === 'gen_random_uuid') || (errorSymbol === 'uuid_generate_v4');
+
+    // "Unexpected identifier 'X'" — a parse/syntax error from TypeScript compilation.
+    // The "Unexpected identifier" format is NOT matched by the errorSymbol patterns above
+    // (which only handle "X is not defined" / "X is not a function"), so errorSymbol stays ''.
+    // Without a symbol, only App.tsx is marked EDITABLE — other files are READ-ONLY — loop.
+    // Fix: treat ALL "Unexpected identifier" errors as needing full cross-file context.
+    // The most common cause is "new toISOString()" but other patterns can trigger it too.
+    const isNewCallSyntaxCrash = /Unexpected identifier/i.test(error);
 
     // For interface-as-component or Supabase crashes, send ALL files — fix must be cross-file consistent.
     // For other errors, only send suspect files to keep context small.
     const suspectFiles = new Set<string>();
     suspectFiles.add('App.tsx');
-    if (!isInterfaceAsComponentCrash && !isSupabaseCrash && !isWindowDbCrash && !isIllegalReturnCrash && !isInvalidLhsCrash && !isSchemaNameCrash && !isKeywordVariableCrash && errorSymbol) {
+    if (!isInterfaceAsComponentCrash && !isSupabaseCrash && !isWindowDbCrash && !isIllegalReturnCrash && !isInvalidLhsCrash && !isSchemaNameCrash && !isKeywordVariableCrash && !isPostgresUuidCrash && !isNewCallSyntaxCrash && errorSymbol) {
       for (const [fname, code] of Object.entries(currentFiles)) {
         if (code.includes(errorSymbol)) suspectFiles.add(fname);
       }
@@ -896,7 +1022,7 @@ export default function PreviewPanel() {
 
     // Attempt 2+: always escalate to ALL files for broader context.
     const needsAllFiles = isInterfaceAsComponentCrash || isSupabaseCrash || isWindowDbCrash ||
-      isIllegalReturnCrash || isInvalidLhsCrash || isSchemaNameCrash || isKeywordVariableCrash || attemptNumber >= 2 ||
+      isIllegalReturnCrash || isInvalidLhsCrash || isSchemaNameCrash || isKeywordVariableCrash || isPostgresUuidCrash || isNewCallSyntaxCrash || attemptNumber >= 2 ||
       !symbolFoundInFiles;
     const allFilesLabel = isInterfaceAsComponentCrash ? 'interface-as-component rename'
       : isSupabaseCrash ? 'Supabase import fix'
@@ -905,14 +1031,59 @@ export default function PreviewPanel() {
       : isInvalidLhsCrash ? 'invalid LHS — must find JS syntax error in style/expression'
       : isSchemaNameCrash ? 'schema-name-as-variable — must replace in all files'
       : isKeywordVariableCrash ? `SQL/CSS keyword "${errorSymbol}" used as variable — rename across all files`
+      : isPostgresUuidCrash ? 'gen_random_uuid is a PostgreSQL function — replace with crypto.randomUUID()'
+      : isNewCallSyntaxCrash ? 'Unexpected identifier — parse error, must scan ALL files'
       : !symbolFoundInFiles ? `${errorSymbol} not found in any file — async error, full context`
       : `attempt ${attemptNumber} — full context`;
+    // Pre-scan which files actually contain the problematic pattern so we only
+    // show those as editable code blocks. All other files are read-only context.
+    function getPatternFiles(): Set<string> {
+      const result = new Set<string>();
+      result.add('App.tsx');
+      if (errorSymbol) {
+        for (const [fname, code] of Object.entries(currentFiles)) {
+          if (code.includes(errorSymbol)) result.add(fname);
+        }
+      }
+      if (isSupabaseCrash) {
+        for (const [fname, code] of Object.entries(currentFiles)) {
+          if (/createClient|@supabase|supabase\.from|supabase\.auth/.test(code)) result.add(fname);
+        }
+      }
+      if (isWindowDbCrash) {
+        for (const [fname, code] of Object.entries(currentFiles)) {
+          if (/(?<!\bwindow\.)(?:db|supabase)\./.test(code)) result.add(fname);
+        }
+      }
+      if (isPostgresUuidCrash) {
+        for (const [fname, code] of Object.entries(currentFiles)) {
+          if (/gen_random_uuid|uuid_generate_v4/.test(code)) result.add(fname);
+        }
+      }
+      if (isNewCallSyntaxCrash) {
+        // Mark ALL files editable — "Unexpected identifier" can originate from any file.
+        // Also prioritize files containing any toISOString-related patterns.
+        for (const fname of Object.keys(currentFiles)) result.add(fname);
+      }
+      return result;
+    }
+    const patternFiles = needsAllFiles ? getPatternFiles() : suspectFiles;
+
     const filesSummary = needsAllFiles
-      ? `### READ-ONLY CONTEXT — ${allFilesLabel}\nDO NOT re-output files you did not change. Only output the specific files where you made edits.\n\n` +
-        Object.entries(currentFiles).map(([name, code]) => `\`\`\`tsx ${name}\n${code}\n\`\`\``).join('\n\n')
+      ? `### SCAN CONTEXT — ${allFilesLabel}\n` +
+        `⚠️ OUTPUT RULE: Only output files you ACTUALLY changed. DO NOT re-output unchanged files.\n` +
+        `[EDITABLE] files may need changes — output them as code blocks.\n` +
+        `[READ-ONLY] files — read for context but DO NOT include in your response.\n\n` +
+        Object.entries(currentFiles).map(([name, code]) => {
+          if (patternFiles.has(name)) {
+            return `[EDITABLE]\n\`\`\`tsx ${name}\n${code}\n\`\`\``;
+          }
+          // Present as plain text (not a code block) so AI reads it but doesn't re-output it
+          return `[READ-ONLY — do NOT output this file]\n${name}:\n${code}`;
+        }).join('\n\n')
       : `### READ-ONLY CONTEXT — only these files are relevant\nDO NOT re-output files you did not change. Only output the specific files where you made edits.\n\n` +
         Object.entries(currentFiles).map(([name, code]) => {
-          if (suspectFiles.has(name)) return `\`\`\`tsx ${name}\n${code}\n\`\`\``;
+          if (suspectFiles.has(name)) return `[EDITABLE]\n\`\`\`tsx ${name}\n${code}\n\`\`\``;
           return `• ${name} (read-only — do NOT re-output unless you changed it)`;
         }).join('\n\n');
 
@@ -1012,19 +1183,31 @@ export default function PreviewPanel() {
         `  1. useState initialized as null or undefined, then methods called on it. Fix: initialize as [] or {} or the correct empty value.\n` +
         `  2. Async data not yet loaded when component renders. Fix: add a loading check or ?. optional chaining.\n` +
         `  → Fix: change null/undefined initializations to safe defaults, add optional chaining (?.) where needed.`;
+    } else if (isKeywordVariableCrash) {
+      const isSqlTypeCast = /is not a function/i.test(error);
+      if (isSqlTypeCast) {
+        extraHint = `\n⚠️ ROOT CAUSE: "${errorSymbol}" is a PostgreSQL data type being called as a JavaScript function (e.g. ${errorSymbol}(value)).\n` +
+          `PostgreSQL type constructors do NOT exist in JavaScript — they must be replaced with plain values or type conversions.\n` +
+          `REQUIRED FIX — search ALL files and replace every call:\n` +
+          `  ❌ ${errorSymbol}(someValue)   →  ✅ someValue   (just use the value directly)\n` +
+          `  ❌ ${errorSymbol}(10.5)        →  ✅ 10.5\n` +
+          `  ❌ ${errorSymbol}('text')      →  ✅ 'text'\n` +
+          `  ❌ ${errorSymbol}(someVar, 2)  →  ✅ someVar  (drop the precision argument)\n` +
+          `✅ Output EVERY file you changed as a full code block.`;
+      } else {
+        extraHint = `\n⚠️ ROOT CAUSE: "${errorSymbol}" is a reserved SQL/PostgreSQL keyword used as a JavaScript variable name.\n` +
+          `In the sandbox, files are merged and evaluated — imports are stripped, so any module-level variable named "${errorSymbol}" that was imported from another file will be undefined.\n` +
+          `REQUIRED FIX — search ALL .tsx and .ts files and rename "${errorSymbol}" to a descriptive name:\n` +
+          `  ❌ const ${errorSymbol} = ...          →  ✅ const ${errorSymbol.toLowerCase()}Value = ...\n` +
+          `  ❌ const { ${errorSymbol} } = obj      →  ✅ const { ${errorSymbol}: ${errorSymbol.toLowerCase()}Value } = obj\n` +
+          `  ❌ import { ${errorSymbol} } from ...  →  ✅ rename the export and all usages\n` +
+          `Rename EVERY usage consistently across all files.\n` +
+          `✅ Output EVERY file you changed as a full code block.`;
+      }
     } else if (/is not a function/i.test(error)) {
       extraHint = `\n• "X is not a function" — check: imported value is actually a function, not an object/array. Check the export matches the import (default vs named).`;
     } else if (/maximum update depth|too many re-renders/i.test(error)) {
       extraHint = `\n• Infinite re-render loop — check: setState being called directly in render body (not inside handler/useEffect), or useEffect missing dependency array.`;
-    } else if (isKeywordVariableCrash) {
-      extraHint = `\n⚠️ ROOT CAUSE: "${errorSymbol}" is a reserved SQL/CSS keyword used as a JavaScript variable name.\n` +
-        `In the sandbox, files are merged and evaluated — imports are stripped, so any module-level variable named "${errorSymbol}" that was imported from another file will be undefined.\n` +
-        `REQUIRED FIX — search ALL .tsx and .ts files and rename "${errorSymbol}" to a descriptive name:\n` +
-        `  ❌ const ${errorSymbol} = ...          →  ✅ const ${errorSymbol}_COLOR = ... (or other descriptive suffix)\n` +
-        `  ❌ const { ${errorSymbol} } = obj      →  ✅ const { ${errorSymbol}: ${errorSymbol.toLowerCase()}Value } = obj\n` +
-        `  ❌ import { ${errorSymbol} } from ...  →  ✅ rename the export and all usages\n` +
-        `Rename EVERY usage consistently across all files.\n` +
-        `✅ Output EVERY file you changed as a full code block.`;
     } else if (isSchemaNameCrash) {
       extraHint = `\n⚠️ ROOT CAUSE: "${errorSymbol}" is a Supabase PostgreSQL schema name that was accidentally used as a JavaScript variable.\n` +
         `The schema name only belongs in schema.sql — it must NEVER appear as a JS identifier in .tsx or .ts files.\n` +
@@ -1034,6 +1217,18 @@ export default function PreviewPanel() {
         `  3. window.db.schema(${errorSymbol}).from('tableName') → window.db.from('tableName')\n` +
         `  4. const x = ${errorSymbol} or similar → remove entirely\n` +
         `  window.db is already scoped to the correct schema — just call window.db.from('tableName') with only the table name.\n` +
+        `✅ Output EVERY file you changed as a full code block.`;
+    } else if (isNewCallSyntaxCrash) {
+      const unexpectedSymbol = error.match(/Unexpected identifier ['"`]?(\w+)['"`]?/i)?.[1] ?? 'identifier';
+      extraHint = `\n⚠️ ROOT CAUSE: "Unexpected identifier '${unexpectedSymbol}'" is a JavaScript/TypeScript PARSE ERROR.\n` +
+        `The parser encountered "${unexpectedSymbol}" in a position where it is not syntactically valid.\n` +
+        `MOST COMMON CAUSES — search ALL files for these patterns:\n` +
+        `  ❌ new toISOString()         →  ✅ new Date().toISOString()  (toISOString is a method, not a constructor)\n` +
+        `  ❌ Date.now().toISOString()  →  ✅ new Date().toISOString()  (Date.now() returns a number)\n` +
+        `  ❌ new Date.toISOString()    →  ✅ new Date().toISOString()  (missing () after Date)\n` +
+        `  ❌ ${unexpectedSymbol}() as a standalone call — check if it should be a method call on an object\n` +
+        `  ❌ Unquoted CSS variable keys in style objects: { --myVar: x } → { '--myVar': x }\n` +
+        `This error REQUIRES fixing ALL files — not just App.tsx. Check data.ts, types.ts, and every component.\n` +
         `✅ Output EVERY file you changed as a full code block.`;
     } else if (isIllegalReturnCrash) {
       extraHint = `\n⚠️ ROOT CAUSE: A bare \`return\` statement exists OUTSIDE any function at the top level of a file.\n` +
@@ -1053,6 +1248,13 @@ export default function PreviewPanel() {
         `REQUIRED FIX:\n` +
         `  → Search ALL style={} objects for unquoted hyphenated keys or \`--\` prefixed keys. Quote them or convert to camelCase.\n` +
         `  → Example: \`style={{ '--gradient-color': '#fff', fontSize: 14 }}\`\n` +
+        `✅ Output EVERY file you changed as a full code block.`;
+    } else if (isPostgresUuidCrash) {
+      extraHint = `\n⚠️ ROOT CAUSE: gen_random_uuid() and uuid_generate_v4() are PostgreSQL SQL functions — they do NOT exist in JavaScript/browser environments.\n` +
+        `REQUIRED FIX — search ALL files and replace every call:\n` +
+        `  ❌ gen_random_uuid()       →  ✅ crypto.randomUUID()\n` +
+        `  ❌ uuid_generate_v4()      →  ✅ crypto.randomUUID()\n` +
+        `  Or for simple IDs in mock data arrays: Math.random().toString(36).slice(2)\n` +
         `✅ Output EVERY file you changed as a full code block.`;
     }
 
@@ -1099,15 +1301,24 @@ export default function PreviewPanel() {
         `✅ Remove any \`--\` decrement operators applied to non-numeric values.\n` +
         `✅ Output EVERY file you changed as a full code block.`
       : isKeywordVariableCrash
-      ? `RESERVED KEYWORD VARIABLE FIX REQUIRED — "${errorSymbol}" is an SQL/CSS reserved keyword used as a JavaScript variable name.\n` +
-        `This crashes because the sandbox merges all files and strips imports — bare keyword variables become undefined.\n` +
-        `Search ALL .tsx and .ts files and rename EVERY usage of "${errorSymbol}" to a descriptive name:\n` +
-        `  ❌ const ${errorSymbol} = '#3B82F6'             →  ✅ const ${errorSymbol}_COLOR = '#3B82F6'\n` +
-        `  ❌ const { ${errorSymbol} } = obj               →  ✅ const { ${errorSymbol}: renamed } = obj\n` +
-        `  ❌ function fn({ ${errorSymbol} }: { ${errorSymbol}: T })  →  ✅ rename the param\n` +
-        `  ❌ import { ${errorSymbol} } from './file'      →  ✅ rename the export in the source file too\n` +
-        `Rename EVERY occurrence — declaration and all usages — consistently across all files.\n` +
-        `✅ Output EVERY file you changed as a full code block.`
+      ? (/is not a function/i.test(error)
+        ? `SQL TYPE CAST FIX REQUIRED — "${errorSymbol}" is a PostgreSQL data type being called as a JS function.\n` +
+          `Search ALL .tsx and .ts files and strip every call to it — just use the inner value directly:\n` +
+          `  ❌ ${errorSymbol}(value)        →  ✅ value\n` +
+          `  ❌ ${errorSymbol}(10.5)         →  ✅ 10.5\n` +
+          `  ❌ ${errorSymbol}('text', 255)  →  ✅ 'text'\n` +
+          `  ❌ ${errorSymbol}(x, 2)         →  ✅ x\n` +
+          `ALSO check for: DECIMAL, FLOAT, INTEGER, VARCHAR, TEXT, BOOLEAN — remove those cast calls too if present.\n` +
+          `✅ Output EVERY file you changed as a full code block.`
+        : `RESERVED KEYWORD VARIABLE FIX REQUIRED — "${errorSymbol}" is an SQL/PostgreSQL keyword used as a JavaScript variable name.\n` +
+          `This crashes because the sandbox merges all files and strips imports — bare keyword variables become undefined.\n` +
+          `Search ALL .tsx and .ts files and rename EVERY usage of "${errorSymbol}" to a descriptive name:\n` +
+          `  ❌ const ${errorSymbol} = '#3B82F6'             →  ✅ const ${errorSymbol.toLowerCase()}Color = '#3B82F6'\n` +
+          `  ❌ const { ${errorSymbol} } = obj               →  ✅ const { ${errorSymbol}: ${errorSymbol.toLowerCase()}Value } = obj\n` +
+          `  ❌ import { ${errorSymbol} } from './file'      →  ✅ rename the export in the source file too\n` +
+          `Rename EVERY occurrence — declaration and all usages — consistently across all files.\n` +
+          `✅ Output EVERY file you changed as a full code block.`
+        )
       : isSchemaNameCrash
       ? `SCHEMA-NAME-AS-VARIABLE FIX REQUIRED — the Supabase schema name "${errorSymbol}" was used as a JavaScript identifier.\n` +
         `The schema name ONLY belongs in schema.sql — it must NEVER appear as a JS variable in .tsx or .ts files.\n` +
@@ -1118,6 +1329,22 @@ export default function PreviewPanel() {
         `  ❌ const x = ${errorSymbol}                            →  ✅ remove entirely\n` +
         `window.db is already configured with the correct schema — use ONLY the table name in .from().\n` +
         `✅ Output EVERY .tsx/.ts file you changed as a full code block.`
+      : isPostgresUuidCrash
+      ? `POSTGRESQL FUNCTION FIX REQUIRED — gen_random_uuid() and uuid_generate_v4() are SQL functions and do NOT exist in JavaScript.\n` +
+        `Search ALL .tsx and .ts files and replace EVERY occurrence:\n` +
+        `  ❌ gen_random_uuid()        →  ✅ crypto.randomUUID()\n` +
+        `  ❌ uuid_generate_v4()       →  ✅ crypto.randomUUID()\n` +
+        `For mock data IDs in arrays you can also use: Math.random().toString(36).slice(2)\n` +
+        `✅ Output EVERY file you changed as a full code block.`
+      : isNewCallSyntaxCrash
+      ? `PARSE ERROR FIX REQUIRED — "Unexpected identifier" is a JavaScript syntax error meaning an identifier appears where the parser doesn't expect one.\n` +
+        `Search EVERY .tsx and .ts file for bad date/syntax patterns and fix them:\n` +
+        `  ❌ new toISOString()         →  ✅ new Date().toISOString()\n` +
+        `  ❌ Date.now().toISOString()  →  ✅ new Date().toISOString()\n` +
+        `  ❌ new Date.toISOString()    →  ✅ new Date().toISOString()\n` +
+        `  ❌ { --cssVar: value }       →  ✅ { '--cssVar': value } (CSS vars in style objects must be quoted)\n` +
+        `Check data.ts, types.ts, components/, and pages/ — not just App.tsx.\n` +
+        `✅ Output EVERY file you changed as a full code block.`
       : `STRICT REPAIR MODE — you are fixing ONE specific runtime error. Follow this protocol exactly:\n` +
         `1. Read the error carefully.\n` +
         `2. Trace the REAL root cause: check imports, exports, variable names, props, state initialization, async logic, and function calls.\n` +
@@ -1181,31 +1408,41 @@ export default function PreviewPanel() {
           }, 1500);
         }
       } else if (e.data?.type === 'preview-ready') {
-        // Successfully rendered — reset error/stuck state immediately
-        recentErrors.current = [];
-        setFixAttempt(0);
-        setIsStuck(false);
-        isStuckRef.current = false;
-        setShouldRegenerate(false);
-        shouldRegenerateRef.current = false;
+        // Preview rendered — only clear the visible error. DO NOT reset stuck detection
+        // history (recentErrors) yet — an async error often fires immediately after render,
+        // and resetting here defeats the STUCK_THRESHOLD accumulation.
+        // Full state reset only happens after 5s of confirmed stable rendering.
         setPreviewError(null);
 
-        // Debounced counter reset: only clear globalRepairCount after the preview
-        // has been STABLE for 5 seconds. If preview-error fires within that window,
-        // the timer above cancels this and the repair count is preserved — preventing
-        // the infinite loop where a brief render success resets progress back to 0.
+        // Debounced FULL reset — only runs if no preview-error fires within 5s.
+        // preview-error handler cancels this timer when it fires, preserving the
+        // recentErrors accumulation so the stuck detection actually works.
         if (previewStableTimer.current) clearTimeout(previewStableTimer.current);
         previewStableTimer.current = setTimeout(() => {
+          // Confirmed stable — reset everything
+          recentErrors.current = [];
           globalRepairCount.current = 0;
+          setFixAttempt(0);
+          setIsStuck(false);
+          isStuckRef.current = false;
+          setShouldRegenerate(false);
+          shouldRegenerateRef.current = false;
           previewStableTimer.current = null;
         }, 5000);
 
-        // Consume and save the pending version snapshot
+        // Consume and save the pending version snapshot.
+        // If the project is brand-new (ID = 'new'), its DB row doesn't exist yet —
+        // defer the save until EditorPage.saveProject() assigns a real UUID.
         const { pendingVersionSave, setPendingVersionSave } = useStore.getState();
         if (pendingVersionSave) {
           setPendingVersionSave(null);
           const { projectId, userId, files: vFiles, label } = pendingVersionSave;
-          saveVersion(projectId, userId, vFiles, label).catch(() => {});
+          if (projectId && projectId !== 'new') {
+            saveVersion(projectId, userId, vFiles, label).catch(() => {});
+          } else {
+            // Park the data — the useEffect above will fire it once the real ID arrives
+            deferredVersionSave.current = { userId, files: vFiles, label };
+          }
         }
       }
     }
@@ -1253,7 +1490,7 @@ export default function PreviewPanel() {
       key={key}
       ref={iframeRef}
       className="w-full h-full border-0"
-      sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
       title="App Preview"
       srcDoc={srcDoc}
     />

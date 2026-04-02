@@ -117,7 +117,7 @@ export default function EditorPage() {
     if (projectId === 'new') {
       // Fresh new project — no DB row yet, start with empty state
       realProjectIdRef.current = null;
-      setProjectMeta({ projectId: 'new', projectName: 'Untitled Project', storageMode: 'supabase', projectConfig: null });
+      setProjectMeta({ projectId: 'new', projectName: 'Untitled Project', storageMode: 'localstorage', projectConfig: null });
       setFiles({}, true);
       setProjectSecrets({});
       clearMessages();
@@ -187,6 +187,24 @@ export default function EditorPage() {
     if (project.files && Object.keys(project.files).length > 0) {
       const sanitized = sanitizeGeneratedFiles(project.files as Record<string, string>);
       setFiles(sanitized, true);
+
+      // Re-apply schema.sql in background so tables always exist when preview loads
+      if (project.storage_mode === 'supabase' && resolvedConfig?.id) {
+        const schemaSql = (project.files as Record<string, string>)['schema.sql'];
+        if (schemaSql) {
+          fetch('/api/run-schema', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sql: schemaSql, projectId: resolvedConfig.id }),
+          }).then(r => r.json()).then(result => {
+            if (result.success) {
+              console.log('[editor] schema.sql re-applied on load for', resolvedConfig!.id);
+            } else {
+              console.warn('[editor] schema.sql re-apply failed:', result.error);
+            }
+          }).catch(() => {});
+        }
+      }
     } else {
       setFiles({}, true);
     }
@@ -282,12 +300,16 @@ export default function EditorPage() {
       if (!authData.user) return;
 
       const name = useStore.getState().currentProjectName ?? 'Untitled Project';
-      const hex = Math.random().toString(16).slice(2, 10);
-      const schemaId = `p_${hex}`;
+      const currentStorageMode = useStore.getState().storageMode ?? 'localstorage';
+      // Reuse the schema ID already set by StorageSelector (which was used in the AI prompt).
+      // Generating a new ID here would cause a mismatch: tables are in the StorageSelector schema
+      // but the DB record and preview would reference a different schema.
+      const existingConfig = useStore.getState().projectConfig;
+      const schemaId = existingConfig?.id ?? `p_${Math.random().toString(16).slice(2, 10)}`;
       // Embed secrets in project_config (no extra DB column needed)
       const config = {
         id: schemaId,
-        storageMode: 'supabase',
+        storageMode: currentStorageMode,
         secrets: Object.keys(currentSecrets).length > 0 ? currentSecrets : undefined,
       };
 
@@ -297,7 +319,7 @@ export default function EditorPage() {
           user_id: authData.user.id,
           name,
           files: currentFiles,
-          storage_mode: 'supabase',
+          storage_mode: currentStorageMode,
           project_config: config,
           updated_at: new Date().toISOString(),
         })
@@ -311,13 +333,6 @@ export default function EditorPage() {
 
       realProjectIdRef.current = data.id;
       setProjectMeta({ projectId: data.id, projectName: name, storageMode: 'supabase', projectConfig: config as typeof projectConfig });
-
-      // Provision schema in background
-      fetch('/api/provision/supabase', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId: schemaId }),
-      }).catch(() => {});
 
       // Update URL to real ID without triggering a full re-load
       skipNextLoadRef.current = true;
