@@ -12,9 +12,19 @@ function transformCode(code: string): string {
   // These patterns survive sanitizeGeneratedFiles if the AI generates them in
   // subtle variations, or if files are loaded from an old project build.
   // "new toISOString()" family → "new Date().toISOString()"
+  // MUST run before TypeScript compilation — some produce SyntaxErrors that abort the entire eval.
   code = code.replace(/\bnew\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
   code = code.replace(/\bDate\.now\(\)\.toISOString\(\)/g, 'new Date().toISOString()');
   code = code.replace(/\bnew\s+Date\.toISOString\s*\(\)/g, 'new Date().toISOString()');
+  // "new Date toISOString()" — space instead of dot/parens. This is the most common AI mistake:
+  // it produces SyntaxError "Unexpected identifier 'toISOString'" which crashes the whole eval.
+  code = code.replace(/\bnew\s+Date\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
+  // "new Date() toISOString()" — instantiation with parens but missing dot before method.
+  code = code.replace(/\bnew\s+Date\s*\(\s*\)\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
+  // Generic: any expression ending in a non-dot, non-whitespace char + space(s) + toISOString(
+  // Extends beyond \w|\) to also cover ] " ' ` and other chars that can end an expression.
+  // This catches: dates[0] toISOString()  "dateStr" toISOString()  etc.
+  code = code.replace(/([^\s.])[ \t]+toISOString\s*\(/g, '$1.toISOString(');
   // PostgreSQL UUID functions → crypto.randomUUID()
   code = code.replace(/\bgen_random_uuid\s*\(\)/g, 'crypto.randomUUID()');
   code = code.replace(/\buuid_generate_v4\s*\(\)/g, 'crypto.randomUUID()');
@@ -104,6 +114,10 @@ function transformCode(code: string): string {
   code = code.replace(/\bexport\s+(?=(?:interface|type)\s)/g, '');
   // export { X, Y }  (named re-exports without 'from' — just drop them)
   code = code.replace(/^export\s*\{[^}]*\};?\s*$/gm, '');
+  // export type { X, Y }  (type-only named exports WITHOUT 'from' — drop them too)
+  // These are not caught by the `export type { X } from '...'` regex above because they have no 'from'.
+  // TypeScript should erase them, but stripping here prevents any edge-case output with module:None.
+  code = code.replace(/^export\s+type\s*\{[^}]*\};?\s*$/gm, '');
 
   // Prepend library var declarations (after stripping so they don't get stripped themselves)
   if (extraVarDecls.length > 0) {
@@ -212,23 +226,46 @@ function buildStorageScripts(config?: PreviewConfig): string {
       '    );\n'
     )
     : (
-      '    // Auth-only client — data storage uses localStorage in this mode\n' +
-      '    window.db = window.supabase.createClient("' + SUPABASE_URL + '", "' + SUPABASE_ANON_KEY + '");\n'
+      '    // Service role key used even in localStorage mode so writes/uploads bypass RLS.\n' +
+      '    window.db = window.supabase.createClient("' + SUPABASE_URL + '", "' + SUPABASE_SERVICE_KEY + '");\n'
     );
 
-  const uploadHelper = isSupabaseMode
-    ? (
-      '    window.uploadFile = async function(file) {\n' +
-      '      var path = "' + projectId + '/" + Date.now() + "_" + file.name;\n' +
-      '      var result = await window.db.storage.from("uploads").upload(path, file, { upsert: true });\n' +
-      '      if (result.error) throw new Error(result.error.message);\n' +
-      '      return window.db.storage.from("uploads").getPublicUrl(result.data.path).data.publicUrl;\n' +
-      '    };\n' +
-      '    console.log("[Supabase] window.db + window.uploadFile ready for project: ' + projectId + '");\n'
-    )
-    : (
-      '    console.log("[Supabase] window.db ready (auth mode)");\n'
-    );
+  // Upload path prefix: use projectId when available, otherwise "sandbox"
+  const uploadPrefix = projectId || 'sandbox';
+  // window.uploadFile routes through the Orchids parent page via postMessage so the
+  // upload goes through the server-side /api/upload endpoint (supabaseAdmin, bypasses RLS).
+  // Direct Supabase Storage calls from the iframe fail with RLS errors because the
+  // iframe's null origin can't use the service-role key reliably across all storage policies.
+  const uploadHelper = (
+    '    window.uploadFile = async function(file) {\n' +
+    '      return new Promise(function(resolve, reject) {\n' +
+    '        var msgId = "__upload_" + Date.now() + "_" + Math.random().toString(36).slice(2);\n' +
+    '        var reader = new FileReader();\n' +
+    '        reader.onerror = function() { reject(new Error("Failed to read file")); };\n' +
+    '        reader.onload = function(e) {\n' +
+    '          var base64 = e.target.result.split(",")[1];\n' +
+    '          function onMsg(evt) {\n' +
+    '            if (!evt.data || evt.data.__uploadResult !== msgId) return;\n' +
+    '            window.removeEventListener("message", onMsg);\n' +
+    '            if (evt.data.error) reject(new Error(evt.data.error));\n' +
+    '            else resolve(evt.data.url);\n' +
+    '          }\n' +
+    '          window.addEventListener("message", onMsg);\n' +
+    '          window.parent.postMessage({\n' +
+    '            __orchidsUploadRequest: true, id: msgId,\n' +
+    '            projectId: "' + uploadPrefix + '",\n' +
+    '            filename: file.name, mimeType: file.type, data: base64\n' +
+    '          }, "*");\n' +
+    '          setTimeout(function() {\n' +
+    '            window.removeEventListener("message", onMsg);\n' +
+    '            reject(new Error("Upload timed out after 30s"));\n' +
+    '          }, 30000);\n' +
+    '        };\n' +
+    '        reader.readAsDataURL(file);\n' +
+    '      });\n' +
+    '    };\n' +
+    '    console.log("[Supabase] window.db + window.uploadFile ready' + (projectId ? ' for project: ' + projectId : ' (sandbox mode)') + '");\n'
+  );
 
   // Shims so AI-generated code that imports supabase helpers still works.
   // import { createClient } from '@supabase/supabase-js' → stripped → createClient undefined
@@ -238,7 +275,8 @@ function buildStorageScripts(config?: PreviewConfig): string {
     '    window.createClient = function(url, key, opts) {\n' +
     '      // Return pre-configured client (schema already set); ignore args to avoid wrong schema\n' +
     '      if (opts && opts.db && opts.db.schema && opts.db.schema !== "' + (projectId || '') + '") {\n' +
-    '        return window.supabase.createClient(url || "' + SUPABASE_URL + '", key || "' + SUPABASE_ANON_KEY + '", opts);\n' +
+    '        // Use service role key so writes bypass RLS regardless of what key the AI passed\n' +
+    '        return window.supabase.createClient(url || "' + SUPABASE_URL + '", "' + SUPABASE_SERVICE_KEY + '", opts);\n' +
     '      }\n' +
     '      return window.db;\n' +
     '    };\n' +
@@ -270,15 +308,28 @@ function buildStorageScripts(config?: PreviewConfig): string {
     '    window.COALESCE = function() { for (var i = 0; i < arguments.length; i++) { if (arguments[i] != null) return arguments[i]; } return null; };\n' +
     '    window.NULLIF = function(a, b) { return a === b ? null : a; };\n' +
     '    window.CAST = function(v) { return v; };\n' +
-    '    // Auth stubs — prevents "user/session/profile is not defined" crashes in preview\n' +
-    '    var _mockUser = { id: "demo_user_01", email: "demo@example.com", name: "Demo User", full_name: "Demo User", username: "demouser", role: "user", avatar_url: "", created_at: new Date().toISOString() };\n' +
-    '    var _mockSession = { user: _mockUser, access_token: "' + (isSupabaseMode ? SUPABASE_SERVICE_KEY : SUPABASE_ANON_KEY) + '", refresh_token: "demo_refresh", expires_at: 9999999999 };\n' +
-    '    if (typeof window.user === "undefined") window.user = _mockUser;\n' +
-    '    if (typeof window.profile === "undefined") window.profile = _mockUser;\n' +
-    '    if (typeof window.session === "undefined") window.session = _mockSession;\n' +
-    '    if (typeof window.currentUser === "undefined") window.currentUser = _mockUser;\n' +
-    '    // Patch window.db.auth so ANY Supabase auth pattern renders without crashing.\n' +
-    '    // This runs after window.db is created, overriding the real auth methods with mock ones.\n' +
+    '    // Stateful auth shim — auth starts UNAUTHENTICATED, signIn/signOut actually change state\n' +
+    '    // so protected-route guards, onAuthStateChange, and getSession all work correctly.\n' +
+    '    var _mockUserTemplate = { id: "00000000-0000-0000-0000-000000000001", email: "demo@example.com", name: "Demo User", full_name: "Demo User", username: "demouser", role: "user", avatar_url: "", created_at: new Date().toISOString() };\n' +
+    '    var _ACCESS_TOKEN = "' + (isSupabaseMode ? SUPABASE_SERVICE_KEY : SUPABASE_ANON_KEY) + '";\n' +
+    '    // Auth state — starts NULL (not signed in). signIn/signUp set this; signOut clears it.\n' +
+    '    window._authState = { user: null, session: null };\n' +
+    '    window._authListeners = window._authListeners || [];\n' +
+    '    window._authNotify = function(event, session) {\n' +
+    '      window.user = session ? session.user : null;\n' +
+    '      window.session = session;\n' +
+    '      window.currentUser = session ? session.user : null;\n' +
+    '      window.profile = session ? session.user : null;\n' +
+    '      for (var i = 0; i < window._authListeners.length; i++) {\n' +
+    '        try { window._authListeners[i](event, session); } catch(e) {}\n' +
+    '      }\n' +
+    '    };\n' +
+    '    // Initially null — auth apps will redirect to login, non-auth apps ignore these\n' +
+    '    if (typeof window.user === "undefined") window.user = null;\n' +
+    '    if (typeof window.profile === "undefined") window.profile = null;\n' +
+    '    if (typeof window.session === "undefined") window.session = null;\n' +
+    '    if (typeof window.currentUser === "undefined") window.currentUser = null;\n' +
+    '    // Patch window.db.auth with a fully stateful shim.\n' +
     '    // Fetch CORS safety net — API calls in sports/data apps fail with CORS in the sandbox iframe.\n' +
     '    // Instead of crashing the app via unhandledrejection, return an empty mock response so the\n' +
     '    // component renders with empty state (shows loading/empty placeholder) rather than crashing.\n' +
@@ -332,18 +383,112 @@ function buildStorageScripts(config?: PreviewConfig): string {
     '    };\n' +
     '    window.WebSocket.CONNECTING = 0; window.WebSocket.OPEN = 1; window.WebSocket.CLOSING = 2; window.WebSocket.CLOSED = 3;\n' +
     '    if (window.db && window.db.auth) {\n' +
-    '      window.db.auth.user = function() { return _mockUser; };\n' +
-    '      window.db.auth.getUser = async function() { return { data: { user: _mockUser }, error: null }; };\n' +
-    '      window.db.auth.getSession = async function() { return { data: { session: _mockSession }, error: null }; };\n' +
-    '      window.db.auth.session = function() { return _mockSession; };\n' +
-    '      window.db.auth.signIn = async function() { return { data: { user: _mockUser, session: _mockSession }, error: null }; };\n' +
-    '      window.db.auth.signUp = async function() { return { data: { user: _mockUser, session: _mockSession }, error: null }; };\n' +
-    '      window.db.auth.signInWithPassword = async function() { return { data: { user: _mockUser, session: _mockSession }, error: null }; };\n' +
-    '      window.db.auth.signOut = async function() { return { error: null }; };\n' +
-    '      window.db.auth.onAuthStateChange = function(cb) {\n' +
-    '        setTimeout(function() { try { cb("SIGNED_IN", _mockSession); } catch(e) {} }, 0);\n' +
-    '        return { data: { subscription: { unsubscribe: function() {} } } };\n' +
-    '      };\n' +
+    (isSupabaseMode
+      // ── SUPABASE MODE: real authentication via anon-key client ──────────────────
+      // window.db uses the SERVICE ROLE key (bypasses RLS for all DB reads/writes).
+      // But auth (signIn / signUp / signOut) uses a separate ANON key client so
+      // only valid Supabase credentials are accepted — fake emails won't work.
+      ? (
+        '      // Real auth client (anon key) — validates real Supabase credentials.\n' +
+        '      // Project-scoped storageKey: signOut() here does NOT affect the platform session.\n' +
+        '      window._authClient = window.supabase.createClient("' + SUPABASE_URL + '", "' + SUPABASE_ANON_KEY + '", {\n' +
+        '        auth: { storageKey: "preview_' + projectId + '_auth", persistSession: true, autoRefreshToken: true }\n' +
+        '      });\n' +
+        '      // Email namespacing — isolates auth per project on the shared Supabase instance.\n' +
+        '      // user@example.com → user+' + projectId + '@example.com in Supabase auth.\n' +
+        '      // The suffix is stripped from all returned user objects so app code sees clean emails.\n' +
+        '      var _PID = "' + projectId + '";\n' +
+        '      function _nsEmail(e) {\n' +
+        '        if (!e || typeof e !== "string") return e;\n' +
+        '        var at = e.lastIndexOf("@"); return at < 0 ? e : e.slice(0, at) + "+" + _PID + e.slice(at);\n' +
+        '      }\n' +
+        '      function _stripUser(u) {\n' +
+        '        if (!u || !u.email) return u;\n' +
+        '        return Object.assign({}, u, { email: u.email.replace("+" + _PID + "@", "@") });\n' +
+        '      }\n' +
+        '      function _stripSession(s) {\n' +
+        '        if (!s) return s;\n' +
+        '        return s.user ? Object.assign({}, s, { user: _stripUser(s.user) }) : s;\n' +
+        '      }\n' +
+        '      function _fixResult(r) {\n' +
+        '        if (!r || !r.data) return r;\n' +
+        '        var d = Object.assign({}, r.data);\n' +
+        '        if (d.user) d.user = _stripUser(d.user);\n' +
+        '        if (d.session) d.session = _stripSession(d.session);\n' +
+        '        return Object.assign({}, r, { data: d });\n' +
+        '      }\n' +
+        '      // Global listener: strip namespace from real auth events before dispatching to app\n' +
+        '      window._authClient.auth.onAuthStateChange(function(event, session) {\n' +
+        '        var clean = _stripSession(session);\n' +
+        '        window._authState.user = clean ? clean.user : null;\n' +
+        '        window._authState.session = clean;\n' +
+        '        window._authNotify(event, clean);\n' +
+        '      });\n' +
+        '      // Restore any existing session from localStorage (e.g. after page refresh)\n' +
+        '      window._authClient.auth.getSession().then(function(r) {\n' +
+        '        if (r.data && r.data.session) {\n' +
+        '          var clean = _stripSession(r.data.session);\n' +
+        '          window._authState.user = clean.user;\n' +
+        '          window._authState.session = clean;\n' +
+        '        }\n' +
+        '      });\n' +
+        '      window.db.auth.user = function() { return window._authState.user; };\n' +
+        '      window.db.auth.session = function() { return window._authState.session; };\n' +
+        '      window.db.auth.getUser = async function() { return _fixResult(await window._authClient.auth.getUser()); };\n' +
+        '      window.db.auth.getSession = async function() { return _fixResult(await window._authClient.auth.getSession()); };\n' +
+        '      window.db.auth.signInWithPassword = async function(creds) {\n' +
+        '        return _fixResult(await window._authClient.auth.signInWithPassword({ email: _nsEmail(creds.email), password: creds.password }));\n' +
+        '      };\n' +
+        '      window.db.auth.signIn = window.db.auth.signInWithPassword;\n' +
+        '      window.db.auth.signUp = async function(creds) {\n' +
+        '        var opts = creds.options ? Object.assign({}, creds.options) : undefined;\n' +
+        '        return _fixResult(await window._authClient.auth.signUp({ email: _nsEmail(creds.email), password: creds.password, options: opts }));\n' +
+        '      };\n' +
+        '      window.db.auth.signOut = async function() { return window._authClient.auth.signOut(); };\n' +
+        '      window.db.auth.onAuthStateChange = function(cb) {\n' +
+        '        window._authListeners.push(cb);\n' +
+        '        setTimeout(function() { var s = window._authState.session; try { cb(s ? "SIGNED_IN" : "SIGNED_OUT", s); } catch(e) {} }, 50);\n' +
+        '        return { data: { subscription: { unsubscribe: function() {\n' +
+        '          window._authListeners = window._authListeners.filter(function(l) { return l !== cb; });\n' +
+        '        } } } };\n' +
+        '      };\n'
+      )
+      // ── LOCALSTORAGE MODE: mock auth — any credentials work (sandbox demo) ──────
+      : (
+        '      window.db.auth.user = function() { return window._authState.user; };\n' +
+        '      window.db.auth.getUser = async function() { return { data: { user: window._authState.user }, error: null }; };\n' +
+        '      window.db.auth.getSession = async function() { return { data: { session: window._authState.session }, error: null }; };\n' +
+        '      window.db.auth.session = function() { return window._authState.session; };\n' +
+        '      window.db.auth.signInWithPassword = async function(creds) {\n' +
+        '        var u = Object.assign({}, _mockUserTemplate, { email: (creds && creds.email) || _mockUserTemplate.email });\n' +
+        '        var s = { user: u, access_token: _ACCESS_TOKEN, refresh_token: "demo_refresh", expires_at: 9999999999 };\n' +
+        '        window._authState.user = u; window._authState.session = s;\n' +
+        '        window._authNotify("SIGNED_IN", s);\n' +
+        '        return { data: { user: u, session: s }, error: null };\n' +
+        '      };\n' +
+        '      window.db.auth.signIn = window.db.auth.signInWithPassword;\n' +
+        '      window.db.auth.signUp = async function(creds) {\n' +
+        '        var u = Object.assign({}, _mockUserTemplate, { email: (creds && creds.email) || _mockUserTemplate.email });\n' +
+        '        var s = { user: u, access_token: _ACCESS_TOKEN, refresh_token: "demo_refresh", expires_at: 9999999999 };\n' +
+        '        window._authState.user = u; window._authState.session = s;\n' +
+        '        window._authNotify("SIGNED_IN", s);\n' +
+        '        return { data: { user: u, session: s }, error: null };\n' +
+        '      };\n' +
+        '      window.db.auth.signOut = async function() {\n' +
+        '        window._authState.user = null; window._authState.session = null;\n' +
+        '        window._authNotify("SIGNED_OUT", null);\n' +
+        '        return { error: null };\n' +
+        '      };\n' +
+        '      window.db.auth.onAuthStateChange = function(cb) {\n' +
+        '        window._authListeners.push(cb);\n' +
+        '        var curSession = window._authState.session;\n' +
+        '        setTimeout(function() { try { cb(curSession ? "SIGNED_IN" : "SIGNED_OUT", curSession); } catch(e) {} }, 0);\n' +
+        '        return { data: { subscription: { unsubscribe: function() {\n' +
+        '          window._authListeners = window._authListeners.filter(function(l) { return l !== cb; });\n' +
+        '        } } } };\n' +
+        '      };\n'
+      )
+    ) +
     '    }\n';
 
   return (
@@ -721,7 +866,8 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     // The root/ReactDOM/showError/reportReady vars are accessible via closure.
     '        var renderCall = \'\\n;(function(){\\n\' +\n' +
     '          \'  if (typeof App !== "undefined") {\\n\' +\n' +
-    '          \'    ReactDOM.createRoot(root).render(React.createElement(App));\\n\' +\n' +
+    '          \'    if (!window.__orchidsRoot) window.__orchidsRoot = ReactDOM.createRoot(root);\\n\' +\n' +
+    '          \'    window.__orchidsRoot.render(React.createElement(App));\\n\' +\n' +
     '          \'    reportReady();\\n\' +\n' +
     '          \'  } else {\\n\' +\n' +
     '          \'    showError("No App component","Export a default function named App from App.tsx");\\n\' +\n' +
@@ -743,12 +889,14 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     // any const/let/var with the same name declared later in the merged eval code.
     '          "var _u = window.user || { id: \'demo_user_01\', email: \'demo@example.com\', name: \'Demo User\', full_name: \'Demo User\', username: \'demouser\', role: \'admin\', avatar_url: \'\', created_at: \'2024-01-01\', updated_at: \'2024-01-01\' };" +\n' +
     '          "var user = _u; var profile = window.profile || _u; var session = window.session || { user: _u, access_token: \'demo_token\', expires_at: 9999999999 };" +\n' +
-    '          "var currentUser = window.currentUser || _u; var authUser = _u; var auth = { user: _u, currentUser: _u, isAuthenticated: true, loading: false };" +\n' +
-    // Safe mock for useAuth()/useUser() hook return values — prevents crash when AI writes
-    // const { user } = useAuth() and useAuth is undefined (returns an object safely).
-    '          "var useAuth = function() { return { user: _u, session: window.session, loading: false, error: null, isAuthenticated: true, signIn: async function() {}, signOut: async function() {} }; };" +\n' +
-    '          "var useUser = useAuth; var useSession = function() { return { data: { session: window.session }, status: \'authenticated\' }; };" +\n' +
-    '          "var useSupabaseUser = function() { return _u; }; var useCurrentUser = useAuth;" +\n' +
+    '          "var _as = window._authState || { user: null, session: null };" +\n' +
+    '          "var currentUser = _as.user; var authUser = _as.user; var auth = { user: _as.user, currentUser: _as.user, isAuthenticated: !!_as.user, loading: false };" +\n' +
+    // useAuth fallback — uses real stateful auth so isAuthenticated starts false and
+    // changes after signIn/signOut. NOTE: as a var stub it is shadowed by the AI's own
+    // useAuth definition when generated code defines it properly.
+    '          "var useAuth = function() { var st = window._authState||{user:null,session:null}; return { user: st.user, session: st.session, loading: false, error: null, isAuthenticated: !!st.user, isLoading: false, signIn: async function(e,p){return window.db?window.db.auth.signInWithPassword({email:e,password:p}):{};}, signOut: async function(){return window.db?window.db.auth.signOut():{};}, signUp: async function(e,p){return window.db?window.db.auth.signUp({email:e,password:p}):{};} }; };" +\n' +
+    '          "var useUser = useAuth; var useSession = function() { var st = window._authState||{session:null}; return { data: { session: st.session }, status: st.session?\'authenticated\':\'unauthenticated\' }; };" +\n' +
+    '          "var useSupabaseUser = function() { return window._authState?window._authState.user:null; }; var useCurrentUser = useAuth;" +\n' +
     // Pre-define common ALL_CAPS data constants as empty arrays. These are overridden when
     // data.ts defines them properly (const ORDERS = [...] shadows the var). The fallback
     // prevents "X is not defined" crashes when a component evaluates before data.ts (wrong sort).
@@ -926,6 +1074,40 @@ export function buildPreviewHTML(files: Record<string, string>, config?: Preview
     '            }\n' +
     '          }\n' +
     '        })();\n' +
+    // Hot update listener — re-transpiles and re-renders without a full iframe reload.
+    // PreviewPanel sends { type: "__hotUpdate", code: string } when only files changed.
+    // On success: calls window.__orchidsRoot.render(App) + sends preview-ready.
+    // On failure: sends __hotUpdateFailed so PreviewPanel falls back to a full reload.
+    '        window.addEventListener("message", function(evt) {\n' +
+    '          if (!evt.data || evt.data.type !== "__hotUpdate") return;\n' +
+    '          try {\n' +
+    '            var hotResult = ts.transpileModule(evt.data.code, {\n' +
+    '              compilerOptions: {\n' +
+    '                target: ts.ScriptTarget.ES2018,\n' +
+    '                module: ts.ModuleKind.None,\n' +
+    '                jsx: ts.JsxEmit.React,\n' +
+    '                jsxFactory: "React.createElement",\n' +
+    '                jsxFragmentFactory: "React.Fragment",\n' +
+    '                esModuleInterop: true,\n' +
+    '                allowSyntheticDefaultImports: true,\n' +
+    '                strict: false,\n' +
+    '                noEmitOnError: false,\n' +
+    '              },\n' +
+    '              fileName: "app.tsx",\n' +
+    '            });\n' +
+    '            if (!hotResult.outputText || !hotResult.outputText.trim()) {\n' +
+    '              window.parent.postMessage({ type: "__hotUpdateFailed", message: "TypeScript produced no output" }, "*");\n' +
+    '              return;\n' +
+    '            }\n' +
+    // Pre-convert const/let → var to avoid "already declared" errors on re-eval
+    '            var hotCode = shim + hotResult.outputText.replace(/\\bconst\\b/g,"var").replace(/\\blet\\b/g,"var") + renderCall;\n' +
+    '            eval(hotCode);\n' +
+    '          } catch(e) {\n' +
+    '            var hm = (e && e.message) || String(e);\n' +
+    '            reportError(hm);\n' +
+    '            window.parent.postMessage({ type: "__hotUpdateFailed", message: hm }, "*");\n' +
+    '          }\n' +
+    '        });\n' +
     '      } catch(e) {\n' +
     '        var msg = e.message || String(e);\n' +
     '        showError("Compile Error", msg);\n' +

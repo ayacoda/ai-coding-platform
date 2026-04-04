@@ -3,6 +3,9 @@ import LandingPage from './pages/LandingPage';
 import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
 import EditorPage from './pages/EditorPage';
+import BillingPage from './pages/BillingPage';
+import PrivacyPage from './pages/PrivacyPage';
+import TermsPage from './pages/TermsPage';
 import ProtectedRoute from './components/ProtectedRoute';
 
 export default function App() {
@@ -10,6 +13,10 @@ export default function App() {
     <Routes>
       <Route path="/" element={<LandingPage />} />
       <Route path="/login" element={<LoginPage />} />
+      <Route path="/pricing" element={<Navigate to="/#pricing" replace />} />
+      <Route path="/features" element={<Navigate to="/#features" replace />} />
+      <Route path="/privacy" element={<PrivacyPage />} />
+      <Route path="/terms" element={<TermsPage />} />
       <Route
         path="/dashboard"
         element={
@@ -23,6 +30,14 @@ export default function App() {
         element={
           <ProtectedRoute>
             <EditorPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/billing"
+        element={
+          <ProtectedRoute>
+            <BillingPage />
           </ProtectedRoute>
         }
       />

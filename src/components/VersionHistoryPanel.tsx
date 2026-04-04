@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useStore } from '../store/useStore';
 import { fetchVersions, deleteVersion } from '../lib/versions';
 import { supabase } from '../lib/supabase';
+import { cancelGeneration } from '../lib/chat';
 import type { ProjectVersion } from '../lib/versions';
 
 function timeAgo(dateStr: string): string {
@@ -48,6 +49,10 @@ export default function VersionHistoryPanel({ projectId, show, onClose, onRestor
 
   async function handleRestore(version: ProjectVersion) {
     setRestoringId(version.id);
+
+    // Stop any in-progress generation immediately before restoring
+    cancelGeneration(true);
+    useStore.getState().setIsGenerating(false);
 
     // 1. Set files directly in the store (instant, no AI involved)
     setFiles(version.files, true);

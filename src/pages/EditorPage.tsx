@@ -117,7 +117,7 @@ export default function EditorPage() {
     if (projectId === 'new') {
       // Fresh new project — no DB row yet, start with empty state
       realProjectIdRef.current = null;
-      setProjectMeta({ projectId: 'new', projectName: 'Untitled Project', storageMode: 'localstorage', projectConfig: null });
+      setProjectMeta({ projectId: 'new', projectName: 'Untitled Project', storageMode: 'supabase', projectConfig: null });
       setFiles({}, true);
       setProjectSecrets({});
       clearMessages();
@@ -216,10 +216,10 @@ export default function EditorPage() {
     }
     // else: clearMessages() was already called before loadProject — welcome screen stays
 
-    // Restore prompt queue — always restore as paused so user can choose to resume
+    // Restore prompt queue — auto-resume so generation continues where it left off
     const savedQueue = project.prompt_queue as import('../types').QueueItem[] | null;
     if (savedQueue && savedQueue.length > 0) {
-      setQueue(savedQueue, true); // paused: true so it doesn't auto-fire on load
+      setQueue(savedQueue, false); // paused: false — resumes automatically on load
     }
 
     isFirstLoad.current = false;

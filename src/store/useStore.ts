@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
-import { FileSystem, Message, ModelId, QueueItem, RightPanelTab, StorageMode, ProjectConfig } from '../types';
+import { FileSystem, Message, ModelId, QueueItem, RightPanelTab, StorageMode, ProjectConfig, ChatAttachment } from '../types';
 
 const WELCOME_MESSAGE: Message = {
   id: 'welcome',
@@ -49,12 +49,17 @@ interface AppStore {
   setMessages: (messages: Message[]) => void;
   clearVisibleMessages: () => void;
   updateLastAssistantPipeline: (pipeline: Message['pipeline']) => void;
+  updateLastAssistantSummary: (summary: NonNullable<Message['generationSummary']>) => void;
   removeLastMessages: (count: number) => void;
   setLastAssistantBuildIntent: (prompt: string) => void;
 
   // UI State
   isGenerating: boolean;
   setIsGenerating: (v: boolean) => void;
+  /** True while a plan approval card is visible and awaiting user decision.
+   *  Blocks the queue from dequeuing the next item until the user acts. */
+  isPlanPending: boolean;
+  setIsPlanPending: (v: boolean) => void;
   rightPanel: RightPanelTab;
   setRightPanel: (panel: RightPanelTab) => void;
 
@@ -72,11 +77,16 @@ interface AppStore {
   promptQueue: QueueItem[];
   queuePaused: boolean;
   addToQueue: (prompt: string) => void;
+  addToQueueFront: (item: QueueItem) => void;
   removeFromQueue: (id: string) => void;
   updateQueueItem: (id: string, prompt: string) => void;
   setQueuePaused: (paused: boolean) => void;
   clearQueue: () => void;
   setQueue: (queue: QueueItem[], paused: boolean) => void;
+  /** True when generation was stopped by the user (not by jam retry or normal completion).
+   *  Used by ChatPanel to restore the aborted queue item to the front. */
+  generationAbortedByUser: boolean;
+  setGenerationAbortedByUser: (v: boolean) => void;
 
   // Storage / project config
   storageMode: StorageMode;
@@ -98,6 +108,14 @@ interface AppStore {
   // Pending version snapshot — set after AI generation, consumed only on preview-ready
   pendingVersionSave: { projectId: string; userId: string; files: Record<string, string>; label: string } | null;
   setPendingVersionSave: (data: { projectId: string; userId: string; files: Record<string, string>; label: string } | null) => void;
+
+  // Pending screenshot from PreviewPanel — consumed by ChatPanel to add as attachment
+  pendingScreenshot: ChatAttachment | null;
+  setPendingScreenshot: (screenshot: ChatAttachment | null) => void;
+
+  // Capture trigger — ChatPanel sets this; PreviewPanel watches and executes
+  captureRequest: 'full' | 'region' | null;
+  setCaptureRequest: (req: 'full' | 'region' | null) => void;
 
   // API secrets for third-party integrations — stored in memory, injected into preview via window.ENV
   projectSecrets: Record<string, string>;
@@ -195,9 +213,20 @@ export const useStore = create<AppStore>()(
           }
           return { messages };
         }),
+      updateLastAssistantSummary: (summary) =>
+        set((state) => {
+          const messages = [...state.messages];
+          const lastIdx = messages.findLastIndex((m) => m.role === 'assistant');
+          if (lastIdx >= 0) {
+            messages[lastIdx] = { ...messages[lastIdx], generationSummary: summary };
+          }
+          return { messages };
+        }),
 
       isGenerating: false,
       setIsGenerating: (v) => set({ isGenerating: v }),
+      isPlanPending: false,
+      setIsPlanPending: (v) => set({ isPlanPending: v }),
       rightPanel: 'preview',
       setRightPanel: (panel) => set({ rightPanel: panel }),
 
@@ -218,6 +247,8 @@ export const useStore = create<AppStore>()(
             { id: `q_${Date.now()}_${Math.random().toString(36).slice(2)}`, prompt },
           ],
         })),
+      addToQueueFront: (item) =>
+        set((state) => ({ promptQueue: [item, ...state.promptQueue] })),
       removeFromQueue: (id) =>
         set((state) => ({ promptQueue: state.promptQueue.filter((item) => item.id !== id) })),
       updateQueueItem: (id, prompt) =>
@@ -227,8 +258,10 @@ export const useStore = create<AppStore>()(
       setQueuePaused: (paused) => set({ queuePaused: paused }),
       clearQueue: () => set({ promptQueue: [] }),
       setQueue: (queue, paused) => set({ promptQueue: queue, queuePaused: paused }),
+      generationAbortedByUser: false,
+      setGenerationAbortedByUser: (v) => set({ generationAbortedByUser: v }),
 
-      storageMode: 'localstorage',
+      storageMode: 'supabase',
       setStorageMode: (mode) => set({ storageMode: mode }),
       projectConfig: null,
       setProjectConfig: (config) => set({ projectConfig: config }),
@@ -241,6 +274,12 @@ export const useStore = create<AppStore>()(
 
       pendingVersionSave: null,
       setPendingVersionSave: (data) => set({ pendingVersionSave: data }),
+
+      pendingScreenshot: null,
+      setPendingScreenshot: (screenshot) => set({ pendingScreenshot: screenshot }),
+
+      captureRequest: null,
+      setCaptureRequest: (req) => set({ captureRequest: req }),
 
       projectSecrets: {},
       setProjectSecret: (envName, value) =>
@@ -267,7 +306,7 @@ export const useStore = create<AppStore>()(
         rightPanel: state.rightPanel,
         promptQueue: state.promptQueue,
         queuePaused: state.queuePaused,
-        // storageMode is intentionally NOT persisted — always defaults to 'localstorage'
+        // storageMode is intentionally NOT persisted — always defaults to 'supabase'
         // and is restored from the project record when a project is loaded.
         projectConfig: state.projectConfig,
       }),

@@ -4,6 +4,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createClient } from '@supabase/supabase-js';
+import Stripe from 'stripe';
 import { config } from 'dotenv';
 import { readFileSync, writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -34,6 +35,136 @@ function getRealAnthropicKey() {
 
 const realAnthropicKey = getRealAnthropicKey();
 const isRealAnthropicKey = realAnthropicKey.startsWith('sk-');
+
+function getRealVercelToken() {
+  const envToken = process.env.VERCEL_TOKEN || '';
+  if (envToken) return envToken;
+  try {
+    const envFile = readFileSync(join(__dirname, '../.env'), 'utf-8');
+    const match = envFile.match(/^VERCEL_TOKEN=(.+)$/m);
+    if (match) return match[1].trim();
+  } catch {}
+  return '';
+}
+
+function getRealEnvVar(name) {
+  const val = process.env[name] || '';
+  if (val) return val;
+  try {
+    const envFile = readFileSync(join(__dirname, '../.env'), 'utf-8');
+    const match = envFile.match(new RegExp(`^${name}=(.+)$`, 'm'));
+    if (match) return match[1].trim();
+  } catch {}
+  return '';
+}
+
+// ── Stripe ────────────────────────────────────────────────────────────────────
+const stripeSecretKey = getRealEnvVar('STRIPE_SECRET_KEY');
+const stripe = stripeSecretKey ? new Stripe(stripeSecretKey) : null;
+
+// ── Supabase admin client (service role — bypasses RLS) ───────────────────────
+function getSupabaseAdmin() {
+  return createClient(
+    getRealEnvVar('SUPABASE_URL') || process.env.SUPABASE_URL || '',
+    getRealEnvVar('SUPABASE_SERVICE_ROLE_KEY') || process.env.SUPABASE_SERVICE_ROLE_KEY || '',
+    { auth: { autoRefreshToken: false, persistSession: false } }
+  );
+}
+
+// ── Auth helper — verify JWT from Authorization header ────────────────────────
+async function getAuthUser(req) {
+  const auth = (req.headers['authorization'] || '').trim();
+  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : null;
+  if (!token) return null;
+  try {
+    const { data: { user }, error } = await getSupabaseAdmin().auth.getUser(token);
+    if (error || !user) return null;
+    return user;
+  } catch { return null; }
+}
+
+// ── Credit costs per build request type ──────────────────────────────────────
+const CREDIT_COSTS = { new_app: 50, redesign: 30, feature_add: 10, bug_fix: 5 };
+
+// ── Atomic credit deduction via direct PG ────────────────────────────────────
+// Uses UPDATE ... WHERE credits >= amount RETURNING credits for safe atomic check.
+async function deductCredits(userId, amount, description, metadata = {}) {
+  const dbUrl = process.env.SUPABASE_DB_URL;
+  if (!dbUrl) return { ok: false, reason: 'no_db', available: 0 };
+
+  const client = new PgClient({
+    connectionString: dbUrl,
+    ssl: { rejectUnauthorized: false },
+    connectionTimeoutMillis: 8000,
+  });
+  try {
+    await client.connect();
+
+    // Atomic check-and-deduct: only succeeds if credits >= amount
+    const result = await client.query(
+      `UPDATE public.profiles SET credits = credits - $1
+       WHERE id = $2 AND credits >= $1
+       RETURNING credits`,
+      [amount, userId]
+    );
+
+    if (result.rowCount === 0) {
+      // Get actual balance for error message
+      const balRes = await client.query(
+        `SELECT credits FROM public.profiles WHERE id = $1`, [userId]
+      );
+      const available = balRes.rows[0]?.credits ?? 0;
+      await client.end();
+      return { ok: false, reason: 'insufficient_credits', available };
+    }
+
+    const remaining = result.rows[0].credits;
+
+    // Log the transaction
+    await client.query(
+      `INSERT INTO public.credit_transactions (user_id, amount, type, description, metadata)
+       VALUES ($1, $2, 'deduction', $3, $4)`,
+      [userId, -amount, description, JSON.stringify(metadata)]
+    );
+
+    await client.end();
+    return { ok: true, remaining };
+  } catch (err) {
+    await client.end().catch(() => {});
+    console.error('[billing] deductCredits error:', err.message);
+    return { ok: false, reason: 'db_error', available: 0 };
+  }
+}
+
+// ── Add credits atomically ────────────────────────────────────────────────────
+async function addCredits(userId, amount, type, description, metadata = {}) {
+  const dbUrl = process.env.SUPABASE_DB_URL;
+  if (!dbUrl) return { ok: false };
+
+  const client = new PgClient({
+    connectionString: dbUrl,
+    ssl: { rejectUnauthorized: false },
+    connectionTimeoutMillis: 8000,
+  });
+  try {
+    await client.connect();
+    await client.query(
+      `UPDATE public.profiles SET credits = credits + $1 WHERE id = $2`,
+      [amount, userId]
+    );
+    await client.query(
+      `INSERT INTO public.credit_transactions (user_id, amount, type, description, metadata)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [userId, amount, type, description, JSON.stringify(metadata)]
+    );
+    await client.end();
+    return { ok: true };
+  } catch (err) {
+    await client.end().catch(() => {});
+    console.error('[billing] addCredits error:', err.message);
+    return { ok: false };
+  }
+}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -97,9 +228,9 @@ let openaiClient = new OpenAI({
 
 let geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
-const SUPABASE_URL = process.env.SUPABASE_URL || '';
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const SUPABASE_URL = getRealEnvVar('SUPABASE_URL') || process.env.SUPABASE_URL || '';
+const SUPABASE_ANON_KEY = getRealEnvVar('SUPABASE_ANON_KEY') || process.env.SUPABASE_ANON_KEY || '';
+const SUPABASE_SERVICE_ROLE_KEY = getRealEnvVar('SUPABASE_SERVICE_ROLE_KEY') || process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
 // Admin Supabase client (service role — server-side only)
 const supabaseAdmin = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
@@ -349,23 +480,18 @@ TypeScript interfaces are erased at runtime. interface Project + <Project /> = I
 MANDATORY naming: interface X → component MUST be XCard, XRow, XItem, or XTile. Always.
 Checklist: for every interface X in types.ts, confirm no JSX <X /> exists anywhere.
 
-【RULE 3 — NO AUTH IN DEFAULT APPS】
-The sandbox has NO logged-in user. Auth calls return null and crash.
-   ❌ window.db.auth.getUser(), getSession(), onAuthStateChange()
-   ❌ Login screens, signup forms, auth gates
-   ❌ createContext / useContext for auth — context providers are NOT wrapped around your app
-   ❌ useAuth(), useUser(), useSupabaseUser(), AuthContext — these hooks/contexts are UNDEFINED in sandbox
-   ❌ const { user } = useAuth()  or  const user = useContext(AuthContext)  → user will be null/undefined → crash
-   ❌ Any pattern that sets user via async effect (user starts null, component renders, user.name crashes)
-   ✅ Hardcode a mock user as a plain object constant at the top of App.tsx, then PASS AS PROPS:
-      const DEMO_USER = { id: 'user_01', name: 'Demo User', email: 'demo@example.com', role: 'admin', avatar_url: '' };
-      // Then: <ConfirmationPage user={DEMO_USER} booking={booking} />
-      // Components receive user as a prop — NEVER from context or global variable
-   ✅ Every component that needs user data must declare it as a typed prop: ({ user }: { user: typeof DEMO_USER })
-   ❌ NEVER destructure from useAuth()/useUser()/useSession() — these are undefined in sandbox
-      If AI writes: const { user } = useAuth() → user is undefined → crash on user.name
-      The fixer will replace these calls automatically, but the CORRECT approach is to pass user as a prop.
-Exception: Only use real auth (window.db.auth.*) when user explicitly asks for login/auth features.
+【RULE 3 — NO AUTH IN DEFAULT APPS (unless explicitly asked)】
+Do NOT add login screens or auth gates unless the user explicitly requests authentication.
+For non-auth apps:
+   ✅ Use a DEMO_USER constant at the top of App.tsx: const DEMO_USER = { id: 'user_01', name: 'Demo User', email: 'demo@example.com', role: 'admin', avatar_url: '' };
+   ✅ Pass user as props to components that need it
+   ❌ NEVER call useAuth()/useUser()/useSession()/useContext(AuthContext) in a non-auth app — crashes on .name access
+
+When the user DOES ask for authentication (login/signup/protected routes):
+   ✅ Use the full Supabase auth pattern with window.db.auth.* — the sandbox supports real stateful auth
+   ✅ onAuthStateChange, getSession, getUser all work correctly in the sandbox
+   ✅ Auth starts UNAUTHENTICATED — login screen shows first, protected pages redirect to login
+   ✅ Use AuthProvider pattern in App.tsx with useAuth() hook for clean auth state management
 
 【RULE 4 — FORBIDDEN PATTERNS】
    ❌ React Router / routing libs → use useState for page navigation
@@ -381,9 +507,11 @@ Exception: Only use real auth (window.db.auth.*) when user explicitly asks for l
    ❌ class decorators, process.env, const enum, namespace
    DATE / TIMESTAMP RULES — these patterns cause instant crashes in the sandbox:
    ❌ new toISOString()          → "Unexpected identifier 'toISOString'" parse error (LOOPS FOREVER)
+   ❌ new Date() toISOString()   → space instead of dot — "Unexpected identifier 'toISOString'" CRASH
+   ❌ new Date toISOString()     → missing dot and parens — same crash
    ❌ Date.now().toISOString()   → Date.now() returns a NUMBER, not a Date — .toISOString() crashes
    ❌ new Date.toISOString()     → missing () after Date — "not a constructor" crash
-   ✅ new Date().toISOString()   → ALWAYS use this. Note the () after Date — required.
+   ✅ new Date().toISOString()   → ALWAYS use this. Note: () after Date, then DOT, then toISOString().
    ✅ someDate.toISOString()     → only when someDate is already a Date object (e.g. from new Date())
    ✅ new Date(isoString)        → parse an ISO string into a Date object
    ✅ Date.now()                 → milliseconds since epoch (number) — NOT a Date, cannot call .toISOString() on it
@@ -420,9 +548,8 @@ Exception: Only use real auth (window.db.auth.*) when user explicitly asks for l
 
 SAFE DATA PATTERN for Supabase projects (use this EXACT pattern, no variations):
    // ⚠️ CRITICAL: ALWAYS declare SEED data and initialize state with it.
-   // The preview sandbox has NO authenticated session → window.db.insert() is BLOCKED by RLS.
-   // NEVER rely on seeding the DB at runtime — it will silently fail.
-   // NEVER initialize state as [] and expect the DB to populate it — DB may be empty or blocked.
+   // The preview sandbox uses service role key — writes work, BUT the DB may be empty on first load.
+   // NEVER initialize state as [] and expect the DB to populate it — DB may be empty initially.
    // ALWAYS pre-populate state with realistic demo data so the app renders useful content immediately.
    const SEED_ITEMS: ItemType[] = [
      { id: '1', /* all required fields with realistic values matching the app domain */ },
@@ -497,6 +624,14 @@ SAFE DATA PATTERN for localStorage/static apps (DEFAULT — use this unless DATA
    // In data.ts — ALL data as static arrays, no async, no window.db
    export const TICKETS: Ticket[] = [{ id: '1', ... }, { id: '2', ... }];
    // In component — use the static array directly, zero crash risk
+
+FILE UPLOADS (available in ALL modes):
+   ✅ window.uploadFile(file)  — always available, returns a public URL string
+   const url = await window.uploadFile(file);  // use this for ANY file/image upload
+   ❌ NEVER call supabase.storage.from(...).upload() directly — ALWAYS causes "row violates RLS policy" error
+   ❌ NEVER call window.db.storage.from(...).upload() directly — ALWAYS causes "row violates RLS policy" error
+   ❌ NEVER write your own upload function using Supabase Storage — use window.uploadFile exclusively
+   ✅ window.uploadFile handles ALL file types, returns a stable public URL, works in every environment
 
 【RULE 6 — IMPORTS & FILES】
    ✅ import { useState } from 'react' • import type { X } from './types'
@@ -826,9 +961,12 @@ CRASH PREVENTION:
   □ No top-level async, no require(), no npm packages
   □ No two components with the same export name
   □ No reserved React global names used as local variables (Fragment, memo, Children, etc.)
-  □ All Date usage correct: new Date().toISOString() ✅ | new toISOString() ❌ | Date.now().toISOString() ❌ | new Date.toISOString() ❌
+  □ All Date usage correct: new Date().toISOString() ✅ | new toISOString() ❌ | Date.now().toISOString() ❌ | new Date.toISOString() ❌ | new Date toISOString() ❌ | new Date() toISOString() ❌ — MUST have a DOT before toISOString: new Date().toISOString()
   □ All UUID generation uses crypto.randomUUID() — NOT gen_random_uuid() or uuid_generate_v4() (those are SQL only)
   □ No Supabase createClient import — window.db is pre-loaded, no import needed
+  □ NEVER add "readiness" guards on window.db — it is ALWAYS available the moment any component runs. No isDbReady, isWorkspaceReady, supabaseReady, dbReady, isReady, or any other loading gate on window.db. Never show "Not ready — please wait" or similar messages. Call window.db.from(...) directly, always.
+  □ NEVER use user?.id || '' or user?.id || 'unknown' — empty string and non-UUID strings cause "invalid input syntax for type uuid" DB errors. Always guard: if (!user?.id) return; before any insert that includes user_id. Use user.id only when user is confirmed non-null.
+  □ Seed data user_id values MUST use the demo UUID '00000000-0000-0000-0000-000000000001' so preview DB queries match the logged-in demo user
 
 MODIFICATION INTEGRITY (feature_add / bug_fix only — skip for new_app/redesign):
   □ Did NOT change any CSS classes, colors, spacing, or visual layout beyond what was requested
@@ -915,6 +1053,19 @@ FEATURE ADD / MODIFICATION — surgical precision:
 
 AUTHENTICATION (when user explicitly asks):
   Use window.db.auth.* — NEVER hardcode credentials.
+
+  ⚠️ SANDBOX PARSE ERROR PREVENTION:
+  The sandbox strips TypeScript types before compilation. These patterns cause "Unexpected identifier 'undefined'" crashes:
+    ❌ createContext(null as unknown as AuthContextType)  →  ✅ createContext(null)
+    ❌ const ctx = useContext(AuthContext)!               →  ✅ const ctx = useContext(AuthContext)
+    ❌ x as SomeType | undefined                         →  ✅ x
+  Keep ALL TypeScript type annotations in the standard position (after :) so they are erased correctly.
+  For auth context default values, ALWAYS use the literal: createContext(null) — never use \`as\` casts.
+
+  ⚠️ AUTH CONTEXT RULE: If you create a React Context for auth (AuthContext/AuthProvider), the
+  AuthProvider MUST be the outermost wrapper in App.tsx return value — NOT inside <Router> or any
+  other component. The sandbox evaluates files top-down; AuthContext must exist before components use it.
+
 \`\`\`tsx
 const { data, error } = await window.db.auth.signUp({ email, password });
 const { data, error } = await window.db.auth.signInWithPassword({ email, password });
@@ -929,6 +1080,35 @@ useEffect(() => {
 if (loading) return <LoadingScreen />;
 if (!user) return <AuthPage onAuth={setUser} />;
 return <MainApp user={user} onSignOut={() => window.db.auth.signOut().then(() => setUser(null))} />;
+\`\`\`
+
+  ⚠️ UUID SAFETY RULE: When inserting records with a user_id column, ALWAYS guard against null user:
+\`\`\`tsx
+// ✅ CORRECT — guard before insert
+const createTask = async (title: string) => {
+  if (!user?.id) return; // never insert with empty/null user_id
+  const { error } = await window.db.from('tasks').insert({ title, user_id: user.id });
+  if (error) console.error(error); else await fetchTasks();
+};
+// ❌ WRONG — user?.id || '' causes "invalid input syntax for type uuid" DB error
+await window.db.from('tasks').insert({ user_id: user?.id || '' });
+\`\`\`
+
+  Auth Context pattern (if needed — keep it simple, no \`as\` type casts):
+\`\`\`tsx
+// contexts/AuthContext.tsx
+const AuthContext = createContext(null); // ✅ plain null, never: createContext(null as AuthContextType)
+export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
+  const [user, setUser] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    window.db.auth.getSession().then(({ data: { session } }) => { setUser(session?.user ?? null); setLoading(false); });
+    const { data: { subscription } } = window.db.auth.onAuthStateChange((_e, s) => setUser(s?.user ?? null));
+    return () => subscription.unsubscribe();
+  }, []);
+  return <AuthContext.Provider value={{ user, loading }}>{children}</AuthContext.Provider>;
+};
+export const useAuth = () => useContext(AuthContext) as any; // ✅ single 'as any' at the end is fine
 \`\`\`
 
 SURGICAL FIX MODE (when message contains "SURGICAL FIX"):
@@ -1123,8 +1303,11 @@ DATABASE:
   await window.db.from('tableName').delete().eq('id', id)
   await window.db.from('tableName').select('*').eq('status', 'active').order('created_at', { ascending: false })
 
-FILE UPLOADS:
-  const url = await window.uploadFile(file)  // returns a public URL instantly
+FILE UPLOADS — CRITICAL:
+  const url = await window.uploadFile(file)  // ← ONLY valid upload method, returns public URL
+  // ❌ BANNED: supabase.storage.from(x).upload(y, file) → "new row violates row-level security policy"
+  // ❌ BANNED: window.db.storage.from(x).upload(y, file) → same RLS crash
+  // ✅ window.uploadFile(file) is the ONLY way to upload files — handles all types, never crashes
 
 🌱 SEED DATA — REQUIRED (critical for CRUD to work on first build)
 
@@ -1137,6 +1320,8 @@ LAYER 1 — schema.sql seed rows (runs once when schema is applied, persists in 
     ('aaaaaaaa-0000-0000-0000-000000000003', 'Realistic value 3', 'completed', NOW())
   ON CONFLICT (id) DO NOTHING;
   → 3–5 rows per main table. Use realistic domain-specific content. Fixed UUIDs (aaaaaaaa-... pattern).
+  → If a table has a user_id column, ALWAYS include it in seed rows using the demo user UUID: '00000000-0000-0000-0000-000000000001'
+    Example: INSERT INTO "${projectId}".tasks (id, title, user_id, created_at) VALUES ('aaaaaaaa-0000-0000-0000-000000000001', 'Example task', '00000000-0000-0000-0000-000000000001', NOW()) ON CONFLICT (id) DO NOTHING;
 
 LAYER 2 — useState seed (same data, for immediate render before DB responds):
   const SEED_ITEMS: ItemType[] = [
@@ -1238,13 +1423,15 @@ This is a Supabase project. The following rules are MANDATORY and NON-NEGOTIABLE
    - Add 3–5 INSERT rows per main table in schema.sql, after the CREATE TABLE block.
    - Use realistic domain-specific values — NOT "Item 1", "Test", "Lorem ipsum".
    - Use fixed UUIDs with the aaaaaaaa-0000-... pattern for easy matching in useState.
-   - Always use ON CONFLICT (id) DO NOTHING for idempotency (safe to apply repeatedly).
+   - ALWAYS use ON CONFLICT (id) DO NOTHING — NEVER use DO UPDATE. schema.sql is re-applied on
+     every project reload; DO UPDATE would silently overwrite the user's real data with seed values.
+   - NEVER include TRUNCATE or DELETE FROM in schema.sql — these would destroy user data on reload.
    - The same IDs MUST appear in both schema.sql INSERTs AND useState SEED_ITEMS in .tsx files.
-   - Example for a tasks app:
-     INSERT INTO "${projectId}".tasks (id, title, description, status, priority, created_at) VALUES
-       ('aaaaaaaa-0000-0000-0000-000000000001', 'Design new onboarding flow', 'Create wireframes for step-by-step user signup', 'in_progress', 'high', NOW()),
-       ('aaaaaaaa-0000-0000-0000-000000000002', 'Fix search result ranking', 'Relevance scores inconsistent with expected order', 'todo', 'medium', NOW()),
-       ('aaaaaaaa-0000-0000-0000-000000000003', 'Add CSV export to reports', 'Finance team needs monthly data in spreadsheet format', 'todo', 'low', NOW())
+   - Example for a tasks app (with user_id — use demo UUID '00000000-0000-0000-0000-000000000001'):
+     INSERT INTO "${projectId}".tasks (id, title, description, status, priority, user_id, created_at) VALUES
+       ('aaaaaaaa-0000-0000-0000-000000000001', 'Design new onboarding flow', 'Create wireframes for step-by-step user signup', 'in_progress', 'high', '00000000-0000-0000-0000-000000000001', NOW()),
+       ('aaaaaaaa-0000-0000-0000-000000000002', 'Fix search result ranking', 'Relevance scores inconsistent with expected order', 'todo', 'medium', '00000000-0000-0000-0000-000000000001', NOW()),
+       ('aaaaaaaa-0000-0000-0000-000000000003', 'Add CSV export to reports', 'Finance team needs monthly data in spreadsheet format', 'todo', 'low', '00000000-0000-0000-0000-000000000001', NOW())
      ON CONFLICT (id) DO NOTHING;
 
 A Supabase project that is missing tables, missing seed data, missing files, missing auth, or has non-functional CRUD is REJECTED.
@@ -1383,19 +1570,17 @@ function validateGeneratedFiles(files) {
     if (/(?<![.\w])fetch\s*\(/.test(content)) {
       fileErrors.push(`BANNED: fetch() HTTP calls are not available in the sandbox. Use static mock data arrays in data.ts, or window.db for Supabase projects.`);
     }
+    // Direct Supabase Storage uploads — always crash with "row violates row-level security policy"
+    if (/\.storage\s*\.\s*from\s*\([^)]+\)\s*\.\s*upload\s*\(/.test(content)) {
+      fileErrors.push(`BANNED: Direct Supabase Storage uploads (.storage.from(x).upload()) always fail with "row violates row-level security policy". Use window.uploadFile(file) instead — it returns a public URL and works in all environments.`);
+    }
     // External package imports that will crash after import stripping
     // NOTE: lucide-react, recharts, and framer-motion are pre-loaded in the sandbox — do NOT ban them
     if (/from\s+['"](?:@headlessui|@heroicons|react-icons|axios|lodash|date-fns|moment|@mui|antd|@radix-ui|@tanstack\/react-query|zustand|react-hook-form)['"]/.test(content)) {
       fileErrors.push(`BANNED IMPORT: External npm packages are not available in the sandbox. Use lucide-react for icons (pre-loaded), recharts for charts (pre-loaded), and plain Tailwind CSS for everything else.`);
     }
-    // Supabase auth subscriptions — async and crash in sandbox
-    if (/window\.db\.auth\.onAuthStateChange/.test(content)) {
-      fileErrors.push(`BANNED: window.db.auth.onAuthStateChange() is an async subscription that crashes in the sandbox. Remove it and use a DEMO_USER mock instead.`);
-    }
-    // window.db.auth.getUser() / getSession() — async, returns null in sandbox
-    if (/window\.db\.auth\.(?:getUser|getSession)\s*\(/.test(content)) {
-      fileErrors.push(`BANNED: window.db.auth.getUser()/getSession() return null in the sandbox — async auth state never resolves. Use a DEMO_USER constant instead.`);
-    }
+    // Note: window.db.auth.onAuthStateChange, getUser, and getSession are now fully
+    // supported by the stateful auth shim in the sandbox — do NOT ban them.
     // useState() with no initializer — gives undefined which crashes .map()/.filter()
     if (/\buseState\s*(?:<[^<>]*>)?\s*\(\s*\)/.test(content)) {
       fileErrors.push(`BUG: useState() called without an initializer returns undefined, which crashes on .map()/.filter()/.length. Use useState(null) for objects or useState([]) for arrays.`);
@@ -1501,9 +1686,8 @@ function applyProgrammaticFixes(files) {
     const c8b = c8a.replace(/\bsessionStorage\.setItem\s*\([^)]*\)\s*;?/g, '/* sessionStorage removed */');
     if (c8b !== c) { applied.push('removed localStorage/sessionStorage usage'); c = c8b; }
 
-    // 9. Remove Supabase onAuthStateChange subscriptions — async auth crashes sandbox
-    const c9 = c.replace(/window\.db\.auth\.onAuthStateChange\s*\([^)]*\)\s*;?/g, '/* onAuthStateChange removed */');
-    if (c9 !== c) { applied.push('removed onAuthStateChange subscription'); c = c9; }
+    // 9. onAuthStateChange is now supported by the stateful sandbox auth shim — keep as-is
+    const c9 = c; // no-op
 
     // 9b. Replace window.db.rpc(...) with empty-result stub — RPC functions don't exist
     // Pattern: window.db.rpc('fn_name', params) → Promise.resolve({ data: [], error: null })
@@ -1516,23 +1700,26 @@ function applyProgrammaticFixes(files) {
     if (c10 !== c) { applied.push('fixed useState() → useState(null)'); c = c10; }
 
     // 11. Replace useAuth() / useUser() / useSupabaseUser() / useSession() destructuring
-    // with safe window.user fallback — these hooks are undefined in the sandbox
-    const AUTH_MOCK = `{user:window.user||{id:"demo_user_01",name:"Demo User",email:"demo@example.com",role:"user",avatar_url:"",created_at:"2024-01-01"},` +
-      `session:window.session||{user:window.user,access_token:"demo_token",expires_at:9999999999},` +
-      `loading:false,error:null,isAuthenticated:true,isLoading:false,` +
-      `signIn:async()=>({}),signOut:async()=>({}),signUp:async()=>({})}`;
+    // with a stateful fallback that reflects actual sandbox auth state (starts unauthenticated)
+    // Only applies when the AI did NOT define useAuth itself (the var is shadowed by the AI's own definition).
+    const AUTH_MOCK = `(function(){var st=window._authState||{user:null,session:null};` +
+      `return {user:st.user,session:st.session,loading:false,error:null,` +
+      `isAuthenticated:!!st.user,isLoading:false,` +
+      `signIn:async function(e,p){return window.db?window.db.auth.signInWithPassword({email:e,password:p}):{};},` +
+      `signOut:async function(){return window.db?window.db.auth.signOut():{};},` +
+      `signUp:async function(e,p){return window.db?window.db.auth.signUp({email:e,password:p}):{};}};}())`;
     const c11 = c.replace(
       /const\s*(\{[^}]+\})\s*=\s*(?:useAuth|useUser|useSupabaseUser|useSession|useCurrentUser)\s*\(\s*\)/g,
       (match, destructure) => `const ${destructure} = ${AUTH_MOCK}`
     );
-    if (c11 !== c) { applied.push('replaced useAuth()/useUser()/useSession() with safe mock'); c = c11; }
+    if (c11 !== c) { applied.push('replaced useAuth()/useUser()/useSession() with stateful mock'); c = c11; }
 
-    // 12. Replace useContext(AuthContext/UserContext/SessionContext) with safe mock
+    // 12. Replace useContext(AuthContext/UserContext/SessionContext) with stateful mock
     const c12 = c.replace(
       /useContext\s*\(\s*[A-Z]\w*(?:Auth|User|Session|Current)\w*Context\w*\s*\)/g,
       AUTH_MOCK
     );
-    if (c12 !== c) { applied.push('replaced useContext(AuthContext) with safe mock'); c = c12; }
+    if (c12 !== c) { applied.push('replaced useContext(AuthContext) with stateful mock'); c = c12; }
 
     // 13. Fix fetch() calls — replace with no-op that returns empty data
     // Simple standalone fetch calls: const x = await fetch(...)
@@ -1542,17 +1729,8 @@ function applyProgrammaticFixes(files) {
     );
     if (c13 !== c) { applied.push('removed await fetch() call(s)'); c = c13; }
 
-    // 14. Fix window.db.auth.getUser() / getSession() — stub their return value
-    // These return null in sandbox when not patched (and the mock patch may not be in scope yet)
-    const c14 = c.replace(
-      /await\s+window\.db\.auth\.getUser\s*\(\s*\)/g,
-      '(await (async()=>({data:{user:window.user||null},error:null}))())'
-    );
-    const c14b = c14.replace(
-      /await\s+window\.db\.auth\.getSession\s*\(\s*\)/g,
-      '(await (async()=>({data:{session:window.session||null},error:null}))())'
-    );
-    if (c14b !== c) { applied.push('stubbed window.db.auth.getUser/getSession()'); c = c14b; }
+    // 14. getUser/getSession are now handled by the stateful sandbox auth shim — no stub needed
+    const c14b = c; // no-op
 
     // 15. Fix unquoted CSS variable keys in style objects — { --myVar: 'x' } is invalid JS syntax.
     // Object keys starting with '--' must be quoted: { '--myVar': 'x' }
@@ -1737,27 +1915,19 @@ app.post('/api/plan-only', async (req, res) => {
   const userMessage = getTextContent(messages[messages.length - 1]) || '';
   const requestType = classifyRequest(userMessage, hasFiles);
 
-  // website_copy bypasses AI entirely — no plan needed
-  if (requestType === 'website_copy') {
+  // bug_fix bypasses plan approval — quick targeted fixes don't need user review
+  if (requestType === 'website_copy' || requestType === 'bug_fix') {
     return res.json({ requestType, plan: null, shouldApprove: false });
   }
 
-  const isChange = requestType === 'feature_add' || requestType === 'bug_fix';
+  // new_app / redesign → PLANNER_PROMPT; feature_add → CHANGE_PLANNER_PROMPT
+  const plannerPrompt = (requestType === 'feature_add' || requestType === 'redesign')
+    ? CHANGE_PLANNER_PROMPT
+    : PLANNER_PROMPT;
 
   try {
-    let promptText;
-    let maxTokens;
-    if (isChange) {
-      const filesContext = currentFileNames.length > 0
-        ? `Current files: ${currentFileNames.join(', ')}\n\n`
-        : '';
-      promptText = `${CHANGE_PLANNER_PROMPT}\n\n${filesContext}Request: ${userMessage}`;
-      maxTokens = 800;
-    } else {
-      // new_app or redesign — full planner
-      promptText = `${PLANNER_PROMPT}\n\nRequest: ${userMessage}`;
-      maxTokens = 1200;
-    }
+    const promptText = `${plannerPrompt}\n\nRequest: ${userMessage}`;
+    const maxTokens = 1200;
 
     const planMsg = await anthropicClient.messages.create({
       model: 'claude-haiku-4-5-20251001',
@@ -1786,19 +1956,6 @@ app.post('/api/plan-only', async (req, res) => {
     return res.json({ requestType, plan, shouldApprove: true });
   } catch (err) {
     console.error('[plan-only] error:', err.message);
-    // For changes, return a fallback plan so the approval card still appears
-    if (isChange) {
-      const fallbackPlan = {
-        title: requestType === 'bug_fix' ? 'Apply Fix' : 'Apply Changes',
-        description: "I'll update the app based on your request.",
-        requestType,
-        firstBuildScope: ['Apply the requested changes'],
-        deferredScope: [],
-        pages: [],
-        components: [],
-      };
-      return res.json({ requestType, plan: fallbackPlan, shouldApprove: true });
-    }
     return res.status(500).json({ error: err.message, requestType, shouldApprove: false });
   }
 });
@@ -1809,6 +1966,28 @@ app.post('/api/build', async (req, res) => {
   const { messages, hasFiles = false, currentFiles = {}, model: preferredModel, isAutoMode = true, storageMode, projectConfig, apiSecrets = {},
     /** Pre-approved plan from /api/plan-only — skips the planning step if provided */
     preMadePlan = null } = req.body;
+
+  // ── Credit gate (must run before SSE headers) ─────────────────────────────
+  const buildUser = await getAuthUser(req);
+  if (buildUser) {
+    const userMessage = getTextContent(messages?.[messages.length - 1]) || '';
+    const rt = preMadePlan?.requestType ?? classifyRequest(userMessage, hasFiles || false);
+    const cost = CREDIT_COSTS[rt] ?? 10;
+    const deductResult = await deductCredits(
+      buildUser.id, cost,
+      `Build: ${rt}`,
+      { requestType: rt, model: preferredModel || 'auto' }
+    );
+    if (!deductResult.ok) {
+      return res.status(402).json({
+        error: 'Insufficient credits. Please top up your balance to continue.',
+        creditsRequired: cost,
+        creditsAvailable: deductResult.available ?? 0,
+        upgradeUrl: '/billing',
+      });
+    }
+    console.log(`[billing] deducted ${cost} credits from ${buildUser.id} for ${rt} → ${deductResult.remaining} remaining`);
+  }
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -2805,10 +2984,25 @@ app.post('/api/run-schema', async (req, res) => {
       }
     }
 
+    // ── Protect user data: strip destructive statements ──────────────────────
+    // schema.sql is re-applied every time a project loads in the editor.
+    // AI-generated seed INSERT statements must NEVER overwrite or delete user data.
+    // Strip TRUNCATE and DELETE FROM statements entirely, and downgrade any
+    // ON CONFLICT ... DO UPDATE to DO NOTHING so seed rows never clobber real data.
+    let safeSql = finalSql
+      // Remove any TRUNCATE TABLE / TRUNCATE "schema".table statements
+      .replace(/^\s*TRUNCATE\s+[^\n;]+;?\s*$/gim, '-- [stripped TRUNCATE — would wipe user data]\n')
+      // Remove standalone DELETE FROM statements (not inside functions/triggers)
+      .replace(/^\s*DELETE\s+FROM\s+[^\n;]+;?\s*$/gim, '-- [stripped DELETE FROM — would wipe user data]\n')
+      // Downgrade ON CONFLICT ... DO UPDATE SET ... to DO NOTHING
+      // Seed data should never overwrite rows the user has edited
+      .replace(/ON\s+CONFLICT\s*\([^)]*\)\s*DO\s+UPDATE\s+SET\s+[^\n;]+/gi, 'ON CONFLICT DO NOTHING')
+      .replace(/ON\s+CONFLICT\s+ON\s+CONSTRAINT\s+\w+\s+DO\s+UPDATE\s+SET\s+[^\n;]+/gi, 'ON CONFLICT DO NOTHING');
+
     // Patch the SQL: replace auth.uid()-based RLS policies with USING (true).
     // The sandbox preview uses an anon key with no real JWT, so auth.uid() returns NULL
     // and blocks all queries. USING (true) allows anon access, which is required for preview.
-    const patchedSql = finalSql
+    const patchedSql = safeSql
       // Replace auth.uid()-based RLS policies with USING (true)
       .replace(/FOR\s+ALL\s+USING\s*\(\s*auth\.uid\s*\(\s*\)\s*=\s*\w+\s*\)/gi, 'FOR ALL USING (true) WITH CHECK (true)')
       .replace(/FOR\s+ALL\s+USING\s*\(\s*\w+\s*=\s*auth\.uid\s*\(\s*\)\s*\)/gi, 'FOR ALL USING (true) WITH CHECK (true)')
@@ -3064,6 +3258,7 @@ const MANAGED_ENV_VARS = [
   'ANTHROPIC_API_KEY',
   'OPENAI_API_KEY',
   'GEMINI_API_KEY',
+  'VERCEL_TOKEN',
   'SUPABASE_URL',
   'SUPABASE_ANON_KEY',
   'SUPABASE_SERVICE_ROLE_KEY',
@@ -3164,6 +3359,969 @@ app.post('/api/env-vars', (req, res) => {
   res.json({ success: true, updated: Object.keys(allowed) });
 });
 
+// ─── Vercel Deploy ────────────────────────────────────────────────────────────
+
+const VERCEL_BOILERPLATE = {
+  'package.json': JSON.stringify({
+    name: 'my-app',
+    version: '0.1.0',
+    private: true,
+    type: 'module',
+    scripts: { dev: 'vite', build: 'vite build', preview: 'vite preview' },
+    dependencies: { react: '^18.3.1', 'react-dom': '^18.3.1' },
+    devDependencies: {
+      '@types/react': '^18.3.1',
+      '@types/react-dom': '^18.3.1',
+      '@vitejs/plugin-react': '^4.3.1',
+      typescript: '^5.6.2',
+      vite: '^5.4.10',
+    },
+  }, null, 2),
+
+  // Use Tailwind CDN — same as the sandbox preview. This guarantees all utility
+  // classes (including dynamic computed ones) are available, matching the preview exactly.
+  'index.html': `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>My App</title>
+    <!-- Suppress Tailwind CDN production warning — we intentionally use CDN for runtime class scanning -->
+    <script>window.tailwind = window.tailwind || {}; window.tailwind.config = {};</script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      // Safety shims — protect against any residual sandbox globals in generated code
+      if (typeof window.db === 'undefined') window.db = null;
+      if (typeof window._authState === 'undefined') window._authState = { user: null, session: null };
+      if (typeof window._authListeners === 'undefined') window._authListeners = [];
+      if (typeof window.ENV === 'undefined') window.ENV = {};
+      if (typeof window.uploadFile === 'undefined') window.uploadFile = async function() { console.warn('window.uploadFile not available in deployed app'); return ''; };
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>`,
+
+  'vite.config.ts': `import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+export default defineConfig({ plugins: [react()] });`,
+
+  'tsconfig.json': JSON.stringify({
+    compilerOptions: {
+      target: 'ES2020',
+      useDefineForClassFields: true,
+      lib: ['ES2020', 'DOM', 'DOM.Iterable'],
+      module: 'ESNext',
+      skipLibCheck: true,
+      moduleResolution: 'bundler',
+      allowImportingTsExtensions: true,
+      resolveJsonModule: true,
+      isolatedModules: true,
+      noEmit: true,
+      jsx: 'react-jsx',
+      strict: false,
+    },
+    include: ['src'],
+    references: [{ path: './tsconfig.node.json' }],
+  }, null, 2),
+
+  'tsconfig.node.json': JSON.stringify({
+    compilerOptions: {
+      composite: true,
+      skipLibCheck: true,
+      module: 'ESNext',
+      moduleResolution: 'bundler',
+      allowSyntheticDefaultImports: true,
+    },
+    include: ['vite.config.ts'],
+  }, null, 2),
+
+  'src/main.tsx': `import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+
+class ErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { error: string | null }
+> {
+  constructor(props: any) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(e: Error) {
+    return { error: e.message };
+  }
+  componentDidCatch(error: Error) {
+    console.error('App crashed:', error);
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ padding: 32, fontFamily: 'system-ui, sans-serif', background: '#0a0a0a', minHeight: '100vh' }}>
+          <div style={{ maxWidth: 600, margin: '0 auto', paddingTop: 64 }}>
+            <div style={{ background: '#1a0a0a', border: '1px solid #3f1a1a', borderRadius: 12, padding: 24 }}>
+              <h2 style={{ color: '#f87171', margin: '0 0 12px', fontSize: 18 }}>App Error</h2>
+              <pre style={{ color: '#fca5a5', whiteSpace: 'pre-wrap', margin: 0, fontSize: 13, lineHeight: 1.6 }}>{this.state.error}</pre>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  </React.StrictMode>
+);`,
+
+  'src/index.css': `/* Base styles — Tailwind is loaded via CDN in index.html */\n* { box-sizing: border-box; }\nbody { margin: 0; }`,
+
+  // SPA routing: serve static assets (JS/CSS/images) from filesystem first,
+  // then fall back to index.html for all client-side routes (e.g. /dashboard).
+  // Using "handle: filesystem" before the wildcard is critical — without it,
+  // /assets/index-abc123.js would also get rewritten to index.html → 404 on JS.
+  'vercel.json': JSON.stringify({
+    routes: [
+      { handle: 'filesystem' },
+      { src: '/(.*)', dest: '/index.html' },
+    ],
+  }, null, 2),
+};
+
+const VERCEL_SUPABASE_PACKAGE = JSON.stringify({
+  name: 'my-app',
+  version: '0.1.0',
+  private: true,
+  type: 'module',
+  scripts: { dev: 'vite', build: 'vite build', preview: 'vite preview' },
+  dependencies: { react: '^18.3.1', 'react-dom': '^18.3.1', '@supabase/supabase-js': '^2.45.0' },
+  devDependencies: {
+    '@types/react': '^18.3.1',
+    '@types/react-dom': '^18.3.1',
+    '@vitejs/plugin-react': '^4.3.1',
+    typescript: '^5.6.2',
+    vite: '^5.4.10',
+  },
+}, null, 2);
+
+/**
+ * Safe wrapper around fetch.json() for Vercel API calls.
+ * Vercel occasionally returns HTML error pages (rate limits, auth failures, maintenance).
+ * Calling .json() on these throws a cryptic SyntaxError. This reads as text first,
+ * tries to parse JSON, and throws a meaningful error if it's HTML.
+ */
+async function safeVercelJson(response) {
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Strip HTML tags and trim to get a readable message
+    const plain = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300);
+    throw new Error(plain || `Vercel returned HTTP ${response.status} (non-JSON)`);
+  }
+}
+
+app.post('/api/deploy/vercel', async (req, res) => {
+  const vercelToken = getRealVercelToken();
+  if (!vercelToken) return res.status(500).json({ error: 'VERCEL_TOKEN is not configured on the server. Add it to .env.' });
+
+  const { files, projectName, storageMode, projectConfig, subdomain, customDomain, customDomains: customDomainsBody, previousSubdomain } = req.body;
+  if (!files || typeof files !== 'object') return res.status(400).json({ error: 'files object required' });
+
+  // Build the list of custom domains to attach as aliases
+  // Accepts either `customDomains` array (preferred) or legacy `customDomain` string
+  const rawDomains = Array.isArray(customDomainsBody)
+    ? customDomainsBody
+    : (customDomain ? [customDomain] : []);
+  const domains = rawDomains.map(d => String(d).trim().replace(/^https?:\/\//, '').replace(/\/$/, '')).filter(Boolean);
+
+  // Determine the project slug (used as Vercel project name → {slug}.vercel.app)
+  const slugSource = subdomain || projectName || 'my-app';
+  const deployName = slugSource
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 50) || 'my-app';
+
+  // If the user renamed the subdomain from a previously deployed project, rename it in Vercel first
+  let prevSlugToDelete = null; // set if rename fails — we'll delete the old project after successful deploy
+  if (previousSubdomain && previousSubdomain !== deployName) {
+    const prevSlug = previousSubdomain.toLowerCase()
+      .replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
+    try {
+      const renameRes = await fetch(`https://api.vercel.com/v9/projects/${prevSlug}`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${vercelToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: deployName }),
+      });
+      if (renameRes.ok) {
+        console.log(`[deploy/vercel] Renamed project ${prevSlug} → ${deployName}`);
+      } else {
+        const renameErr = await safeVercelJson(renameRes);
+        console.warn(`[deploy/vercel] Project rename failed (${prevSlug} → ${deployName}):`, renameErr?.error?.message);
+        // Non-fatal — will delete the old project after new deployment succeeds
+        prevSlugToDelete = prevSlug;
+      }
+    } catch (e) {
+      console.warn('[deploy/vercel] Project rename error:', e.message);
+      prevSlugToDelete = prevSlug;
+    }
+  }
+
+  // ── Auto-detect third-party packages needed by generated files ────────────────
+  // Map of npm package name → version for packages commonly used in AI-generated apps.
+  // If the generated code imports any of these, they're added to package.json automatically.
+  const KNOWN_PACKAGES = {
+    'react-router-dom': '^6.26.2',
+    'lucide-react': '^0.462.0',
+    'framer-motion': '^11.11.1',
+    'date-fns': '^4.1.0',
+    'recharts': '^2.13.3',
+    'chart.js': '^4.4.6',
+    'react-chartjs-2': '^5.2.0',
+    'clsx': '^2.1.1',
+    'class-variance-authority': '^0.7.0',
+    'tailwind-merge': '^2.5.4',
+    '@radix-ui/react-dialog': '^1.1.2',
+    '@radix-ui/react-dropdown-menu': '^2.1.2',
+    '@radix-ui/react-select': '^2.1.2',
+    '@radix-ui/react-tabs': '^1.1.1',
+    '@radix-ui/react-tooltip': '^1.1.3',
+    'react-hot-toast': '^2.4.1',
+    'react-toastify': '^10.0.6',
+    'axios': '^1.7.7',
+    'zod': '^3.23.8',
+    'react-hook-form': '^7.53.2',
+    '@hookform/resolvers': '^3.9.1',
+    'zustand': '^5.0.1',
+    'react-query': '^3.39.3',
+    '@tanstack/react-query': '^5.59.20',
+    'react-icons': '^5.3.0',
+    'heroicons': '^2.1.5',
+    '@heroicons/react': '^2.1.5',
+  };
+
+  function detectRequiredPackages(fileMap) {
+    const found = {};
+    const importRe = /from\s+['"]([^'"./][^'"]*)['"]/g;
+    for (const code of Object.values(fileMap)) {
+      if (typeof code !== 'string') continue;
+      let m;
+      importRe.lastIndex = 0;
+      while ((m = importRe.exec(code)) !== null) {
+        const pkg = m[1].split('/')[0]; // handle scoped: @radix-ui/react-dialog → @radix-ui/react-dialog
+        const scoped = m[1].startsWith('@') ? m[1].split('/').slice(0,2).join('/') : pkg;
+        if (KNOWN_PACKAGES[scoped]) found[scoped] = KNOWN_PACKAGES[scoped];
+      }
+    }
+    return found;
+  }
+
+  // Assemble all project files
+  const allFiles = { ...VERCEL_BOILERPLATE };
+
+  if (storageMode === 'supabase') {
+    allFiles['package.json'] = VERCEL_SUPABASE_PACKAGE;
+    const projectId = projectConfig?.id || 'your-project-id';
+    // Inject the platform's Supabase credentials as env vars so the deployed app works out of the box
+    // Hardcode credentials directly — Supabase anon key is public-facing by design.
+    // This guarantees the deployed app works without any Vercel project settings.
+    allFiles['src/lib/supabase.ts'] = `import { createClient } from '@supabase/supabase-js';
+
+const _c = createClient('${SUPABASE_URL}', '${SUPABASE_ANON_KEY}', { db: { schema: '${projectId}' } });
+export const PROJECT_ID = '${projectId}';
+
+// Project-isolated auth: emails are namespaced with +projectId so each app
+// has its own independent user pool on the shared Supabase instance.
+// user@example.com → user+${projectId}@example.com in Supabase; stripped before returning to app code.
+const _ns = (e: string) => { const i = e.lastIndexOf('@'); return i < 0 ? e : e.slice(0, i) + '+${projectId}' + e.slice(i); };
+const _su = (u: any) => u?.email ? { ...u, email: u.email.replace('+${projectId}@', '@') } : u;
+const _ss = (s: any) => s?.user ? { ...s, user: _su(s.user) } : s;
+const _fix = (r: any) => r?.data ? { ...r, data: { ...(r.data.user !== undefined ? { user: _su(r.data.user) } : {}), ...(r.data.session !== undefined ? { session: _ss(r.data.session) } : {}) } } : r;
+
+// Save original auth methods before overriding
+const _signIn = _c.auth.signInWithPassword.bind(_c.auth);
+const _signUp = _c.auth.signUp.bind(_c.auth);
+const _getUser = _c.auth.getUser.bind(_c.auth);
+const _getSession = _c.auth.getSession.bind(_c.auth);
+const _onAuth = _c.auth.onAuthStateChange.bind(_c.auth);
+
+(_c.auth as any).signInWithPassword = (creds: any) => _signIn({ ...creds, email: _ns(creds.email) }).then(_fix);
+(_c.auth as any).signUp = (creds: any) => _signUp({ ...creds, email: _ns(creds.email) }).then(_fix);
+(_c.auth as any).getUser = () => _getUser().then((r: any) => r.data?.user ? { ...r, data: { user: _su(r.data.user) } } : r);
+(_c.auth as any).getSession = () => _getSession().then((r: any) => r.data?.session ? { ...r, data: { session: _ss(r.data.session) } } : r);
+(_c.auth as any).onAuthStateChange = (cb: any) => _onAuth((e: any, s: any) => cb(e, _ss(s)));
+
+export const db = _c;`;
+  }
+
+  // Add generated app files into src/
+  for (const [filename, content] of Object.entries(files)) {
+    if (filename.endsWith('.sql')) continue;
+    const dest = filename.startsWith('src/') ? filename : `src/${filename}`;
+    let code = content;
+    if (storageMode === 'supabase') {
+      code = code.replace(/\bwindow\.db\b/g, 'db');
+      code = code.replace(/\bwindow\.db\.auth\b/g, 'db.auth');
+
+      // Calculate the correct relative path from this file to src/lib/supabase.ts.
+      // A file at src/components/Foo.tsx is depth 1, needs '../lib/supabase'.
+      // A file at src/Foo.tsx is depth 0, needs './lib/supabase'.
+      const depthInSrc = dest.replace(/^src\//, '').split('/').length - 1;
+      const supabaseRelPath = depthInSrc === 0
+        ? './lib/supabase'
+        : Array(depthInSrc).fill('..').join('/') + '/lib/supabase';
+
+      // Fix any existing supabase imports that use the wrong relative path
+      // (AI sometimes writes './lib/supabase' even for files in src/components/)
+      code = code.replace(/from\s+['"](?:\.\.\/)*lib\/supabase['"]/g, `from '${supabaseRelPath}'`);
+      code = code.replace(/from\s+['"](?:\.\.\/)*supabase['"]/g, `from '${supabaseRelPath}'`);
+
+      // Add import if the file uses `db` but has no supabase import yet
+      if (/\bdb\.(from|auth|storage|rpc)\b/.test(code)
+        && !code.includes(`from '${supabaseRelPath}'`)
+        && !code.includes(`from "${supabaseRelPath}"`)) {
+        code = `import { db } from '${supabaseRelPath}';\n` + code;
+      }
+    }
+    allFiles[dest] = code;
+  }
+
+  // Inject any detected third-party packages into the package.json
+  const detectedPkgs = detectRequiredPackages(files);
+  if (Object.keys(detectedPkgs).length > 0) {
+    const pkg = JSON.parse(allFiles['package.json']);
+    for (const [name, version] of Object.entries(detectedPkgs)) {
+      if (!pkg.dependencies[name] && !pkg.devDependencies?.[name]) {
+        pkg.dependencies[name] = version;
+      }
+    }
+    allFiles['package.json'] = JSON.stringify(pkg, null, 2);
+    console.log('[deploy/vercel] auto-added packages:', Object.keys(detectedPkgs).join(', '));
+  }
+
+  const vercelFiles = Object.entries(allFiles).map(([file, data]) => ({
+    file,
+    data,
+    encoding: 'utf-8',
+  }));
+
+  // Always inject the platform's Supabase credentials into every deployment.
+  // Supabase anon key is designed to be public — safe to expose in env vars.
+  const envVars = SUPABASE_URL && SUPABASE_ANON_KEY
+    ? { VITE_SUPABASE_URL: SUPABASE_URL, VITE_SUPABASE_ANON_KEY: SUPABASE_ANON_KEY }
+    : {};
+
+  try {
+    const deployBody = {
+      name: deployName,
+      files: vercelFiles,
+      target: 'production',
+      projectSettings: {
+        framework: 'vite',
+        buildCommand: 'npm run build',
+        outputDirectory: 'dist',
+        installCommand: 'npm install',
+      },
+      env: envVars,
+    };
+
+    const vercelRes = await fetch('https://api.vercel.com/v13/deployments', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${vercelToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(deployBody),
+    });
+
+    const data = await safeVercelJson(vercelRes);
+
+    if (!vercelRes.ok) {
+      const errMsg = data?.error?.message || data?.message || JSON.stringify(data);
+      console.error('[deploy/vercel] API error:', errMsg);
+      return res.status(vercelRes.status).json({ error: errMsg });
+    }
+
+    const deploymentId = data.id;
+
+    // Vercel appends the team slug to project domains (e.g. my-app-ayacoda.vercel.app).
+    // Fix: explicitly set {deployName}.vercel.app as an alias — if the name is free it sticks.
+    let cleanAlias = null;
+    try {
+      const cleanAliasRes = await fetch(`https://api.vercel.com/v2/deployments/${deploymentId}/aliases`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${vercelToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ alias: `${deployName}.vercel.app` }),
+      });
+      const cleanAliasData = await safeVercelJson(cleanAliasRes);
+      if (cleanAliasRes.ok && cleanAliasData.alias) {
+        cleanAlias = `https://${cleanAliasData.alias}`;
+        console.log('[deploy/vercel] Clean alias set:', cleanAliasData.alias);
+      } else {
+        console.warn('[deploy/vercel] Could not set clean alias:', cleanAliasData?.error?.message || JSON.stringify(cleanAliasData));
+      }
+    } catch (e) {
+      console.warn('[deploy/vercel] Clean alias error:', e.message);
+    }
+
+    // Use the clean alias if we got one, otherwise fall back to whatever Vercel assigned.
+    const vercelAppAlias = (data.alias || []).find(a => a.endsWith('.vercel.app'));
+    const primaryUrl = cleanAlias
+      || (vercelAppAlias ? `https://${vercelAppAlias}` : `https://${data.url}`);
+    console.log('[deploy/vercel] Deployment created:', data.url, '→ primary:', primaryUrl);
+
+    // Set aliases for all custom domains
+    const customDomainAliases = [];
+    for (const domain of domains) {
+      try {
+        const aliasRes = await fetch(`https://api.vercel.com/v2/deployments/${deploymentId}/aliases`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${vercelToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ alias: domain }),
+        });
+        const aliasData = await safeVercelJson(aliasRes);
+        if (aliasRes.ok) {
+          customDomainAliases.push(aliasData.alias || domain);
+          console.log('[deploy/vercel] Custom domain alias set:', aliasData.alias || domain);
+        } else {
+          console.warn('[deploy/vercel] Custom domain alias failed for', domain, ':', aliasData?.error?.message || JSON.stringify(aliasData));
+        }
+      } catch (e) {
+        console.warn('[deploy/vercel] Custom domain alias error for', domain, ':', e.message);
+      }
+    }
+
+    res.json({
+      url: primaryUrl,                        // stable project URL (*.vercel.app alias or deployment URL)
+      previewUrl: `https://${data.url}`,      // deployment-specific URL (always unique)
+      // Return all successfully attached custom domains
+      customDomainUrls: customDomainAliases.map(a => `https://${a}`),
+      customDomainUrl: customDomainAliases.length > 0 ? `https://${customDomainAliases[0]}` : null,
+      deploymentId,
+      name: deployName,
+    });
+
+    // Clean up old project if rename failed — prevents duplicate projects on Vercel
+    if (prevSlugToDelete) {
+      try {
+        const delRes = await fetch(`https://api.vercel.com/v9/projects/${prevSlugToDelete}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${vercelToken}` },
+        });
+        if (delRes.ok || delRes.status === 404) {
+          console.log(`[deploy/vercel] Deleted old duplicate project: ${prevSlugToDelete}`);
+          // Also clean up its alias
+          await fetch(`https://api.vercel.com/v2/aliases/${prevSlugToDelete}.vercel.app`, {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${vercelToken}` },
+          }).catch(() => {});
+        }
+      } catch (e) {
+        console.warn('[deploy/vercel] Could not delete old project:', e.message);
+      }
+    }
+  } catch (err) {
+    console.error('[deploy/vercel] Unexpected error:', err);
+    res.status(500).json({ error: err.message || 'Deployment failed' });
+  }
+});
+
+app.get('/api/deploy/vercel/check-subdomain', async (req, res) => {
+  const vercelToken = getRealVercelToken();
+  if (!vercelToken) return res.status(500).json({ error: 'VERCEL_TOKEN not configured' });
+
+  const raw = (req.query.name || '').toString().trim();
+  const slug = raw.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
+  if (!slug) return res.status(400).json({ error: 'Invalid name' });
+
+  try {
+    const r = await fetch(`https://api.vercel.com/v9/projects/${slug}`, {
+      headers: { Authorization: `Bearer ${vercelToken}` },
+    });
+    if (r.status === 200) return res.json({ status: 'yours', slug, aliasAvailable: true });
+    if (r.status !== 404) return res.status(r.status).json({ error: 'Vercel API error' });
+
+    // Project doesn't exist in our account — check if {slug}.vercel.app is globally taken by ANOTHER user.
+    // If it belongs to us (stale alias from a deleted project) we can still use the name.
+    let aliasAvailable = true;
+    try {
+      const [aliasRes, teamsRes] = await Promise.all([
+        fetch(`https://api.vercel.com/v2/aliases/${slug}.vercel.app`, {
+          headers: { Authorization: `Bearer ${vercelToken}` },
+        }),
+        fetch('https://api.vercel.com/v2/teams', {
+          headers: { Authorization: `Bearer ${vercelToken}` },
+        }),
+      ]);
+
+      if (aliasRes.status === 200) {
+        const aliasData = await safeVercelJson(aliasRes);
+        const teamsData = teamsRes.ok ? await safeVercelJson(teamsRes).catch(() => ({})) : {};
+        const ourTeamIds = (teamsData.teams || []).map(t => t.id);
+
+        if (!aliasData.ownerId || ourTeamIds.includes(aliasData.ownerId)) {
+          // Alias is ours (stale from deleted project) or no owner — we can reclaim it
+          aliasAvailable = true;
+        } else {
+          // Alias owned by a different Vercel user/team
+          aliasAvailable = false;
+        }
+      }
+      // 404 = alias doesn't exist = available (aliasAvailable stays true)
+      // other errors = assume available to avoid false positives
+    } catch { /* treat as available if check fails */ }
+
+    return res.json({ status: 'available', slug, aliasAvailable });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// List all aliases (*.vercel.app + custom domains) for a given project name
+app.get('/api/deploy/vercel/project-aliases', async (req, res) => {
+  const vercelToken = getRealVercelToken();
+  if (!vercelToken) return res.status(500).json({ error: 'VERCEL_TOKEN not configured' });
+
+  const raw = (req.query.name || '').toString().trim();
+  const slug = raw.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
+  if (!slug) return res.status(400).json({ error: 'name required' });
+
+  try {
+    // Fetch project details to get id
+    const projRes = await fetch(`https://api.vercel.com/v9/projects/${slug}`, {
+      headers: { Authorization: `Bearer ${vercelToken}` },
+    });
+    if (!projRes.ok) {
+      const d = await safeVercelJson(projRes);
+      return res.status(projRes.status).json({ error: d?.error?.message || 'Project not found' });
+    }
+    const proj = await safeVercelJson(projRes);
+
+    const productionAliases = proj.targets?.production?.alias || [];
+    const projectDomains = (proj.alias || [])
+      .map(a => (typeof a === 'string' ? a : a.domain))
+      .filter(Boolean);
+
+    const all = [...new Set([...productionAliases, ...projectDomains])];
+
+    // Build the alias list the user should see:
+    //   1. Prefer the exact {slug}.vercel.app clean alias if it exists
+    //   2. Otherwise fall back to the team-suffixed {slug}-{team}.vercel.app
+    //   3. Always include custom domains (non .vercel.app)
+    // Hide hash-deployment URLs (contain random characters like {slug}-abc123xyz.vercel.app)
+    const cleanAlias = all.find(a => a === `${slug}.vercel.app`);
+    const teamAlias = !cleanAlias
+      ? all.find(a => a.endsWith('.vercel.app') && a.startsWith(`${slug}-`))
+      : null;
+    const customDomains = all.filter(a => !a.endsWith('.vercel.app'));
+
+    const filtered = [
+      ...(cleanAlias ? [cleanAlias] : teamAlias ? [teamAlias] : []),
+      ...customDomains,
+    ];
+    return res.json({ aliases: filtered });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete an entire Vercel project by name (removes all deployments, aliases, and domains)
+app.delete('/api/deploy/vercel/project', async (req, res) => {
+  const vercelToken = getRealVercelToken();
+  if (!vercelToken) return res.status(500).json({ error: 'VERCEL_TOKEN not configured' });
+
+  const raw = (req.body?.name || '').toString().trim();
+  const name = raw.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
+  if (!name) return res.status(400).json({ error: 'project name required' });
+
+  try {
+    const r = await fetch(`https://api.vercel.com/v9/projects/${name}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${vercelToken}` },
+    });
+    if (r.ok || r.status === 404) {
+      console.log('[deploy/vercel] Project deleted:', name);
+      // Also delete the clean alias so the subdomain is immediately available for reuse
+      try {
+        const aliasDelRes = await fetch(`https://api.vercel.com/v2/aliases/${name}.vercel.app`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${vercelToken}` },
+        });
+        if (aliasDelRes.ok) console.log('[deploy/vercel] Alias deleted:', `${name}.vercel.app`);
+      } catch { /* alias deletion is best-effort */ }
+      return res.json({ deleted: name });
+    }
+    const d = await safeVercelJson(r);
+    return res.status(r.status).json({ error: d?.error?.message || 'Failed to delete project' });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/deploy/vercel/:deploymentId/status', async (req, res) => {
+  const vercelToken = getRealVercelToken();
+  if (!vercelToken) return res.status(500).json({ error: 'VERCEL_TOKEN not configured' });
+
+  try {
+    const vercelRes = await fetch(
+      `https://api.vercel.com/v13/deployments/${req.params.deploymentId}`,
+      { headers: { Authorization: `Bearer ${vercelToken}` } }
+    );
+    const data = await safeVercelJson(vercelRes);
+    if (!vercelRes.ok) {
+      return res.status(vercelRes.status).json({ error: data?.error?.message || 'Vercel API error' });
+    }
+
+    // Build a human-readable error message when the deployment fails
+    let errorMessage = data.errorMessage || data.error?.message || (data.builds?.[0]?.error?.message) || null;
+
+    // When it's a build failure, fetch the last error lines from the build log for a useful message
+    if ((data.readyState === 'ERROR') && !errorMessage) {
+      try {
+        const logsRes = await fetch(
+          `https://api.vercel.com/v3/deployments/${req.params.deploymentId}/events?limit=100`,
+          { headers: { Authorization: `Bearer ${vercelToken}` } }
+        );
+        if (logsRes.ok) {
+          const logsText = await logsRes.text();
+          // Events come as newline-delimited JSON (NDJSON)
+          const errorLines = logsText.split('\n')
+            .filter(Boolean)
+            .map(l => { try { return JSON.parse(l); } catch { return null; } })
+            .filter(e => e && (e.type === 'stderr' || e.type === 'error'))
+            .map(e => e.payload?.text || e.text || '')
+            .filter(Boolean)
+            .join('\n')
+            .trim();
+          if (errorLines) {
+            // Grab last 3 meaningful lines for display
+            const lastLines = errorLines.split('\n').filter(l => l.trim()).slice(-3).join(' | ');
+            errorMessage = lastLines || 'Build failed — see Vercel logs for details';
+          }
+        }
+      } catch (logErr) {
+        console.warn('[deploy/vercel] Could not fetch build logs:', logErr.message);
+      }
+    }
+
+    if (!errorMessage && data.readyState === 'ERROR') {
+      errorMessage = 'Build failed — click "View build logs" for details';
+    }
+
+    res.json({
+      readyState: data.readyState,
+      url: data.url ? `https://${data.url}` : null,
+      state: data.state,
+      errorMessage,
+      inspectorUrl: data.inspectorUrl || null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BILLING ROUTES
+// ══════════════════════════════════════════════════════════════════════════════
+
+const PLANS = {
+  free:  { name: 'Free',  price: 0,   monthlyCredits: 0,    stripePriceId: null },
+  pro:   { name: 'Pro',   price: 19,  monthlyCredits: 2000, stripePriceId: getRealEnvVar('STRIPE_PRO_PRICE_ID') },
+  scale: { name: 'Scale', price: 49,  monthlyCredits: 6000, stripePriceId: getRealEnvVar('STRIPE_SCALE_PRICE_ID') },
+};
+
+const CREDIT_PACKS = {
+  starter: { name: 'Starter', credits: 500,  price: 3.99,  stripePriceId: getRealEnvVar('STRIPE_CREDITS_STARTER_PRICE_ID') },
+  builder: { name: 'Builder', credits: 2000, price: 14.99, stripePriceId: getRealEnvVar('STRIPE_CREDITS_BUILDER_PRICE_ID') },
+  power:   { name: 'Power',   credits: 5000, price: 34.99, stripePriceId: getRealEnvVar('STRIPE_CREDITS_POWER_PRICE_ID') },
+};
+
+// GET /api/billing/status — current credits, plan, recent transactions
+app.get('/api/billing/status', async (req, res) => {
+  const user = await getAuthUser(req);
+  if (!user) return res.status(401).json({ error: 'Authentication required' });
+
+  try {
+    const admin = getSupabaseAdmin();
+    let { data: profile, error: profErr } = await admin
+      .from('profiles')
+      .select('credits, plan, credits_reset_at, stripe_subscription_id')
+      .eq('id', user.id)
+      .single();
+
+    // PGRST116 = no rows found — profile doesn't exist yet, create it
+    if (profErr && (profErr.code === 'PGRST116' || profErr.message?.includes('no rows'))) {
+      console.log('[billing/status] profile missing for user', user.id, '— creating default profile');
+      const { data: newProfile, error: insertErr } = await admin
+        .from('profiles')
+        .upsert({ id: user.id, email: user.email, credits: 100, plan: 'free' }, { onConflict: 'id' })
+        .select('credits, plan, credits_reset_at, stripe_subscription_id')
+        .single();
+      if (insertErr) {
+        console.error('[billing/status] failed to create profile for', user.id, ':', insertErr.message);
+        // Return safe defaults rather than failing
+        return res.json({
+          credits: 100, plan: 'free', creditsResetAt: null, stripeSubscriptionId: null,
+          stripeConfigured: !!stripe, plans: PLANS, creditPacks: CREDIT_PACKS,
+          creditCosts: CREDIT_COSTS, transactions: [],
+        });
+      }
+      profile = newProfile;
+      profErr = null;
+      // Log a signup grant transaction
+      await admin.from('credit_transactions').insert({
+        user_id: user.id, amount: 100, type: 'signup_grant', description: 'Welcome credits — free tier',
+      }).catch(() => {});
+    } else if (profErr) {
+      throw profErr;
+    }
+
+    console.log('[billing/status] user', user.id, 'credits:', profile?.credits, 'plan:', profile?.plan);
+
+    const { data: txns } = await admin
+      .from('credit_transactions')
+      .select('id, amount, type, description, created_at')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    res.json({
+      credits: profile?.credits ?? 100,
+      plan: profile?.plan ?? 'free',
+      creditsResetAt: profile?.credits_reset_at,
+      stripeSubscriptionId: profile?.stripe_subscription_id,
+      stripeConfigured: !!stripe,
+      plans: PLANS,
+      creditPacks: CREDIT_PACKS,
+      creditCosts: CREDIT_COSTS,
+      transactions: txns || [],
+    });
+  } catch (err) {
+    console.error('[billing/status] error for user', user?.id, ':', err.message, err.code);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/billing/create-checkout — create Stripe Checkout session
+app.post('/api/billing/create-checkout', async (req, res) => {
+  const user = await getAuthUser(req);
+  if (!user) return res.status(401).json({ error: 'Authentication required' });
+  if (!stripe) return res.status(503).json({ error: 'Stripe is not configured on this server. Add STRIPE_SECRET_KEY to .env.' });
+
+  const { type, plan, pack } = req.body; // type: 'subscription' | 'credits'
+  // APP_URL takes priority so Stripe always returns to the production site, not localhost
+  const origin = getRealEnvVar('APP_URL') || req.headers.origin || 'http://localhost:5173';
+
+  try {
+    // Ensure Stripe customer exists for this user
+    const admin = getSupabaseAdmin();
+    const { data: profile } = await admin
+      .from('profiles')
+      .select('stripe_customer_id, email')
+      .eq('id', user.id)
+      .single();
+
+    let customerId = profile?.stripe_customer_id;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: user.email || profile?.email || '',
+        metadata: { supabase_user_id: user.id },
+      });
+      customerId = customer.id;
+      await admin.from('profiles').update({ stripe_customer_id: customerId }).eq('id', user.id);
+    }
+
+    let session;
+
+    if (type === 'subscription') {
+      const planData = PLANS[plan];
+      if (!planData?.stripePriceId) {
+        return res.status(400).json({ error: `No Stripe price configured for plan: ${plan}. Add STRIPE_${plan.toUpperCase()}_PRICE_ID to .env.` });
+      }
+      session = await stripe.checkout.sessions.create({
+        customer: customerId,
+        mode: 'subscription',
+        line_items: [{ price: planData.stripePriceId, quantity: 1 }],
+        success_url: `${origin}/billing?success=1`,
+        cancel_url: `${origin}/billing?canceled=1`,
+        metadata: { supabase_user_id: user.id, plan },
+        subscription_data: { metadata: { supabase_user_id: user.id, plan } },
+      });
+    } else if (type === 'credits') {
+      const packData = CREDIT_PACKS[pack];
+      if (!packData?.stripePriceId) {
+        return res.status(400).json({ error: `No Stripe price configured for pack: ${pack}. Add STRIPE_CREDITS_${pack.toUpperCase()}_PRICE_ID to .env.` });
+      }
+      session = await stripe.checkout.sessions.create({
+        customer: customerId,
+        mode: 'payment',
+        line_items: [{ price: packData.stripePriceId, quantity: 1 }],
+        success_url: `${origin}/billing?success=1`,
+        cancel_url: `${origin}/billing?canceled=1`,
+        metadata: { supabase_user_id: user.id, pack, credits: packData.credits },
+      });
+    } else {
+      return res.status(400).json({ error: 'type must be "subscription" or "credits"' });
+    }
+
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('[billing] create-checkout error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/billing/create-portal — Stripe Customer Portal
+app.post('/api/billing/create-portal', async (req, res) => {
+  const user = await getAuthUser(req);
+  if (!user) return res.status(401).json({ error: 'Authentication required' });
+  if (!stripe) return res.status(503).json({ error: 'Stripe is not configured' });
+
+  // APP_URL takes priority so Stripe always returns to the production site, not localhost
+  const origin = getRealEnvVar('APP_URL') || req.headers.origin || 'http://localhost:5173';
+
+  try {
+    const admin = getSupabaseAdmin();
+    const { data: profile } = await admin
+      .from('profiles')
+      .select('stripe_customer_id')
+      .eq('id', user.id)
+      .single();
+
+    if (!profile?.stripe_customer_id) {
+      return res.status(400).json({ error: 'No billing account found. Subscribe to a plan first.' });
+    }
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: profile.stripe_customer_id,
+      return_url: `${origin}/billing`,
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/billing/webhook — Stripe event handler
+// Raw body required for signature verification
+app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const webhookSecret = getRealEnvVar('STRIPE_WEBHOOK_SECRET');
+  if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
+
+  let event;
+  try {
+    if (webhookSecret) {
+      const sig = req.headers['stripe-signature'];
+      event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    } else {
+      // No webhook secret — parse raw body (dev only)
+      event = JSON.parse(req.body.toString());
+      console.warn('[billing] webhook: no STRIPE_WEBHOOK_SECRET — skipping signature check');
+    }
+  } catch (err) {
+    console.error('[billing] webhook signature error:', err.message);
+    return res.status(400).json({ error: err.message });
+  }
+
+  const admin = getSupabaseAdmin();
+
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        const userId = session.metadata?.supabase_user_id;
+        if (!userId) break;
+
+        if (session.mode === 'payment') {
+          // One-time credit purchase
+          const pack = session.metadata?.pack;
+          const credits = parseInt(session.metadata?.credits || '0', 10);
+          if (credits > 0) {
+            await addCredits(userId, credits, 'credit_purchase', `${CREDIT_PACKS[pack]?.name || pack} credit pack`, { pack, stripeSessionId: session.id });
+            console.log(`[billing] webhook: added ${credits} credits to ${userId} (pack: ${pack})`);
+          }
+        }
+        break;
+      }
+
+      case 'customer.subscription.created':
+      case 'customer.subscription.updated': {
+        const sub = event.data.object;
+        const userId = sub.metadata?.supabase_user_id;
+        if (!userId) break;
+
+        const plan = sub.metadata?.plan || 'pro';
+        const status = sub.status;
+
+        if (status === 'active' || status === 'trialing') {
+          const planData = PLANS[plan];
+          const now = new Date();
+          const resetAt = new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString();
+
+          // Update plan + subscription ID (no credit grant here — handled by invoice.payment_succeeded)
+          await admin.from('profiles').update({
+            plan,
+            stripe_subscription_id: sub.id,
+            credits_reset_at: resetAt,
+          }).eq('id', userId);
+
+          console.log(`[billing] webhook: subscription ${event.type === 'customer.subscription.created' ? 'created' : 'updated'} for ${userId} → plan=${plan}`);
+        }
+        break;
+      }
+
+      case 'invoice.payment_succeeded': {
+        // Fires on every successful payment — covers initial subscription + monthly renewals.
+        // Grant monthly credits whenever a subscription invoice is paid.
+        const invoice = event.data.object;
+        if (invoice.billing_reason !== 'subscription_create' && invoice.billing_reason !== 'subscription_cycle') break;
+
+        const subId = invoice.subscription;
+        if (!subId) break;
+
+        const sub = await stripe.subscriptions.retrieve(subId);
+        const userId = sub.metadata?.supabase_user_id;
+        if (!userId) break;
+
+        const plan = sub.metadata?.plan || 'pro';
+        const planData = PLANS[plan];
+        const monthlyCredits = planData?.monthlyCredits ?? 1000;
+
+        await addCredits(userId, monthlyCredits, 'subscription_grant', `${planData?.name || plan} plan — monthly credits`, { plan, subscriptionId: subId, invoiceId: invoice.id });
+        console.log(`[billing] webhook: granted ${monthlyCredits} credits to ${userId} (${plan}, ${invoice.billing_reason})`);
+        break;
+      }
+
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object;
+        const userId = sub.metadata?.supabase_user_id;
+        if (!userId) break;
+
+        await admin.from('profiles').update({
+          plan: 'free',
+          stripe_subscription_id: null,
+          credits_reset_at: null,
+        }).eq('id', userId);
+
+        console.log(`[billing] webhook: subscription canceled for ${userId} — downgraded to free`);
+        break;
+      }
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error('[billing] webhook handler error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
@@ -3171,29 +4329,36 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-app.listen(PORT, async () => {
-  console.log(`\n🚀 API Server running → http://localhost:${PORT}`);
-  if (!process.env.ANTHROPIC_API_KEY) {
-    console.warn('⚠️  ANTHROPIC_API_KEY not set — copy .env.example to .env and add your key\n');
-  } else {
-    console.log('✅ Anthropic API key loaded');
-  }
-  // Auto-provision database schema on startup
-  if (process.env.SUPABASE_DB_URL) {
-    const result = await runSchemaSql();
-    if (result.success) {
-      console.log('✅ Database schema ready');
+// Export app for Vercel serverless / programmatic use.
+// Only start the HTTP server when run directly (node server/index.js).
+export default app;
+
+const isMain = process.argv[1] === fileURLToPath(import.meta.url);
+if (isMain) {
+  app.listen(PORT, async () => {
+    console.log(`\n🚀 API Server running → http://localhost:${PORT}`);
+    if (!process.env.ANTHROPIC_API_KEY) {
+      console.warn('⚠️  ANTHROPIC_API_KEY not set — copy .env.example to .env and add your key\n');
     } else {
-      console.warn('⚠️  DB schema init skipped:', result.error);
+      console.log('✅ Anthropic API key loaded');
     }
-  }
-  // Ensure uploads bucket exists in Supabase Storage
-  if (supabaseAdmin) {
-    const { error } = await supabaseAdmin.storage.createBucket(UPLOADS_BUCKET, { public: true });
-    if (!error || error.message?.includes('already exists')) {
-      console.log('✅ Supabase Storage bucket ready\n');
-    } else {
-      console.warn('⚠️  Storage bucket init warning:', error.message, '\n');
+    // Auto-provision database schema on startup
+    if (process.env.SUPABASE_DB_URL) {
+      const result = await runSchemaSql();
+      if (result.success) {
+        console.log('✅ Database schema ready');
+      } else {
+        console.warn('⚠️  DB schema init skipped:', result.error);
+      }
     }
-  }
-});
+    // Ensure uploads bucket exists in Supabase Storage
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.storage.createBucket(UPLOADS_BUCKET, { public: true });
+      if (!error || error.message?.includes('already exists')) {
+        console.log('✅ Supabase Storage bucket ready\n');
+      } else {
+        console.warn('⚠️  Storage bucket init warning:', error.message, '\n');
+      }
+    }
+  });
+}

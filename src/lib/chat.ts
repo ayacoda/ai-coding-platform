@@ -9,6 +9,20 @@ export function genId() {
   return `msg_${Date.now()}_${++idCounter}`;
 }
 
+/** Get the current user's JWT for server billing auth */
+async function getAuthHeaders(): Promise<Record<string, string>> {
+  try {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (session?.access_token) {
+      return {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${session.access_token}`,
+      };
+    }
+  } catch { /* ignore */ }
+  return { 'Content-Type': 'application/json' };
+}
+
 /**
  * Post-generation sanitizer — runs deterministically after files are parsed.
  *
@@ -159,6 +173,34 @@ export function sanitizeGeneratedFiles(
 let currentAbortController: AbortController | null = null;
 // When true, the next AbortError will skip the file-revert (used when navigating away)
 let navigationCancel = false;
+
+// ── Jam detection ─────────────────────────────────────────────────────────────
+// If the stream produces no data for JAM_TIMEOUT_MS, generation is considered
+// "jammed" and will automatically restart from scratch (up to MAX_JAM_RETRIES times).
+const JAM_TIMEOUT_MS = 30_000;
+const MAX_JAM_RETRIES = 2;
+let jamRetryCount = 0;
+let jamRetryMessage = '';
+let jamRetryOptions: { isolatedContext?: boolean; displayContent?: string; attachments?: ChatAttachment[]; overrideModel?: string; skipPlanApproval?: boolean; } | undefined;
+let jamRestartPending = false;
+let _jamWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
+
+function _startJamWatchdog() {
+  if (_jamWatchdogTimer) clearTimeout(_jamWatchdogTimer);
+  _jamWatchdogTimer = setTimeout(() => {
+    _jamWatchdogTimer = null;
+    if (currentAbortController && !jamRestartPending && useStore.getState().isGenerating) {
+      console.warn('[chat] generation jammed — no data for 30s, restarting...');
+      jamRestartPending = true;
+      currentAbortController.abort();
+      useStore.getState().setIsGenerating(false);
+    }
+  }, JAM_TIMEOUT_MS);
+}
+
+function _clearJamWatchdog() {
+  if (_jamWatchdogTimer) { clearTimeout(_jamWatchdogTimer); _jamWatchdogTimer = null; }
+}
 
 export function cancelGeneration(suppressRevert = false) {
   if (suppressRevert) navigationCancel = true;
@@ -513,7 +555,7 @@ export async function sendChatMessage(
     attachments?: ChatAttachment[];
     /** Force a specific model for this request (bypasses auto-mode, used for repair escalation). */
     overrideModel?: string;
-    /** Skip the plan-approval gate — used for queued items that the user already committed to. */
+    /** Skip the plan-approval gate — only used internally for repair flows. */
     skipPlanApproval?: boolean;
   }
 ) {
@@ -535,6 +577,7 @@ export async function sendChatMessage(
     projectConfig,
     removeLastMessages,
     setPendingVersionSave,
+    updateLastAssistantSummary,
   } = store;
 
   // Snapshot files before generation so we can revert on cancel
@@ -586,6 +629,12 @@ export async function sendChatMessage(
   currentAbortController = new AbortController();
   const { signal } = currentAbortController;
 
+  // Start jam watchdog immediately — covers plan-only, main fetch, AND streaming loop.
+  // Reset on every received chunk; fires if no data for JAM_TIMEOUT_MS.
+  jamRetryMessage = userInput;
+  jamRetryOptions = options;
+  _startJamWatchdog();
+
   // ── Build conversation history ─────────────────────────────────────────────
   type HistoryMsg = { role: string; content: string; images?: typeof images };
   let history: HistoryMsg[];
@@ -627,8 +676,7 @@ export async function sendChatMessage(
 
   // ── Plan approval gate ─────────────────────────────────────────────────────
   // Fetch a brief plan and show it to the user before generation starts.
-  // They can approve or cancel. Applies to all non-repair requests.
-  // Skipped for queued items — the user already committed to those when they queued them.
+  // They can approve or cancel. Applies to ALL non-repair requests — including queued ones.
   if (!isRepair && !options?.skipPlanApproval) {
     let planToShow: FullPlan | null = null;
     try {
@@ -640,8 +688,26 @@ export async function sendChatMessage(
         signal,
       });
       if (planResp.ok) {
-        const { plan, shouldApprove } = await planResp.json();
+        const { plan, shouldApprove, requestType: planReqType } = await planResp.json();
         if (shouldApprove && plan) planToShow = plan;
+
+        // Fallback: if plan-only failed for any non-bugfix operation, show a minimal card
+        // so the user can still confirm before generation runs.
+        if (!planToShow && planReqType !== 'bug_fix' && planReqType !== 'website_copy') {
+          planToShow = {
+            title: planReqType === 'new_app' ? 'Build App' : planReqType === 'redesign' ? 'Redesign App' : 'Update App',
+            description: planReqType === 'new_app'
+              ? "I'll build the app based on your request."
+              : planReqType === 'redesign'
+              ? "I'll redesign the app based on your request."
+              : "I'll update the app based on your request.",
+            requestType: planReqType,
+            firstBuildScope: ['Apply the requested changes'],
+            deferredScope: [],
+            pages: [],
+            components: [],
+          } as FullPlan;
+        }
       }
     } catch (planErr: unknown) {
       // Re-throw abort errors — user cancelled
@@ -649,22 +715,8 @@ export async function sendChatMessage(
       console.warn('[chat] /api/plan-only failed:', planErr);
     }
 
-    // For change requests where the server plan failed, use a minimal fallback
-    // so we always show an approval card instead of silently proceeding
-    if (!planToShow && hasFiles) {
-      planToShow = {
-        title: 'Apply Changes',
-        description: "I'll update the app based on your request.",
-        requestType: 'feature_add',
-        firstBuildScope: ['Apply the requested changes'],
-        deferredScope: [],
-        pages: [],
-        components: [],
-      } as FullPlan;
-    }
-
     if (planToShow) {
-      const { updateMessage } = useStore.getState();
+      const { updateMessage, setIsPlanPending } = useStore.getState();
       const msgs = useStore.getState().messages;
       const lastAssistant = [...msgs].reverse().find(m => m.role === 'assistant');
       if (lastAssistant) {
@@ -678,6 +730,8 @@ export async function sendChatMessage(
           },
         });
       }
+      // Block queue from processing the next item until this plan is resolved.
+      setIsPlanPending(true);
       setIsGenerating(false);
       currentAbortController = null;
       return;
@@ -706,9 +760,10 @@ export async function sendChatMessage(
       };
     }
 
+    const authHeaders = await getAuthHeaders();
     const response = await fetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders,
       body: JSON.stringify(body),
       signal,
     });
@@ -720,6 +775,10 @@ export async function sendChatMessage(
         (err.error?.includes('ANTHROPIC_API_KEY') || err.error?.includes('OPENAI_API_KEY'))
       ) {
         setHasApiKey(false);
+      }
+      if (response.status === 402) {
+        const credErr = `${err.error || 'Insufficient credits'} [${err.creditsAvailable ?? 0} available, ${err.creditsRequired ?? '?'} required]`;
+        throw new Error(credErr);
       }
       throw new Error(err.error || `HTTP ${response.status}`);
     }
@@ -753,6 +812,7 @@ export async function sendChatMessage(
       const { done, value } = await reader.read();
       if (done) break;
 
+      _startJamWatchdog(); // reset watchdog on every chunk
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? '';
@@ -927,6 +987,12 @@ export async function sendChatMessage(
       setFiles(newFiles);
       setRightPanel('preview');
 
+      // Show what was generated vs modified
+      updateLastAssistantSummary({
+        filesCreated: Object.keys(newFiles).filter(f => !filesSnapshot[f] && !f.endsWith('.sql')),
+        filesModified: Object.keys(newFiles).filter(f => !!filesSnapshot[f] && !f.endsWith('.sql')),
+      });
+
       // For new_app: only complete pages that are explicit stubs (contain placeholder text).
       // Do NOT use the manifest to find "missing" pages here — the generation completed normally
       // (App.tsx present) so the AI chose what to generate. Forcing extra pages causes unwanted
@@ -1020,23 +1086,50 @@ export async function sendChatMessage(
       }
     }
 
+    useStore.getState().setGenerationAbortedByUser(false);
     setLastMessageStreaming(false);
   } catch (err) {
+    _clearJamWatchdog();
     if (err instanceof Error && err.name === 'AbortError') {
-      if (!navigationCancel) {
+      if (jamRestartPending) {
+        // Jam-triggered abort — revert files and remove in-progress messages just like
+        // a user cancel, then retry after cleanup.
+        setFiles(filesSnapshot, true);
+        removeLastMessages(2);
+        setPendingVersionSave(null);
+        useStore.getState().setGenerationAbortedByUser(false);
+      } else if (!navigationCancel) {
         // User cancelled via stop button — revert files and remove in-progress messages
         setFiles(filesSnapshot, true);
         removeLastMessages(2); // remove user message + empty assistant placeholder
         setPendingVersionSave(null);
+        useStore.getState().setGenerationAbortedByUser(true);
       }
       navigationCancel = false;
     } else {
       const msg = err instanceof Error ? err.message : String(err);
       setLastMessageError(msg);
+      useStore.getState().setGenerationAbortedByUser(false);
     }
   } finally {
+    _clearJamWatchdog();
     currentAbortController = null;
     setIsGenerating(false);
+  }
+
+  // Jam restart — fires after finally, re-sends the same message if retry budget remains
+  if (jamRestartPending) {
+    jamRestartPending = false;
+    if (jamRetryCount < MAX_JAM_RETRIES) {
+      jamRetryCount++;
+      console.warn(`[chat] jam restart attempt ${jamRetryCount}/${MAX_JAM_RETRIES}`);
+      await sendChatMessage(jamRetryMessage, { ...jamRetryOptions, skipPlanApproval: true });
+    } else {
+      jamRetryCount = 0;
+      console.warn('[chat] jam: max retries reached, giving up');
+    }
+  } else {
+    jamRetryCount = 0; // reset counter on successful completion
   }
 }
 
@@ -1051,6 +1144,7 @@ export async function approvePlan(messageId: string) {
     updateLastAssistantMessage,
     updateLastAssistantPipeline,
     setIsGenerating,
+    setIsPlanPending,
     setLastMessageStreaming,
     setLastMessageError,
     setFiles,
@@ -1058,6 +1152,7 @@ export async function approvePlan(messageId: string) {
     setHasApiKey,
     setSelectedModel,
     setPendingVersionSave,
+    updateLastAssistantSummary,
   } = useStore.getState();
 
   const msg = messages.find(m => m.id === messageId);
@@ -1065,7 +1160,8 @@ export async function approvePlan(messageId: string) {
 
   const { plan, buildContext } = msg.planApproval;
 
-  // Transition to generating state — clear approval card, start pipeline
+  // Unblock the queue and transition to generating state
+  setIsPlanPending(false);
   updateMessage(messageId, {
     isStreaming: true,
     content: '',
@@ -1077,6 +1173,9 @@ export async function approvePlan(messageId: string) {
   currentAbortController = new AbortController();
   const { signal } = currentAbortController;
 
+  // Start watchdog immediately — covers the fetch hang + streaming stall
+  _startJamWatchdog();
+
   const filesSnapshot = { ...useStore.getState().files };
   const existingFiles = useStore.getState().files;
 
@@ -1084,9 +1183,10 @@ export async function approvePlan(messageId: string) {
     const { storageMode, projectConfig } = useStore.getState();
 
     const actualHasFiles = Object.keys(existingFiles).length > 0;
+    const approveAuthHeaders = await getAuthHeaders();
     const response = await fetch('/api/build', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: approveAuthHeaders,
       body: JSON.stringify({
         messages: buildContext.messages,
         hasFiles: actualHasFiles,
@@ -1105,6 +1205,10 @@ export async function approvePlan(messageId: string) {
       const err = await response.json().catch(() => ({ error: 'Unknown error' }));
       if (response.status === 400 && (err.error?.includes('ANTHROPIC_API_KEY') || err.error?.includes('OPENAI_API_KEY'))) {
         setHasApiKey(false);
+      }
+      if (response.status === 402) {
+        const credErr = `${err.error || 'Insufficient credits'} [${err.creditsAvailable ?? 0} available, ${err.creditsRequired ?? '?'} required]`;
+        throw new Error(credErr);
       }
       throw new Error(err.error || `HTTP ${response.status}`);
     }
@@ -1134,6 +1238,7 @@ export async function approvePlan(messageId: string) {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      _startJamWatchdog(); // reset watchdog on every chunk
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? '';
@@ -1257,6 +1362,12 @@ export async function approvePlan(messageId: string) {
       setFiles(newFiles);
       setRightPanel('preview');
 
+      // Show what was generated vs modified
+      updateLastAssistantSummary({
+        filesCreated: Object.keys(newFiles).filter(f => !filesSnapshot[f] && !f.endsWith('.sql')),
+        filesModified: Object.keys(newFiles).filter(f => !!filesSnapshot[f] && !f.endsWith('.sql')),
+      });
+
       if (isNewApp) {
         const allFiles = { ...existingFiles, ...newFiles };
         const stubPages = detectStubPages(allFiles);
@@ -1291,16 +1402,35 @@ export async function approvePlan(messageId: string) {
 
     setLastMessageStreaming(false);
   } catch (err) {
+    _clearJamWatchdog();
     if (err instanceof Error && err.name === 'AbortError') {
       setFiles(filesSnapshot, true);
       setPendingVersionSave(null);
       navigationCancel = false;
+      useStore.getState().setGenerationAbortedByUser(jamRestartPending ? false : true);
     } else {
       const errMsg = err instanceof Error ? err.message : String(err);
       setLastMessageError(errMsg);
+      useStore.getState().setGenerationAbortedByUser(false);
     }
   } finally {
+    _clearJamWatchdog();
     currentAbortController = null;
     setIsGenerating(false);
+  }
+
+  // Jam restart for approvePlan — re-approve the same plan
+  if (jamRestartPending) {
+    jamRestartPending = false;
+    if (jamRetryCount < MAX_JAM_RETRIES) {
+      jamRetryCount++;
+      console.warn(`[chat] approvePlan jam restart attempt ${jamRetryCount}/${MAX_JAM_RETRIES}`);
+      await approvePlan(messageId);
+    } else {
+      jamRetryCount = 0;
+      console.warn('[chat] approvePlan jam: max retries reached');
+    }
+  } else {
+    jamRetryCount = 0;
   }
 }

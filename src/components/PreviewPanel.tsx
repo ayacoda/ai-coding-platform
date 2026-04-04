@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
+import type { ChatAttachment } from '../types';
 
 type ViewportMode = 'desktop' | 'tablet' | 'mobile';
 import { useStore } from '../store/useStore';
 import { buildPreviewHTML } from '../lib/preview';
-import { sendChatMessage } from '../lib/chat';
+import { sendChatMessage, cancelGeneration } from '../lib/chat';
 import { saveVersion } from '../lib/versions';
 
 // Fix budget: max 3 identical consecutive errors before marking "stuck".
@@ -26,7 +27,72 @@ function normalizeError(msg: string): string {
     .trim();
 }
 
-// ─── Generating overlay ───────────────────────────────────────────────────────
+// ─── Shared file detection hook ──────────────────────────────────────────────
+
+type DetectedFile = { name: string; complete: boolean; lineCount: number };
+
+function useDetectedFiles(streamingContent: string): DetectedFile[] {
+  const fileTimings = useRef<Map<string, number>>(new Map());
+  const prevLen = useRef(0);
+
+  return useMemo(() => {
+    if (streamingContent.length < prevLen.current) fileTimings.current.clear();
+    prevLen.current = streamingContent.length;
+
+    const result: DetectedFile[] = [];
+    const lines = streamingContent.split('\n');
+    let inCode = false;
+    let currentFile = '';
+    let codeLineCount = 0;
+
+    for (const line of lines) {
+      if (!inCode && line.startsWith('```')) {
+        const parts = line.slice(3).trim().split(/\s+/);
+        const name = parts.slice(1).join(' ');
+        if (name && name.includes('.')) {
+          currentFile = name; inCode = true; codeLineCount = 0;
+        }
+      } else if (inCode && line.startsWith('```')) {
+        result.push({ name: currentFile, complete: true, lineCount: codeLineCount });
+        inCode = false; currentFile = ''; codeLineCount = 0;
+      } else if (inCode) {
+        codeLineCount++;
+      }
+    }
+    if (inCode && currentFile) result.push({ name: currentFile, complete: false, lineCount: codeLineCount });
+    return result;
+  }, [streamingContent]);
+}
+
+// ─── Generation timer hook ────────────────────────────────────────────────────
+
+function useTimerFromMount(): number {
+  const [elapsed, setElapsed] = useState(0);
+  const startRef = useRef(Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setElapsed(Date.now() - startRef.current), 100);
+    return () => clearInterval(id);
+  }, []);
+  return elapsed;
+}
+
+function formatElapsed(ms: number): string {
+  const s = ms / 1000;
+  if (s < 60) {
+    const int = Math.floor(s);
+    const dec = Math.floor((s - int) * 10);
+    return `${int}.${dec}`;
+  }
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60).toString().padStart(2, '0');
+  return `${m}:${sec}`;
+}
+
+function formatElapsedUnit(ms: number): string {
+  return ms < 60000 ? 's' : '';
+}
+
+// ─── Generating overlay (new app — no existing files) ────────────────────────
 
 const PHASE_LABELS = [
   'Planning architecture…',
@@ -36,41 +102,38 @@ const PHASE_LABELS = [
   'Finishing up…',
 ];
 
+function FileRow({ file, accentClass }: { file: DetectedFile; accentClass: string }) {
+  return (
+    <div className={`flex items-center gap-2.5 px-3 py-1.5 rounded-lg transition-all ${
+      file.complete ? 'bg-transparent' : `bg-zinc-900 border border-${accentClass}-500/20`
+    }`}>
+      {file.complete ? (
+        <div className="w-4 h-4 rounded-full bg-emerald-500/15 border border-emerald-500/25 flex items-center justify-center flex-shrink-0">
+          <svg className="w-2.5 h-2.5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+          </svg>
+        </div>
+      ) : (
+        <div className="w-4 h-4 flex-shrink-0 relative">
+          <div className={`absolute inset-0 rounded-full border-[1.5px] border-transparent border-t-${accentClass}-500 animate-spin`} />
+        </div>
+      )}
+      <span className={`text-[11px] font-mono flex-1 truncate ${file.complete ? 'text-zinc-600' : 'text-zinc-200'}`}>
+        {file.name}
+      </span>
+      {file.lineCount > 0 && (
+        <span className={`text-[9px] font-mono flex-shrink-0 tabular-nums ${file.complete ? 'text-zinc-700' : `text-${accentClass}-400/60`}`}>
+          {file.lineCount}L
+        </span>
+      )}
+    </div>
+  );
+}
+
 function GeneratingOverlay({ streamingContent }: { streamingContent: string }) {
-  const fileTimings = useRef<Map<string, { start: number; end?: number }>>(new Map());
-  const prevLen = useRef(0);
-
-  const detectedFiles = useMemo(() => {
-    // Content was reset (new generation) — clear timings
-    if (streamingContent.length < prevLen.current) fileTimings.current.clear();
-    prevLen.current = streamingContent.length;
-
-    const result: { name: string; complete: boolean; lineCount: number; duration: number | null }[] = [];
-    const lines = streamingContent.split('\n');
-    let inCode = false;
-    let currentFile = '';
-    let codeLineCount = 0;
-    for (const line of lines) {
-      if (!inCode && line.startsWith('```')) {
-        const parts = line.slice(3).trim().split(/\s+/);
-        const name = parts.slice(1).join(' ');
-        if (name && name.includes('.')) {
-          if (!fileTimings.current.has(name)) fileTimings.current.set(name, { start: Date.now() });
-          currentFile = name; inCode = true; codeLineCount = 0;
-        }
-      } else if (inCode && line.startsWith('```')) {
-        const t = fileTimings.current.get(currentFile);
-        if (t && !t.end) t.end = Date.now();
-        const dur = t?.end && t?.start ? (t.end - t.start) / 1000 : null;
-        result.push({ name: currentFile, complete: true, lineCount: codeLineCount, duration: dur });
-        inCode = false; currentFile = ''; codeLineCount = 0;
-      } else if (inCode) {
-        codeLineCount++;
-      }
-    }
-    if (inCode && currentFile) result.push({ name: currentFile, complete: false, lineCount: codeLineCount, duration: null });
-    return result;
-  }, [streamingContent]);
+  const detectedFiles = useDetectedFiles(streamingContent);
+  const completedCount = detectedFiles.filter((f) => f.complete).length;
+  const elapsed = useTimerFromMount();
 
   const [phaseIdx, setPhaseIdx] = useState(0);
   useEffect(() => {
@@ -78,59 +141,80 @@ function GeneratingOverlay({ streamingContent }: { streamingContent: string }) {
     return () => clearInterval(t);
   }, []);
 
-  const statusLabel =
-    detectedFiles.length > 0
-      ? `Writing ${detectedFiles[detectedFiles.length - 1].name}…`
-      : PHASE_LABELS[phaseIdx];
-  const completedCount = detectedFiles.filter((f) => f.complete).length;
+  const currentFile = detectedFiles.find((f) => !f.complete);
+  const statusLabel = currentFile
+    ? `Writing ${currentFile.name}…`
+    : PHASE_LABELS[phaseIdx];
+
+  const progress = detectedFiles.length > 0
+    ? Math.max(5, (completedCount / Math.max(detectedFiles.length, 1)) * 100)
+    : 0;
 
   return (
-    <div className="absolute inset-0 flex items-center justify-center bg-zinc-950 z-10">
-      <div className="w-full max-w-[280px] px-2 space-y-7">
-        <div className="flex justify-center">
-          <div className="relative w-16 h-16">
-            <div className="absolute inset-0 rounded-full border-2 border-indigo-500/15" />
-            <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-indigo-500 animate-spin" />
-            <div className="absolute inset-0 rounded-full border-2 border-transparent border-r-indigo-500/40 animate-spin [animation-duration:2s]" />
-            <div className="absolute inset-0 flex items-center justify-center text-xl select-none">⚡</div>
-          </div>
-        </div>
-        <div className="text-center space-y-1.5">
-          <p className="text-zinc-100 text-sm font-semibold tracking-tight">Building your app</p>
-          <p className="text-indigo-400 text-xs font-mono">{statusLabel}</p>
-        </div>
-        {detectedFiles.length > 0 && (
-          <div className="space-y-2">
-            <p className="text-[10px] text-zinc-600 uppercase tracking-widest font-medium px-1">
-              Files · {completedCount}/{detectedFiles.length}
-            </p>
-            <div className="space-y-1.5">
-              {detectedFiles.map((file, i) => (
-                <div key={i} className="flex items-center gap-2.5 px-1">
-                  {file.complete ? (
-                    <span className="text-emerald-400 text-xs flex-shrink-0">✓</span>
-                  ) : (
-                    <span className="w-3 h-3 rounded-full border-2 border-indigo-500 border-t-transparent animate-spin flex-shrink-0 inline-block" />
-                  )}
-                  <span className={`text-xs font-mono truncate flex-1 ${file.complete ? 'text-zinc-500' : 'text-zinc-200'}`}>
-                    {file.name}
-                  </span>
-                  {file.lineCount > 0 && (
-                    <span className={`text-[10px] font-mono flex-shrink-0 tabular-nums ${file.complete ? 'text-zinc-700' : 'text-indigo-400'}`}>
-                      {file.lineCount}L{file.duration !== null ? ` · ${file.duration.toFixed(1)}s` : ''}
-                    </span>
-                  )}
-                </div>
-              ))}
+    <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950 z-10 overflow-hidden">
+      {/* Ambient glow blobs */}
+      <div className="absolute rounded-full pointer-events-none animate-pulse"
+        style={{ width: 500, height: 500, top: '-20%', left: '-15%', background: 'radial-gradient(circle, rgba(99,102,241,0.10) 0%, transparent 65%)', animationDuration: '4s' }} />
+      <div className="absolute rounded-full pointer-events-none animate-pulse"
+        style={{ width: 380, height: 380, bottom: '-15%', right: '-10%', background: 'radial-gradient(circle, rgba(168,85,247,0.07) 0%, transparent 65%)', animationDuration: '5s', animationDelay: '1.8s' }} />
+
+      <div className="relative z-10 flex flex-col items-center w-full max-w-[300px] px-4 gap-6">
+        {/* Multi-ring orbital animation */}
+        <div className="relative w-24 h-24 flex items-center justify-center">
+          <div className="absolute inset-0 rounded-full border border-indigo-500/12 animate-ping" style={{ animationDuration: '3.5s' }} />
+          <div className="absolute inset-2 rounded-full border border-zinc-800/70" />
+          <div className="absolute inset-2 rounded-full border-2 border-transparent animate-spin"
+            style={{ borderTopColor: '#6366f1', borderRightColor: 'rgba(99,102,241,0.25)', animationDuration: '1.4s' }} />
+          <div className="absolute inset-6 rounded-full border border-zinc-700/50" />
+          <div className="absolute inset-6 rounded-full border-2 border-transparent animate-spin"
+            style={{ borderBottomColor: '#a855f7', borderLeftColor: 'rgba(168,85,247,0.25)', animationDuration: '2.2s', animationDirection: 'reverse' }} />
+          <div className="w-8 h-8 rounded-full flex items-center justify-center animate-pulse"
+            style={{ background: 'radial-gradient(circle, rgba(99,102,241,0.3) 0%, transparent 80%)', animationDuration: '2s' }}>
+            <div className="w-6 h-6 rounded-full bg-zinc-900 border border-indigo-500/35 flex items-center justify-center">
+              <svg className="w-3.5 h-3.5 text-indigo-400" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M13 10V3L4 14h7v7l9-11h-7z" />
+              </svg>
             </div>
           </div>
-        )}
+        </div>
+
+        {/* ── Big vibrant timer ── */}
+        <div className="flex flex-col items-center gap-1">
+          <div className="flex items-end gap-0.5 leading-none select-none">
+            <span
+              className="text-[52px] font-black tabular-nums tracking-tight"
+              style={{ background: 'linear-gradient(135deg, #818cf8 0%, #a78bfa 40%, #e879f9 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text', filter: 'drop-shadow(0 0 18px rgba(129,140,248,0.45))' }}
+            >
+              {formatElapsed(elapsed)}
+            </span>
+            {elapsed < 60000 && (
+              <span className="text-[22px] font-bold mb-2 text-violet-400/70">s</span>
+            )}
+          </div>
+          <span className="text-[10px] uppercase tracking-[0.2em] text-zinc-600 font-medium">elapsed</span>
+        </div>
+
+        {/* Status text */}
+        <div className="text-center space-y-1">
+          <p className="text-[14px] font-semibold text-zinc-200 tracking-tight">Building your app</p>
+          <p className="text-[11px] font-mono text-indigo-400/90">{statusLabel}</p>
+        </div>
+
+        {/* File list */}
         {detectedFiles.length > 0 && (
-          <div className="h-0.5 bg-zinc-800 rounded-full overflow-hidden">
-            <div
-              className="h-full bg-gradient-to-r from-indigo-500 to-purple-500 rounded-full transition-all duration-500"
-              style={{ width: `${Math.max(8, (completedCount / Math.max(detectedFiles.length, 1)) * 100)}%` }}
-            />
+          <div className="w-full space-y-2">
+            <div className="flex justify-between items-center px-1">
+              <span className="text-[10px] text-zinc-600 uppercase tracking-widest font-semibold">Files</span>
+              <span className="text-[10px] text-zinc-500 font-mono tabular-nums">{completedCount} / {detectedFiles.length}</span>
+            </div>
+            <div className="space-y-1">
+              {detectedFiles.map((file, i) => <FileRow key={i} file={file} accentClass="indigo" />)}
+            </div>
+            {/* Glowing progress bar */}
+            <div className="h-[3px] bg-zinc-800/80 rounded-full overflow-hidden mt-1">
+              <div className="h-full rounded-full transition-all duration-700 ease-out"
+                style={{ width: `${progress}%`, background: 'linear-gradient(90deg, #6366f1, #a855f7)', boxShadow: '0 0 8px rgba(99,102,241,0.75)' }} />
+            </div>
           </div>
         )}
       </div>
@@ -138,87 +222,65 @@ function GeneratingOverlay({ streamingContent }: { streamingContent: string }) {
   );
 }
 
-// ─── Generating status bar (bottom panel, shown when modifying existing app) ──
+// ─── Generating overlay (updating existing app) ───────────────────────────────
 
-function GeneratingStatusBar({ streamingContent }: { streamingContent: string }) {
-  const fileTimings = useRef<Map<string, { start: number; end?: number }>>(new Map());
-  const prevLen = useRef(0);
-
-  const detectedFiles = useMemo(() => {
-    if (streamingContent.length < prevLen.current) fileTimings.current.clear();
-    prevLen.current = streamingContent.length;
-    const result: { name: string; complete: boolean; lineCount: number; duration: number | null }[] = [];
-    const lines = streamingContent.split('\n');
-    let inCode = false; let currentFile = ''; let codeLineCount = 0;
-    for (const line of lines) {
-      if (!inCode && line.startsWith('```')) {
-        const parts = line.slice(3).trim().split(/\s+/);
-        const name = parts.slice(1).join(' ');
-        if (name && name.includes('.')) {
-          if (!fileTimings.current.has(name)) fileTimings.current.set(name, { start: Date.now() });
-          currentFile = name; inCode = true; codeLineCount = 0;
-        }
-      } else if (inCode && line.startsWith('```')) {
-        const t = fileTimings.current.get(currentFile);
-        if (t && !t.end) t.end = Date.now();
-        const dur = t?.end && t?.start ? (t.end - t.start) / 1000 : null;
-        result.push({ name: currentFile, complete: true, lineCount: codeLineCount, duration: dur });
-        inCode = false; currentFile = ''; codeLineCount = 0;
-      } else if (inCode) { codeLineCount++; }
-    }
-    if (inCode && currentFile) result.push({ name: currentFile, complete: false, lineCount: codeLineCount, duration: null });
-    return result;
-  }, [streamingContent]);
-
+function GeneratingUpdateOverlay({ streamingContent }: { streamingContent: string }) {
+  const detectedFiles = useDetectedFiles(streamingContent);
   const completedCount = detectedFiles.filter((f) => f.complete).length;
-  const activeFile = detectedFiles.find((f) => !f.complete);
-  const progress = detectedFiles.length > 0
-    ? Math.max(5, (completedCount / Math.max(detectedFiles.length, 1)) * 100)
-    : 20;
+  const elapsed = useTimerFromMount();
+
+  const [phaseIdx, setPhaseIdx] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setPhaseIdx((i) => Math.min(i + 1, PHASE_LABELS.length - 1)), 3500);
+    return () => clearInterval(t);
+  }, []);
+
+  const currentFile = detectedFiles.find((f) => !f.complete);
+  const statusLabel = currentFile ? `Writing ${currentFile.name}…` : PHASE_LABELS[phaseIdx];
 
   return (
-    <div className="absolute bottom-0 left-0 right-0 z-10 pointer-events-none">
-      {/* Thin progress bar at very top of panel */}
-      <div className="h-0.5 bg-zinc-800/80">
-        <div
-          className="h-full bg-gradient-to-r from-indigo-500 to-purple-500 transition-all duration-500"
-          style={{ width: `${progress}%` }}
-        />
+    <div className="absolute inset-0 flex flex-col items-end justify-end z-10 pointer-events-none p-3 gap-2">
+      {/* Top shimmer line */}
+      <div className="absolute top-0 left-0 right-0 h-[2px] bg-zinc-800/60 overflow-hidden rounded-full">
+        <div className="gen-sweep" />
       </div>
-      <div className="bg-zinc-950/90 backdrop-blur-sm border-t border-zinc-800/60 px-4 py-2.5 flex items-center gap-3">
-        {/* Spinner */}
-        <div className="relative w-5 h-5 flex-shrink-0">
-          <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-indigo-500 animate-spin" />
-          <div className="absolute inset-0 rounded-full border-2 border-transparent border-r-indigo-500/30 animate-spin [animation-duration:2s]" />
-        </div>
 
-        {/* Current file info */}
-        <div className="flex-1 min-w-0">
-          {activeFile ? (
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-zinc-300 font-mono truncate">{activeFile.name}</span>
-              {activeFile.lineCount > 0 && (
-                <span className="text-[10px] text-indigo-400 font-mono tabular-nums flex-shrink-0">{activeFile.lineCount}L</span>
-              )}
-            </div>
-          ) : (
-            <span className="text-xs text-zinc-400">Applying changes…</span>
-          )}
-        </div>
-
-        {/* File chips */}
-        {detectedFiles.length > 0 && (
-          <div className="flex items-center gap-1.5 flex-shrink-0">
-            {detectedFiles.slice(-5).map((f, i) => (
-              <span
-                key={i}
-                title={f.complete ? `${f.name} — ${f.lineCount}L${f.duration !== null ? ` · ${f.duration.toFixed(1)}s` : ''}` : f.name}
-                className={`w-1.5 h-1.5 rounded-full ${f.complete ? 'bg-emerald-500' : 'bg-indigo-400 animate-pulse'}`}
-              />
-            ))}
-            <span className="text-[10px] text-zinc-600 tabular-nums ml-1">{completedCount}/{detectedFiles.length}</span>
+      {/* File list card — slides up from bottom-right */}
+      {detectedFiles.length > 0 && (
+        <div className="pointer-events-auto bg-zinc-900/95 border border-zinc-700/60 rounded-xl p-3 shadow-2xl backdrop-blur-sm w-[220px] space-y-2">
+          <div className="flex justify-between items-center">
+            <span className="text-[10px] text-zinc-500 uppercase tracking-widest font-semibold">Updating</span>
+            <span className="text-[10px] text-zinc-600 font-mono tabular-nums">{completedCount}/{detectedFiles.length}</span>
           </div>
-        )}
+          <div className="space-y-0.5">
+            {detectedFiles.map((file, i) => <FileRow key={i} file={file} accentClass="indigo" />)}
+          </div>
+          <div className="h-[2px] bg-zinc-800 rounded-full overflow-hidden">
+            <div className="h-full rounded-full transition-all duration-700 ease-out"
+              style={{
+                width: `${Math.max(5, (completedCount / Math.max(detectedFiles.length, 1)) * 100)}%`,
+                background: 'linear-gradient(90deg, #6366f1, #a855f7)',
+                boxShadow: '0 0 6px rgba(99,102,241,0.7)',
+              }} />
+          </div>
+        </div>
+      )}
+
+      {/* Status pill with timer */}
+      <div className="pointer-events-auto flex items-center gap-2 bg-zinc-900/95 border border-zinc-700/60 rounded-full px-3 py-1.5 shadow-xl backdrop-blur-sm">
+        <div className="relative w-3.5 h-3.5 flex-shrink-0">
+          <div className="absolute inset-0 rounded-full border-[1.5px] border-transparent border-t-indigo-500 animate-spin" style={{ animationDuration: '0.9s' }} />
+        </div>
+        <p className="text-[11px] font-mono text-zinc-300 max-w-[140px] truncate">{statusLabel}</p>
+        <span className="flex-shrink-0 flex items-end gap-0.5 leading-none select-none ml-0.5">
+          <span
+            className="text-[15px] font-black tabular-nums"
+            style={{ background: 'linear-gradient(135deg, #818cf8 0%, #a78bfa 50%, #e879f9 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text', filter: 'drop-shadow(0 0 6px rgba(129,140,248,0.5))' }}
+          >
+            {formatElapsed(elapsed)}
+          </span>
+          {elapsed < 60000 && <span className="text-[9px] font-bold mb-0.5 text-violet-400/70">{formatElapsedUnit(elapsed)}</span>}
+        </span>
       </div>
     </div>
   );
@@ -247,99 +309,80 @@ function ErrorOverlay({
   isGenerating: boolean;
   streamingContent?: string;
 }) {
-  const fileTimings = useRef<Map<string, { start: number; end?: number }>>(new Map());
-  const prevLen = useRef(0);
-
-  const detectedFiles = useMemo(() => {
-    if (!streamingContent) { fileTimings.current.clear(); prevLen.current = 0; return []; }
-    if (streamingContent.length < prevLen.current) fileTimings.current.clear();
-    prevLen.current = streamingContent.length;
-
-    const result: { name: string; complete: boolean; lineCount: number; duration: number | null }[] = [];
-    const lines = streamingContent.split('\n');
-    let inCode = false;
-    let currentFile = '';
-    let codeLineCount = 0;
-    for (const line of lines) {
-      if (!inCode && line.startsWith('```')) {
-        const parts = line.slice(3).trim().split(/\s+/);
-        const name = parts.slice(1).join(' ');
-        if (name && name.includes('.')) {
-          if (!fileTimings.current.has(name)) fileTimings.current.set(name, { start: Date.now() });
-          currentFile = name; inCode = true; codeLineCount = 0;
-        }
-      } else if (inCode && line.startsWith('```')) {
-        const t = fileTimings.current.get(currentFile);
-        if (t && !t.end) t.end = Date.now();
-        const dur = t?.end && t?.start ? (t.end - t.start) / 1000 : null;
-        result.push({ name: currentFile, complete: true, lineCount: codeLineCount, duration: dur });
-        inCode = false; currentFile = ''; codeLineCount = 0;
-      } else if (inCode) {
-        codeLineCount++;
-      }
-    }
-    if (inCode && currentFile) result.push({ name: currentFile, complete: false, lineCount: codeLineCount, duration: null });
-    return result;
-  }, [streamingContent]);
+  const detectedFiles = useDetectedFiles(streamingContent || '');
+  const elapsed = useTimerFromMount();
 
   if (isFixing) {
-    const statusLabel = detectedFiles.length > 0
-      ? `Rewriting ${detectedFiles[detectedFiles.length - 1].name}…`
-      : 'Analyzing error…';
     const completedCount = detectedFiles.filter((f) => f.complete).length;
+    const currentFile = detectedFiles.find((f) => !f.complete);
+    const statusLabel = currentFile ? `Rewriting ${currentFile.name}…` : 'Analyzing error…';
 
     return (
-      <div className="absolute inset-0 flex items-center justify-center bg-zinc-950 z-10">
-        <div className="w-full max-w-[280px] px-2 space-y-7">
-          <div className="flex justify-center">
-            <div className="relative w-16 h-16">
-              <div className="absolute inset-0 rounded-full border-2 border-amber-500/15" />
-              <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-amber-500 animate-spin" />
-              <div className="absolute inset-0 rounded-full border-2 border-transparent border-r-amber-500/40 animate-spin [animation-duration:2s]" />
-              <div className="absolute inset-0 flex items-center justify-center text-xl select-none">🔧</div>
+      <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950 z-10 overflow-hidden">
+        {/* Amber ambient glow */}
+        <div className="absolute rounded-full pointer-events-none animate-pulse"
+          style={{ width: 420, height: 420, top: '-15%', right: '-10%', background: 'radial-gradient(circle, rgba(245,158,11,0.08) 0%, transparent 65%)', animationDuration: '4s' }} />
+
+        <div className="relative z-10 flex flex-col items-center w-full max-w-[300px] px-4 gap-6">
+          {/* Orbital animation — amber palette */}
+          <div className="relative w-24 h-24 flex items-center justify-center">
+            <div className="absolute inset-0 rounded-full border border-amber-500/10 animate-ping" style={{ animationDuration: '3.5s' }} />
+            <div className="absolute inset-2 rounded-full border border-zinc-800/70" />
+            <div className="absolute inset-2 rounded-full border-2 border-transparent animate-spin"
+              style={{ borderTopColor: '#f59e0b', borderRightColor: 'rgba(245,158,11,0.25)', animationDuration: '1.4s' }} />
+            <div className="absolute inset-6 rounded-full border border-zinc-700/50" />
+            <div className="absolute inset-6 rounded-full border-2 border-transparent animate-spin"
+              style={{ borderBottomColor: '#fb923c', borderLeftColor: 'rgba(251,146,60,0.25)', animationDuration: '2.2s', animationDirection: 'reverse' }} />
+            <div className="w-8 h-8 rounded-full flex items-center justify-center animate-pulse"
+              style={{ background: 'radial-gradient(circle, rgba(245,158,11,0.25) 0%, transparent 80%)', animationDuration: '2s' }}>
+              <div className="w-6 h-6 rounded-full bg-zinc-900 border border-amber-500/35 flex items-center justify-center">
+                <svg className="w-3.5 h-3.5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+              </div>
             </div>
           </div>
-          <div className="text-center space-y-1.5">
-            <p className="text-zinc-100 text-sm font-semibold tracking-tight">
-              {fixAttempt > 1 ? `Fixing… (attempt ${fixAttempt})` : 'Auto-fixing error…'}
-            </p>
-            <p className="text-amber-400 text-xs font-mono">{statusLabel}</p>
+
+          {/* Elapsed timer */}
+          <div className="flex flex-col items-center gap-1">
+            <div className="flex items-end gap-0.5 leading-none select-none">
+              <span
+                className="text-[52px] font-black tabular-nums tracking-tight"
+                style={{ background: 'linear-gradient(135deg, #fbbf24 0%, #f59e0b 40%, #fb923c 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text', filter: 'drop-shadow(0 0 18px rgba(245,158,11,0.45))' }}
+              >
+                {formatElapsed(elapsed)}
+              </span>
+              {elapsed < 60000 && (
+                <span className="text-[22px] font-bold mb-2 text-amber-400/70">s</span>
+              )}
+            </div>
+            <span className="text-[10px] uppercase tracking-[0.2em] text-zinc-600 font-medium">elapsed</span>
           </div>
+
+          <div className="text-center space-y-1.5">
+            <p className="text-[15px] font-semibold text-zinc-100 tracking-tight">
+              {fixAttempt > 1 ? `Auto-fixing… (attempt ${fixAttempt})` : 'Auto-fixing error…'}
+            </p>
+            <p className="text-[11px] font-mono text-amber-400/90">{statusLabel}</p>
+          </div>
+
           {detectedFiles.length > 0 && (
-            <div className="space-y-2">
-              <p className="text-[10px] text-zinc-600 uppercase tracking-widest font-medium px-1">
-                Files · {completedCount}/{detectedFiles.length}
-              </p>
-              <div className="space-y-1.5">
-                {detectedFiles.map((file, i) => (
-                  <div key={i} className="flex items-center gap-2.5 px-1">
-                    {file.complete ? (
-                      <span className="text-emerald-400 text-xs flex-shrink-0">✓</span>
-                    ) : (
-                      <span className="w-3 h-3 rounded-full border-2 border-amber-500 border-t-transparent animate-spin flex-shrink-0 inline-block" />
-                    )}
-                    <span className={`text-xs font-mono truncate flex-1 ${file.complete ? 'text-zinc-500' : 'text-zinc-200'}`}>
-                      {file.name}
-                    </span>
-                    {file.lineCount > 0 && (
-                      <span className={`text-[10px] font-mono flex-shrink-0 tabular-nums ${file.complete ? 'text-zinc-700' : 'text-amber-400'}`}>
-                        {file.lineCount}L{file.duration !== null ? ` · ${file.duration.toFixed(1)}s` : ''}
-                      </span>
-                    )}
-                  </div>
-                ))}
+            <div className="w-full space-y-2">
+              <div className="flex justify-between items-center px-1">
+                <span className="text-[10px] text-zinc-600 uppercase tracking-widest font-semibold">Files</span>
+                <span className="text-[10px] text-zinc-500 font-mono tabular-nums">{completedCount} / {detectedFiles.length}</span>
+              </div>
+              <div className="space-y-1">
+                {detectedFiles.map((file, i) => <FileRow key={i} file={file} accentClass="amber" />)}
+              </div>
+              <div className="h-[3px] bg-zinc-800/80 rounded-full overflow-hidden mt-1">
+                <div className="h-full rounded-full transition-all duration-700 ease-out"
+                  style={{ width: `${Math.max(5, (completedCount / Math.max(detectedFiles.length, 1)) * 100)}%`, background: 'linear-gradient(90deg, #f59e0b, #fb923c)', boxShadow: '0 0 8px rgba(245,158,11,0.75)' }} />
               </div>
             </div>
           )}
-          {detectedFiles.length > 0 && (
-            <div className="h-0.5 bg-zinc-800 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-gradient-to-r from-amber-500 to-orange-500 rounded-full transition-all duration-500"
-                style={{ width: `${Math.max(8, (completedCount / Math.max(detectedFiles.length, 1)) * 100)}%` }}
-              />
-            </div>
-          )}
-          <p className="text-zinc-600 text-[11px] text-center">Hang tight, rewriting the broken file…</p>
+          <p className="text-zinc-700 text-[11px] text-center">Rewriting the broken file…</p>
         </div>
       </div>
     );
@@ -400,7 +443,7 @@ function ErrorOverlay({
         <div className="flex gap-2">
           <button
             onClick={onRetry}
-            disabled={isFixing || isGenerating}
+            disabled={isFixing}
             className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-xs font-semibold transition-colors"
           >
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -729,6 +772,9 @@ function TabletFrame({ children }: { children: React.ReactNode }) {
 
 export default function PreviewPanel() {
   const { files, isGenerating, messages, storageMode, projectConfig, projectSecrets } = useStore();
+  const setPendingScreenshot = useStore((s) => s.setPendingScreenshot);
+  const captureRequest = useStore((s) => s.captureRequest);
+  const setCaptureRequest = useStore((s) => s.setCaptureRequest);
   const setFiles = useStore((s) => s.setFiles);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -739,6 +785,14 @@ export default function PreviewPanel() {
   const [isStuck, setIsStuck] = useState(false);   // true when same error repeated too many times
   const [shouldRegenerate, setShouldRegenerate] = useState(false); // true when 3+ distinct errors hit
   const [viewportMode, setViewportMode] = useState<ViewportMode>('desktop');
+
+  // Screenshot / region capture
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [captureToast, setCaptureToast] = useState(false);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selection, setSelection] = useState<{ startX: number; startY: number; endX: number; endY: number } | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const captureToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const filesRef = useRef(files);
   const isFixingRef = useRef(false);
@@ -778,6 +832,78 @@ export default function PreviewPanel() {
   useEffect(() => { isGeneratingRef.current = isGenerating; }, [isGenerating]);
   useEffect(() => { isStuckRef.current = isStuck; }, [isStuck]);
   useEffect(() => { shouldRegenerateRef.current = shouldRegenerate; }, [shouldRegenerate]);
+
+  // Esc cancels region select mode
+  useEffect(() => {
+    if (!selectMode) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') { setSelectMode(false); setSelection(null); setIsDragging(false); }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selectMode]);
+
+  const capturePreview = useCallback(async (region?: { x: number; y: number; w: number; h: number; containerW: number; containerH: number }) => {
+    const iframe = iframeRef.current;
+    const doc = iframe?.contentDocument;
+    if (!doc?.documentElement) return;
+    setIsCapturing(true);
+    try {
+      const { default: html2canvas } = await import('html2canvas');
+      const fullCanvas = await html2canvas(doc.documentElement, {
+        useCORS: true,
+        allowTaint: true,
+        backgroundColor: '#ffffff',
+        scale: 1,
+        logging: false,
+      });
+
+      let outCanvas: HTMLCanvasElement = fullCanvas;
+      if (region && region.w > 5 && region.h > 5) {
+        const scaleX = fullCanvas.width / region.containerW;
+        const scaleY = fullCanvas.height / region.containerH;
+        const cx = Math.round(region.x * scaleX);
+        const cy = Math.round(region.y * scaleY);
+        const cw = Math.max(1, Math.round(region.w * scaleX));
+        const ch = Math.max(1, Math.round(region.h * scaleY));
+        outCanvas = document.createElement('canvas');
+        outCanvas.width = cw;
+        outCanvas.height = ch;
+        outCanvas.getContext('2d')!.drawImage(fullCanvas, cx, cy, cw, ch, 0, 0, cw, ch);
+      }
+
+      const dataUrl = outCanvas.toDataURL('image/jpeg', 0.85);
+      const screenshot: ChatAttachment = {
+        id: `att_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+        type: 'image',
+        name: region ? 'preview-region.jpg' : 'preview-screenshot.jpg',
+        base64Data: dataUrl.split(',')[1],
+        mediaType: 'image/jpeg',
+        dataUrl,
+      };
+      setPendingScreenshot(screenshot);
+      // Show toast
+      if (captureToastTimer.current) clearTimeout(captureToastTimer.current);
+      setCaptureToast(true);
+      captureToastTimer.current = setTimeout(() => setCaptureToast(false), 2000);
+    } catch (e) {
+      console.error('Screenshot capture failed:', e);
+    } finally {
+      setIsCapturing(false);
+    }
+  }, [setPendingScreenshot]);
+
+  // Handle capture requests triggered from ChatPanel toolbar
+  useEffect(() => {
+    if (!captureRequest) return;
+    setCaptureRequest(null);
+    if (captureRequest === 'full') {
+      capturePreview();
+    } else if (captureRequest === 'region') {
+      setSelectMode(true);
+      setSelection(null);
+    }
+  }, [captureRequest, setCaptureRequest, capturePreview]);
 
   const streamingContent = useMemo(() => {
     const last = [...messages].reverse().find((m) => m.role === 'assistant' && m.isStreaming);
@@ -846,6 +972,14 @@ export default function PreviewPanel() {
       c = c.replace(/\bnew\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
       c = c.replace(/\bDate\.now\(\)\.toISOString\(\)/g, 'new Date().toISOString()');
       c = c.replace(/\bnew\s+Date\.toISOString\s*\(\)/g, 'new Date().toISOString()');
+      // "new Date toISOString()" — space instead of dot. The most common AI variant.
+      // Produces SyntaxError "Unexpected identifier 'toISOString'" which kills the entire eval.
+      c = c.replace(/\bnew\s+Date\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
+      // "new Date() toISOString()" — has parens but missing dot before method call.
+      c = c.replace(/\bnew\s+Date\s*\(\s*\)\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
+      // Generic fallback: any expression char (including ] " ') + space + toISOString( without a dot.
+      // Extended beyond \w|\) to catch: dates[0] toISOString(), "str" toISOString(), etc.
+      c = c.replace(/([^\s.])[ \t]+toISOString\s*\(/g, '$1.toISOString(');
 
       // Supabase createClient import — stripped by sandbox, crashes with "createClient is not defined".
       // window.db is pre-loaded; no import needed.
@@ -864,6 +998,15 @@ export default function PreviewPanel() {
 
       // window.db.auth.signIn( → window.db.auth.signInWithPassword(
       c = c.replace(/window\.db\.auth\.signIn\s*\(/g, 'window.db.auth.signInWithPassword(');
+
+      // TypeScript `as` type assertions that may survive compilation and cause "Unexpected identifier".
+      // Pattern: `expr as SomeType | undefined`  or  `expr as unknown as SomeType`
+      // These are valid TypeScript but invalid JavaScript — if TypeScript compilation fails to erase
+      // them (e.g. network issue loading TypeScript CDN), they produce parse errors in the browser.
+      // Safe to strip because TypeScript semantics for `as` are identity at runtime.
+      c = c.replace(/\s+as\s+unknown\s+as\s+[\w<>[\]|&?, ]+(?=\s*[;,)}\]:])/g, '');
+      c = c.replace(/\s+as\s+[\w<>[\]|&?, ]+\s*\|\s*(?:null|undefined)(?=\s*[;,)}\]:])/g, '');
+      c = c.replace(/\s+as\s+(?:null|undefined)\s*\|\s*[\w<>[\]|&?, ]+(?=\s*[;,)}\]:])/g, '');
 
       if (c !== code) anyChanged = true;
       result[name] = c;
@@ -996,6 +1139,12 @@ export default function PreviewPanel() {
     const isPostgresUuidCrash = /gen_random_uuid is not a function|uuid_generate_v4 is not a function/i.test(error) ||
       (errorSymbol === 'gen_random_uuid') || (errorSymbol === 'uuid_generate_v4');
 
+    // "invalid input syntax for type uuid: """ — user_id inserted as empty string.
+    // Root cause: code uses `user?.id || ''` fallback — when user is null/not-yet-loaded,
+    // user?.id is undefined and `|| ''` coerces to "". PostgreSQL rejects "" as a UUID.
+    const isEmptyUuidCrash = /invalid input syntax for type uuid/i.test(error) ||
+      /invalid.*uuid.*""|"".*uuid/i.test(error);
+
     // "Unexpected identifier 'X'" — a parse/syntax error from TypeScript compilation.
     // The "Unexpected identifier" format is NOT matched by the errorSymbol patterns above
     // (which only handle "X is not defined" / "X is not a function"), so errorSymbol stays ''.
@@ -1004,11 +1153,21 @@ export default function PreviewPanel() {
     // The most common cause is "new toISOString()" but other patterns can trigger it too.
     const isNewCallSyntaxCrash = /Unexpected identifier/i.test(error);
 
+    // Specifically: "Unexpected identifier 'undefined'" with auth context code.
+    // Caused by TypeScript `as T | undefined` assertions not being compiled away,
+    // or auth createContext patterns that produce raw TypeScript in the sandbox output.
+    const unexpectedSymbolForAuth = error.match(/Unexpected identifier ['"`]?(\w+)['"`]?/i)?.[1] ?? '';
+    const isAuthUndefinedCrash = isNewCallSyntaxCrash &&
+      unexpectedSymbolForAuth === 'undefined' &&
+      Object.values(currentFiles).some((c) =>
+        /createContext|AuthContext|AuthProvider|useAuth\s*[=(]|onAuthStateChange/.test(c)
+      );
+
     // For interface-as-component or Supabase crashes, send ALL files — fix must be cross-file consistent.
     // For other errors, only send suspect files to keep context small.
     const suspectFiles = new Set<string>();
     suspectFiles.add('App.tsx');
-    if (!isInterfaceAsComponentCrash && !isSupabaseCrash && !isWindowDbCrash && !isIllegalReturnCrash && !isInvalidLhsCrash && !isSchemaNameCrash && !isKeywordVariableCrash && !isPostgresUuidCrash && !isNewCallSyntaxCrash && errorSymbol) {
+    if (!isInterfaceAsComponentCrash && !isSupabaseCrash && !isWindowDbCrash && !isIllegalReturnCrash && !isInvalidLhsCrash && !isSchemaNameCrash && !isKeywordVariableCrash && !isPostgresUuidCrash && !isEmptyUuidCrash && !isNewCallSyntaxCrash && errorSymbol) {
       for (const [fname, code] of Object.entries(currentFiles)) {
         if (code.includes(errorSymbol)) suspectFiles.add(fname);
       }
@@ -1022,7 +1181,7 @@ export default function PreviewPanel() {
 
     // Attempt 2+: always escalate to ALL files for broader context.
     const needsAllFiles = isInterfaceAsComponentCrash || isSupabaseCrash || isWindowDbCrash ||
-      isIllegalReturnCrash || isInvalidLhsCrash || isSchemaNameCrash || isKeywordVariableCrash || isPostgresUuidCrash || isNewCallSyntaxCrash || attemptNumber >= 2 ||
+      isIllegalReturnCrash || isInvalidLhsCrash || isSchemaNameCrash || isKeywordVariableCrash || isPostgresUuidCrash || isEmptyUuidCrash || isNewCallSyntaxCrash || attemptNumber >= 2 ||
       !symbolFoundInFiles;
     const allFilesLabel = isInterfaceAsComponentCrash ? 'interface-as-component rename'
       : isSupabaseCrash ? 'Supabase import fix'
@@ -1032,6 +1191,8 @@ export default function PreviewPanel() {
       : isSchemaNameCrash ? 'schema-name-as-variable — must replace in all files'
       : isKeywordVariableCrash ? `SQL/CSS keyword "${errorSymbol}" used as variable — rename across all files`
       : isPostgresUuidCrash ? 'gen_random_uuid is a PostgreSQL function — replace with crypto.randomUUID()'
+      : isEmptyUuidCrash ? 'empty UUID — user_id inserted as "" — must add null guard in all mutation files'
+      : isAuthUndefinedCrash ? 'Auth context parse error — TypeScript `as undefined` pattern, must fix ALL auth files'
       : isNewCallSyntaxCrash ? 'Unexpected identifier — parse error, must scan ALL files'
       : !symbolFoundInFiles ? `${errorSymbol} not found in any file — async error, full context`
       : `attempt ${attemptNumber} — full context`;
@@ -1058,6 +1219,12 @@ export default function PreviewPanel() {
       if (isPostgresUuidCrash) {
         for (const [fname, code] of Object.entries(currentFiles)) {
           if (/gen_random_uuid|uuid_generate_v4/.test(code)) result.add(fname);
+        }
+      }
+      if (isEmptyUuidCrash) {
+        // Mark files that contain user_id inserts or user?.id patterns
+        for (const [fname, code] of Object.entries(currentFiles)) {
+          if (/user_id|user\?\.id|user\.id/.test(code)) result.add(fname);
         }
       }
       if (isNewCallSyntaxCrash) {
@@ -1204,6 +1371,17 @@ export default function PreviewPanel() {
           `Rename EVERY usage consistently across all files.\n` +
           `✅ Output EVERY file you changed as a full code block.`;
       }
+    } else if (isEmptyUuidCrash) {
+      extraHint = `\n⚠️ ROOT CAUSE: "invalid input syntax for type uuid: """ — a user_id column is being inserted with an empty string "" instead of a valid UUID.\n` +
+        `This happens when code uses \`user?.id || ''\` — if user is null/not-loaded yet, \`user?.id\` is undefined and \`|| ''\` coerces it to "".\n` +
+        `REQUIRED FIX — search ALL files for every DB insert/update that includes user_id and add a null guard:\n` +
+        `  ❌ await window.db.from('tasks').insert({ user_id: user?.id || '', title })\n` +
+        `  ✅ if (!user?.id) return;  // guard at top of the function\n` +
+        `     await window.db.from('tasks').insert({ user_id: user.id, title })\n` +
+        `  ❌ user_id: user?.id || 'unknown'  →  same problem, still not a UUID\n` +
+        `  ❌ user_id: userId || ''           →  same problem if userId is empty\n` +
+        `ALSO check: does the component receive/read user from auth state? Ensure auth is initialised before allowing any insert.\n` +
+        `✅ Output EVERY file you changed as a full code block.`;
     } else if (/is not a function/i.test(error)) {
       extraHint = `\n• "X is not a function" — check: imported value is actually a function, not an object/array. Check the export matches the import (default vs named).`;
     } else if (/maximum update depth|too many re-renders/i.test(error)) {
@@ -1220,16 +1398,32 @@ export default function PreviewPanel() {
         `✅ Output EVERY file you changed as a full code block.`;
     } else if (isNewCallSyntaxCrash) {
       const unexpectedSymbol = error.match(/Unexpected identifier ['"`]?(\w+)['"`]?/i)?.[1] ?? 'identifier';
-      extraHint = `\n⚠️ ROOT CAUSE: "Unexpected identifier '${unexpectedSymbol}'" is a JavaScript/TypeScript PARSE ERROR.\n` +
-        `The parser encountered "${unexpectedSymbol}" in a position where it is not syntactically valid.\n` +
-        `MOST COMMON CAUSES — search ALL files for these patterns:\n` +
-        `  ❌ new toISOString()         →  ✅ new Date().toISOString()  (toISOString is a method, not a constructor)\n` +
-        `  ❌ Date.now().toISOString()  →  ✅ new Date().toISOString()  (Date.now() returns a number)\n` +
-        `  ❌ new Date.toISOString()    →  ✅ new Date().toISOString()  (missing () after Date)\n` +
-        `  ❌ ${unexpectedSymbol}() as a standalone call — check if it should be a method call on an object\n` +
-        `  ❌ Unquoted CSS variable keys in style objects: { --myVar: x } → { '--myVar': x }\n` +
-        `This error REQUIRES fixing ALL files — not just App.tsx. Check data.ts, types.ts, and every component.\n` +
-        `✅ Output EVERY file you changed as a full code block.`;
+      if (isAuthUndefinedCrash) {
+        extraHint = `\n⚠️ ROOT CAUSE: "Unexpected identifier 'undefined'" with auth code is caused by TypeScript \`as\` type assertions that the sandbox couldn't strip — e.g. \`x as SomeType | undefined\` or \`null as unknown as AuthContextType\`.\n` +
+          `REQUIRED FIX — search ALL files for TypeScript patterns that produce runtime 'undefined':\n` +
+          `  ❌ createContext(null as unknown as AuthContextType)  →  ✅ createContext(null)\n` +
+          `  ❌ const ctx = useContext(AuthContext)!  →  ✅ const ctx = useContext(AuthContext)\n` +
+          `  ❌ const value = x as AuthType | undefined  →  ✅ const value = x\n` +
+          `  ❌ Any TypeScript \`as\` cast whose target type includes "undefined" or a specific type\n` +
+          `Also check that the auth pattern follows this EXACT safe structure:\n` +
+          `  ✅ const [user, setUser] = useState(null);\n` +
+          `  ✅ useEffect(() => { window.db.auth.getSession().then(...); window.db.auth.onAuthStateChange(...); }, []);\n` +
+          `  ✅ All auth state lives directly in the component via useState — NOT via createContext/useContext\n` +
+          `  ❌ DO NOT wrap the app in <AuthProvider> using a React Context — the sandbox has no Provider chain\n` +
+          `  ✅ If you need useAuth(), define it as: const useAuth = () => ({ user, loading, signIn, signOut })  (closure, not context)\n` +
+          `✅ Output EVERY file you changed as a full code block.`;
+      } else {
+        extraHint = `\n⚠️ ROOT CAUSE: "Unexpected identifier '${unexpectedSymbol}'" is a JavaScript/TypeScript PARSE ERROR.\n` +
+          `The parser encountered "${unexpectedSymbol}" in a position where it is not syntactically valid.\n` +
+          `MOST COMMON CAUSES — search ALL files for these patterns:\n` +
+          `  ❌ new toISOString()         →  ✅ new Date().toISOString()  (toISOString is a method, not a constructor)\n` +
+          `  ❌ Date.now().toISOString()  →  ✅ new Date().toISOString()  (Date.now() returns a number)\n` +
+          `  ❌ new Date.toISOString()    →  ✅ new Date().toISOString()  (missing () after Date)\n` +
+          `  ❌ ${unexpectedSymbol}() as a standalone call — check if it should be a method call on an object\n` +
+          `  ❌ Unquoted CSS variable keys in style objects: { --myVar: x } → { '--myVar': x }\n` +
+          `This error REQUIRES fixing ALL files — not just App.tsx. Check data.ts, types.ts, and every component.\n` +
+          `✅ Output EVERY file you changed as a full code block.`;
+      }
     } else if (isIllegalReturnCrash) {
       extraHint = `\n⚠️ ROOT CAUSE: A bare \`return\` statement exists OUTSIDE any function at the top level of a file.\n` +
         `The sandbox evaluates all files as a script (not a module), so top-level \`return\` is illegal.\n` +
@@ -1336,13 +1530,30 @@ export default function PreviewPanel() {
         `  ❌ uuid_generate_v4()       →  ✅ crypto.randomUUID()\n` +
         `For mock data IDs in arrays you can also use: Math.random().toString(36).slice(2)\n` +
         `✅ Output EVERY file you changed as a full code block.`
+      : isAuthUndefinedCrash
+      ? `AUTH PARSE ERROR FIX REQUIRED — "Unexpected identifier 'undefined'" in auth code means TypeScript \`as\` type assertions with \`undefined\` are not being stripped by the sandbox compiler.\n` +
+        `REQUIRED FIXES (check ALL .tsx/.ts files):\n` +
+        `  ❌ createContext(null as unknown as AuthContextType)  →  ✅ createContext(null)\n` +
+        `  ❌ x as SomeType | undefined  →  ✅ x\n` +
+        `  ❌ useContext(AuthContext)!  →  ✅ useContext(AuthContext)\n` +
+        `  ❌ const ctx = useContext(AuthContext); if (!ctx) throw ...  →  ✅ remove the throw (ctx may be null in sandbox)\n` +
+        `ALSO verify the auth structure is sandbox-safe:\n` +
+        `  ✅ Auth state: useState(null) in App.tsx — no createContext/Provider for auth\n` +
+        `  ✅ onAuthStateChange via: window.db.auth.onAuthStateChange((_e, s) => setUser(s?.user ?? null))\n` +
+        `  ✅ If using a custom useAuth hook, define it as a closure (not context): const useAuth = () => ({ user, ... })\n` +
+        `✅ Output EVERY file you changed as a full code block.`
       : isNewCallSyntaxCrash
       ? `PARSE ERROR FIX REQUIRED — "Unexpected identifier" is a JavaScript syntax error meaning an identifier appears where the parser doesn't expect one.\n` +
         `Search EVERY .tsx and .ts file for bad date/syntax patterns and fix them:\n` +
-        `  ❌ new toISOString()         →  ✅ new Date().toISOString()\n` +
-        `  ❌ Date.now().toISOString()  →  ✅ new Date().toISOString()\n` +
-        `  ❌ new Date.toISOString()    →  ✅ new Date().toISOString()\n` +
-        `  ❌ { --cssVar: value }       →  ✅ { '--cssVar': value } (CSS vars in style objects must be quoted)\n` +
+        `  ❌ new toISOString()             →  ✅ new Date().toISOString()\n` +
+        `  ❌ Date.now().toISOString()      →  ✅ new Date().toISOString()\n` +
+        `  ❌ new Date.toISOString()        →  ✅ new Date().toISOString()\n` +
+        `  ❌ new Date toISOString()        →  ✅ new Date().toISOString()  ← missing () after Date\n` +
+        `  ❌ new Date() toISOString()      →  ✅ new Date().toISOString()  ← missing dot\n` +
+        `  ❌ dates[0] toISOString()        →  ✅ dates[0].toISOString()    ← missing dot after ]\n` +
+        `  ❌ booking.date as Date toISOString()  →  ✅ (booking.date as Date).toISOString()\n` +
+        `  ❌ { --cssVar: value }           →  ✅ { '--cssVar': value } (CSS vars must be quoted)\n` +
+        `THE RULE: toISOString() must ALWAYS be preceded immediately by a DOT. NEVER a space.\n` +
         `Check data.ts, types.ts, components/, and pages/ — not just App.tsx.\n` +
         `✅ Output EVERY file you changed as a full code block.`
       : `STRICT REPAIR MODE — you are fixing ONE specific runtime error. Follow this protocol exactly:\n` +
@@ -1377,6 +1588,29 @@ export default function PreviewPanel() {
 
   useEffect(() => {
     function handleMessage(e: MessageEvent) {
+      // ── Upload bridge — sandboxed iframe can't fetch directly, so it posts here ──
+      if (e.data?.__orchidsUploadRequest) {
+        const { id, filename, mimeType, data } = e.data;
+        const pid = useStore.getState().projectConfig?.id || 'sandbox';
+        fetch('/api/upload', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ projectId: pid, filename, mimeType, data }),
+        })
+          .then((r) => r.json())
+          .then((result) => {
+            iframeRef.current?.contentWindow?.postMessage(
+              { __uploadResult: id, url: result.url, error: result.error || null }, '*'
+            );
+          })
+          .catch((err) => {
+            iframeRef.current?.contentWindow?.postMessage(
+              { __uploadResult: id, error: err.message }, '*'
+            );
+          });
+        return;
+      }
+
       if (e.data?.type === 'preview-error') {
         const msg: string = e.data.message;
         setPreviewError(msg);
@@ -1407,7 +1641,15 @@ export default function PreviewPanel() {
             }
           }, 1500);
         }
+      } else if (e.data?.type === '__hotUpdateFailed') {
+        // Hot update failed — fall back to a full iframe reload with the latest srcDoc
+        console.warn('[preview] hot update failed, falling back to full reload:', e.data?.message);
+        iframeInitialized.current = false;
+        setIframeSrcDoc(srcDocRef.current);
+        setKey((k) => k + 1);
       } else if (e.data?.type === 'preview-ready') {
+        // Mark the iframe as initialized so future file changes use hot updates
+        iframeInitialized.current = true;
         // Preview rendered — only clear the visible error. DO NOT reset stuck detection
         // history (recentErrors) yet — an async error often fires immediately after render,
         // and resetting here defeats the STUCK_THRESHOLD accumulation.
@@ -1455,6 +1697,9 @@ export default function PreviewPanel() {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   function handleRefresh() {
+    // Always do a full reload on manual refresh
+    iframeInitialized.current = false;
+    setIframeSrcDoc(srcDocRef.current);
     setIsRefreshing(true);
     setPreviewError(null);
     setKey((k) => k + 1);
@@ -1463,6 +1708,8 @@ export default function PreviewPanel() {
 
   function handleManualRetry() {
     if (previewError) {
+      // Cancel any in-progress generation so the fix can proceed immediately.
+      cancelGeneration(false);
       recentErrors.current = [];
       globalRepairCount.current = 0;
       setIsStuck(false);
@@ -1474,16 +1721,64 @@ export default function PreviewPanel() {
   }
 
   const hasFiles = Object.keys(files).length > 0;
-  // Full-screen overlay only for brand-new apps (nothing to show yet).
-  // When modifying an existing app, use the bottom status bar so the preview stays interactive.
+  // Full-screen overlay for brand-new apps. Inline card overlay for updates.
   const showGeneratingOverlay = isGenerating && !isFixing && !hasFiles;
-  const showStatusBar = isGenerating && !isFixing && hasFiles;
+  const showUpdateOverlay = isGenerating && !isFixing && hasFiles;
 
-  // Memoize srcDoc so it's only rebuilt when files/config/secrets actually change
+  // ── Hot reload implementation ─────────────────────────────────────────────
+  // After the first successful preview-ready, we avoid full iframe reloads by
+  // sending { type: "__hotUpdate", code } via postMessage. The iframe re-transpiles
+  // and re-renders in place. Falls back to full reload on failure or config change.
+
+  const iframeInitialized = useRef(false);
+  // "Stable" srcDoc rendered in the iframe — only updated for full reloads
+  const [iframeSrcDoc, setIframeSrcDoc] = useState('');
+  // Latest computed srcDoc (always current) — used for fallback full reloads
+  const srcDocRef = useRef('');
+  // Config key: when this changes, always do a full reload (not just code)
+  const lastConfigKey = useRef('');
+
+  // Compute the full HTML from current state
   const srcDoc = useMemo(
     () => buildPreviewHTML(hasFiles ? files : {}, { storageMode, projectId: projectConfig?.id, apiSecrets: projectSecrets }),
     [files, storageMode, projectConfig?.id, hasFiles, projectSecrets]
   );
+
+  // Keep srcDocRef in sync
+  useEffect(() => { srcDocRef.current = srcDoc; }, [srcDoc]);
+
+  // When srcDoc changes, decide: full reload or hot update
+  useEffect(() => {
+    const configKey = `${storageMode}|${projectConfig?.id ?? ''}|${JSON.stringify(projectSecrets ?? {})}`;
+    const configChanged = configKey !== lastConfigKey.current;
+
+    if (configChanged || !iframeInitialized.current || !hasFiles) {
+      // Always do a full reload for first load, config changes, or empty state
+      lastConfigKey.current = configKey;
+      iframeInitialized.current = false;
+      setIframeSrcDoc(srcDoc);
+      return;
+    }
+
+    // Iframe is initialized and only files changed — attempt hot update
+    const win = iframeRef.current?.contentWindow;
+    if (!win) {
+      iframeInitialized.current = false;
+      setIframeSrcDoc(srcDoc);
+      return;
+    }
+
+    // Extract and unescape the user code from the new HTML
+    const codeMatch = srcDoc.match(/<script id="user-code" type="text\/plain">([\s\S]*?)<\/script>/);
+    if (!codeMatch) {
+      iframeInitialized.current = false;
+      setIframeSrcDoc(srcDoc);
+      return;
+    }
+    // Reverse escapeForScriptTag: <\/script> → </script>
+    const code = codeMatch[1].replace(/<\\\/script>/gi, '</script>');
+    win.postMessage({ type: '__hotUpdate', code }, '*');
+  }, [srcDoc]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const iframeEl = (
     <iframe
@@ -1492,7 +1787,7 @@ export default function PreviewPanel() {
       className="w-full h-full border-0"
       sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
       title="App Preview"
-      srcDoc={srcDoc}
+      srcDoc={iframeSrcDoc}
     />
   );
 
@@ -1524,10 +1819,10 @@ export default function PreviewPanel() {
               {fixAttempt > 1 ? `Auto-fixing… (attempt ${fixAttempt})` : 'Auto-fixing…'}
             </div>
           )}
-          {isGenerating && !isFixing && (
-            <div className="flex items-center gap-1.5 text-xs text-indigo-400 mr-1">
+          {isGenerating && !isFixing && hasFiles && (
+            <div className="flex items-center gap-1 text-[11px] text-indigo-400 mr-1 font-medium">
               <div className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse" />
-              Generating…
+              Generating
             </div>
           )}
 
@@ -1578,6 +1873,16 @@ export default function PreviewPanel() {
         </div>
       </div>
 
+      {/* Generating progress line — sits between toolbar and preview area */}
+      <div className="relative h-0.5 flex-shrink-0 overflow-hidden" style={{ background: (isGenerating || isFixing) ? 'rgba(99,102,241,0.12)' : 'transparent' }}>
+        {(isGenerating || isFixing) && (
+          <div
+            className="gen-sweep absolute left-0 top-0"
+            style={{ background: isFixing ? 'linear-gradient(90deg, transparent 0%, #f59e0b 40%, #fbbf24 60%, transparent 100%)' : undefined }}
+          />
+        )}
+      </div>
+
       {/* iframe + overlays */}
       <div
         className={`flex-1 relative overflow-hidden min-h-0 ${
@@ -1586,6 +1891,9 @@ export default function PreviewPanel() {
       >
         {showGeneratingOverlay && (
           <GeneratingOverlay streamingContent={streamingContent} />
+        )}
+        {showUpdateOverlay && (
+          <GeneratingUpdateOverlay streamingContent={streamingContent} />
         )}
 
         {/* Error / fixing overlay — replaces the white iframe when broken */}
@@ -1603,10 +1911,6 @@ export default function PreviewPanel() {
           />
         )}
 
-        {/* Status bar rendered after error overlay so it stays visible on top */}
-        {showStatusBar && (
-          <GeneratingStatusBar streamingContent={streamingContent} />
-        )}
 
         {viewportMode === 'desktop' ? (
           <div className="absolute inset-0">
@@ -1616,6 +1920,87 @@ export default function PreviewPanel() {
           <TabletFrame>{iframeEl}</TabletFrame>
         ) : (
           <PhoneFrame>{iframeEl}</PhoneFrame>
+        )}
+
+        {/* Region selection overlay */}
+        {selectMode && (
+          <div
+            className="absolute inset-0 z-30 select-none"
+            style={{ cursor: 'crosshair' }}
+            onMouseDown={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              const x = e.clientX - rect.left;
+              const y = e.clientY - rect.top;
+              setSelection({ startX: x, startY: y, endX: x, endY: y });
+              setIsDragging(true);
+            }}
+            onMouseMove={(e) => {
+              if (!isDragging) return;
+              const rect = e.currentTarget.getBoundingClientRect();
+              setSelection((s) => s ? { ...s, endX: e.clientX - rect.left, endY: e.clientY - rect.top } : null);
+            }}
+            onMouseUp={async (e) => {
+              setIsDragging(false);
+              setSelectMode(false);
+              const sel = selection;
+              setSelection(null);
+              if (!sel) return;
+              const x = Math.min(sel.startX, sel.endX);
+              const y = Math.min(sel.startY, sel.endY);
+              const w = Math.abs(sel.endX - sel.startX);
+              const h = Math.abs(sel.endY - sel.startY);
+              const rect = e.currentTarget.getBoundingClientRect();
+              if (w > 5 && h > 5) {
+                await capturePreview({ x, y, w, h, containerW: rect.width, containerH: rect.height });
+              }
+            }}
+          >
+            {/* Before drag starts: dim + instructions */}
+            {!isDragging && !selection && (
+              <div className="absolute inset-0 bg-black/40 flex items-center justify-center pointer-events-none">
+                <div className="bg-zinc-900/90 border border-zinc-600 rounded-xl px-5 py-3 text-sm text-zinc-200 flex items-center gap-2.5 shadow-2xl">
+                  <svg className="w-4 h-4 text-indigo-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+                  </svg>
+                  Drag to select a region
+                  <span className="text-zinc-500 text-xs">· Esc to cancel</span>
+                </div>
+              </div>
+            )}
+
+            {/* Spotlight selection */}
+            {selection && (() => {
+              const x = Math.min(selection.startX, selection.endX);
+              const y = Math.min(selection.startY, selection.endY);
+              const w = Math.abs(selection.endX - selection.startX);
+              const h = Math.abs(selection.endY - selection.startY);
+              return (
+                <>
+                  <div className="absolute bg-black/50" style={{ top: 0, left: 0, right: 0, height: y }} />
+                  <div className="absolute bg-black/50" style={{ top: y + h, left: 0, right: 0, bottom: 0 }} />
+                  <div className="absolute bg-black/50" style={{ top: y, left: 0, width: x, height: h }} />
+                  <div className="absolute bg-black/50" style={{ top: y, left: x + w, right: 0, height: h }} />
+                  <div className="absolute pointer-events-none" style={{ left: x, top: y, width: w, height: h, border: '2px solid #818cf8', boxShadow: '0 0 0 1px rgba(129,140,248,0.3)' }}>
+                    {([[-1,-1],[-1,1],[1,-1],[1,1]] as [number,number][]).map(([dx, dy], i) => (
+                      <div key={i} className="absolute w-2.5 h-2.5 bg-indigo-400 rounded-sm"
+                        style={{ top: dy === -1 ? -5 : 'auto', bottom: dy === 1 ? -5 : 'auto', left: dx === -1 ? -5 : 'auto', right: dx === 1 ? -5 : 'auto' }}
+                      />
+                    ))}
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        )}
+
+        {/* Capture toast */}
+        {captureToast && (
+          <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-40 bg-zinc-900/95 border border-zinc-700 rounded-lg px-4 py-2 text-xs text-zinc-200 flex items-center gap-2 shadow-xl pointer-events-none">
+            <svg className="w-3.5 h-3.5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+            </svg>
+            Screenshot added to chat
+          </div>
         )}
       </div>
     </div>

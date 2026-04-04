@@ -78,6 +78,11 @@ export interface Message {
   isAskResponse?: boolean;
   /** When set, the message shows a plan approval card instead of normal content */
   planApproval?: PlanApproval;
+  /** Set after generation completes — shows which files were created vs modified */
+  generationSummary?: {
+    filesCreated: string[];
+    filesModified: string[];
+  };
 }
 
 export interface QueueItem {

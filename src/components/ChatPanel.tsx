@@ -232,11 +232,14 @@ interface PendingKeyRequest {
 
 export default function ChatPanel() {
   const {
-    messages, isGenerating, hasApiKey,
+    messages, isGenerating, isPlanPending, hasApiKey,
     selectedModel, setSelectedModel, isAutoMode, setIsAutoMode,
     files, projectSecrets, setProjectSecret,
-    promptQueue, queuePaused, addToQueue, removeFromQueue, updateQueueItem, setQueuePaused, clearQueue,
+    promptQueue, queuePaused, addToQueue, addToQueueFront, removeFromQueue, updateQueueItem, setQueuePaused, clearQueue,
+    generationAbortedByUser, setGenerationAbortedByUser,
     clearVisibleMessages,
+    pendingScreenshot, setPendingScreenshot,
+    setCaptureRequest,
   } = useStore();
   const [chatMode, setChatMode] = useState<'build' | 'ask'>('build');
   const [input, setInput] = useState('');
@@ -256,6 +259,8 @@ export default function ChatPanel() {
   const [ideaSearch, setIdeaSearch] = useState('');
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [isRewriting, setIsRewriting] = useState(false);
+  // Tracks the queue item currently being processed — restored to front on user abort
+  const processingQueueItemRef = useRef<import('../types').QueueItem | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -268,6 +273,15 @@ export default function ChatPanel() {
     !!(window as any).SpeechRecognition || !!(window as any).webkitSpeechRecognition
   );
   const hasFiles = Object.keys(files).length > 0;
+
+  // Consume screenshot captured from PreviewPanel → add as attachment
+  useEffect(() => {
+    if (pendingScreenshot) {
+      setAttachments((prev) => [...prev, pendingScreenshot!]);
+      setPendingScreenshot(null);
+      setTimeout(() => textareaRef.current?.focus(), 50);
+    }
+  }, [pendingScreenshot, setPendingScreenshot]);
 
   function toggleDictation() {
     if (isListening) {
@@ -370,6 +384,20 @@ export default function ChatPanel() {
     return () => controller.abort();
   }, [files]);
 
+  // ── Elapsed timer — counts up while isGenerating (includes auto-fix runs) ──
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  useEffect(() => {
+    if (!isGenerating) { setElapsedSeconds(0); return; }
+    setElapsedSeconds(0);
+    const interval = setInterval(() => setElapsedSeconds((s) => s + 1), 1000);
+    return () => clearInterval(interval);
+  }, [isGenerating]);
+
+  function formatElapsed(s: number) {
+    if (s < 60) return `${s}s`;
+    return `${Math.floor(s / 60)}m ${s % 60}s`;
+  }
+
   // Re-fetch suggestions when generation finishes (covers cases where files didn't change)
   const prevIsGenerating = useRef(false);
   useEffect(() => {
@@ -424,22 +452,40 @@ export default function ChatPanel() {
     }
   }, [input]);
 
-  // Auto-execute next queued item when generation finishes
+  // Auto-execute next queued item when generation finishes AND no plan is awaiting approval.
+  // isPlanPending blocks this effect from firing while the user reviews a plan card,
+  // ensuring only one item is dequeued at a time.
   useEffect(() => {
-    if (isGenerating || queuePaused) return;
+    if (isGenerating || isPlanPending || queuePaused) return;
     const { promptQueue: q } = useStore.getState();
     if (q.length === 0) return;
     const timer = setTimeout(() => {
       // Re-check state inside timeout (may have changed)
-      const { promptQueue: current, queuePaused: paused, isGenerating: gen, removeFromQueue: remove } = useStore.getState();
-      if (gen || paused || current.length === 0) return;
+      const { promptQueue: current, queuePaused: paused, isGenerating: gen, isPlanPending: planPending, removeFromQueue: remove } = useStore.getState();
+      if (gen || planPending || paused || current.length === 0) return;
       const next = current[0];
+      processingQueueItemRef.current = next; // save before removing — restored on user abort
       remove(next.id);
-      sendChatMessage(next.prompt, { skipPlanApproval: true });
+      sendChatMessage(next.prompt);
     }, 400);
     return () => clearTimeout(timer);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isGenerating, queuePaused]);
+  }, [isGenerating, isPlanPending, queuePaused]);
+
+  // When the user cancels generation mid-queue: put the aborted item back at the front
+  // so it's retried the next time the queue runs (on resume or project reload).
+  useEffect(() => {
+    if (isGenerating) return; // still running
+    if (generationAbortedByUser && processingQueueItemRef.current) {
+      const item = processingQueueItemRef.current;
+      processingQueueItemRef.current = null;
+      addToQueueFront(item);
+      setGenerationAbortedByUser(false);
+    } else {
+      processingQueueItemRef.current = null;
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isGenerating, generationAbortedByUser]);
 
   async function doSend(message: string, atts: ChatAttachment[], mode: 'build' | 'ask' = 'build') {
     if (mode === 'ask') {
@@ -593,8 +639,16 @@ export default function ChatPanel() {
               />
             </svg>
             <div className="flex-1 min-w-0">
-              <div className="text-[10px] text-indigo-400/80 uppercase tracking-widest font-semibold mb-0.5">
-                Working on
+              <div className="flex items-center justify-between mb-0.5">
+                <span className="text-[10px] text-indigo-400/80 uppercase tracking-widest font-semibold">
+                  Working on
+                </span>
+                <span
+                  className="text-[10px] font-mono font-semibold tabular-nums px-1.5 py-0.5 rounded-md"
+                  style={{ background: 'rgba(99,102,241,0.15)', color: '#a5b4fc' }}
+                >
+                  {formatElapsed(elapsedSeconds)}
+                </span>
               </div>
               <p className="text-xs text-zinc-300 leading-relaxed line-clamp-2 break-words">
                 {activePrompt}
@@ -1150,47 +1204,9 @@ export default function ChatPanel() {
           </div>
         )}
 
-        <div className={`flex items-end gap-2 rounded-xl border bg-zinc-800/60 p-3 transition-colors ${
+        <div className={`flex items-end gap-2 rounded-xl border bg-zinc-800/60 px-3 pt-2.5 pb-2 transition-colors ${
           isGenerating ? 'border-zinc-700' : 'border-zinc-700 focus-within:border-indigo-500/60'
         }`}>
-          {/* Attach button */}
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            title="Attach image or file"
-            className="flex-shrink-0 w-7 h-7 rounded-md flex items-center justify-center text-zinc-500 hover:text-zinc-300 hover:bg-zinc-700 transition-colors mb-0.5"
-          >
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
-            </svg>
-          </button>
-
-          {/* Dictation button */}
-          {hasSpeechRecognition && (
-            <button
-              onClick={toggleDictation}
-              title={isListening ? 'Stop dictation' : 'Dictate (voice to text)'}
-              className={`flex-shrink-0 w-7 h-7 rounded-md flex items-center justify-center transition-all duration-150 mb-0.5 ${
-                isListening
-                  ? 'text-red-400 bg-red-500/15 hover:bg-red-500/25'
-                  : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-700'
-              }`}
-            >
-              {isListening ? (
-                /* Pulsing mic-off icon while recording */
-                <span className="relative flex items-center justify-center">
-                  <span className="absolute w-5 h-5 rounded-full bg-red-500/20 animate-ping" />
-                  <svg className="w-4 h-4 relative" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-                  </svg>
-                </span>
-              ) : (
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-                </svg>
-              )}
-            </button>
-          )}
-
           <textarea
             ref={textareaRef}
             value={input}
@@ -1270,6 +1286,70 @@ export default function ChatPanel() {
             )}
           </button>
         </div>
+        {/* Bottom toolbar — attach, mic, and capture buttons */}
+        <div className="flex items-center gap-0.5 mt-1">
+          {/* Attach */}
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            title="Attach image or file"
+            className="w-7 h-7 rounded-md flex items-center justify-center text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 transition-colors flex-shrink-0"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+            </svg>
+          </button>
+          {/* Dictation */}
+          {hasSpeechRecognition && (
+            <button
+              onClick={toggleDictation}
+              title={isListening ? 'Stop dictation' : 'Dictate (voice to text)'}
+              className={`w-7 h-7 rounded-md flex items-center justify-center transition-all duration-150 flex-shrink-0 ${
+                isListening ? 'text-red-400 bg-red-500/15' : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800'
+              }`}
+            >
+              {isListening ? (
+                <span className="relative flex items-center justify-center">
+                  <span className="absolute w-4 h-4 rounded-full bg-red-500/20 animate-ping" />
+                  <svg className="w-3.5 h-3.5 relative" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                  </svg>
+                </span>
+              ) : (
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                </svg>
+              )}
+            </button>
+          )}
+          {/* Capture buttons — only when a project is loaded */}
+          {hasFiles && (
+            <>
+              <div className="w-px h-3.5 bg-zinc-700/60 mx-0.5 flex-shrink-0" />
+              <button
+                onClick={() => setCaptureRequest('full')}
+                title="Capture full preview → attach to chat"
+                className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 transition-colors flex-shrink-0"
+              >
+                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+                Screenshot
+              </button>
+              <button
+                onClick={() => setCaptureRequest('region')}
+                title="Select a region of the preview → attach to chat"
+                className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 transition-colors flex-shrink-0"
+              >
+                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+                </svg>
+                Select region
+              </button>
+            </>
+          )}
+        </div>
+
         <p className="text-zinc-600 text-[11px] mt-2 text-center">
           {chatMode === 'ask'
             ? 'Ask a question · Enter to send'
@@ -1286,7 +1366,7 @@ export default function ChatPanel() {
 
 function PlanApprovalCard({ message }: { message: Message }) {
   const isGenerating = useStore(s => s.isGenerating);
-  const { updateMessage } = useStore.getState();
+  const { updateMessage, setIsPlanPending } = useStore.getState();
   const approval = message.planApproval!;
   const plan = approval.plan;
 
@@ -1295,6 +1375,8 @@ function PlanApprovalCard({ message }: { message: Message }) {
   }
 
   function handleCancel() {
+    // Unblock the queue so the next queued item can be processed
+    setIsPlanPending(false);
     updateMessage(message.id, {
       isStreaming: false,
       planApproval: { ...approval, status: 'cancelled' },
@@ -1500,6 +1582,11 @@ function MessageBubble({ message, onRePrompt, onFix, onImplement, onBuildFromAsk
         {/* Pipeline progress card (shown while pipeline is running or complete) */}
         {message.pipeline && <PipelineCard pipeline={message.pipeline} />}
 
+        {/* Generation summary — files created / modified */}
+        {message.generationSummary && !message.isStreaming && (
+          <GenerationSummaryCard summary={message.generationSummary} />
+        )}
+
         {message.error ? (
           <div className="text-sm text-red-400 bg-red-950/30 border border-red-900/40 rounded-xl p-3 space-y-2.5">
             <div>
@@ -1657,7 +1744,7 @@ function MarkdownContent({ content, isStreaming, onImplement, hideCode, hideText
           const hasCodeBefore = segments.slice(0, i).some((s) => s.type === 'code');
           const hasCodeAfter = segments.slice(i + 1).some((s) => s.type === 'code');
           const isLastText = !segments.slice(i + 1).some((s) => s.type === 'text');
-          if (hasCodeBefore && isLastText && !hasCodeAfter) {
+          if (hasCodeBefore && isLastText && !hasCodeAfter && /✅\s*Done!/i.test(seg.content)) {
             return <TextBlock key={i} text={seg.content} onImplement={onImplement} />;
           }
           return null;
@@ -1734,7 +1821,8 @@ function parseChangedEntries(lines: string[]): { file: string; desc: string }[] 
     if (!line || /^(Works:|Note:|✅)/i.test(line)) break;
     const m = line.match(/^[-•*]\s+(.+)/);
     if (!m) break;
-    const entry = m[1];
+    // Normalize backtick-quoted filenames: `file.ts`: desc → file.ts: desc
+    const entry = m[1].trim().replace(/^`([^`]+)`(\s*:)/, '$1$2');
     const colonIdx = entry.search(/\.(?:tsx?|jsx?|css|json|sql|md)\s*:/i);
     if (colonIdx !== -1) {
       // Find the end of the filename (up to and including the extension)
@@ -1758,6 +1846,48 @@ function parseChangedEntries(lines: string[]): { file: string; desc: string }[] 
   return [];
 }
 
+function GenerationSummaryCard({ summary }: { summary: NonNullable<import('../types').Message['generationSummary']> }) {
+  const { filesCreated, filesModified } = summary;
+  if (filesCreated.length === 0 && filesModified.length === 0) return null;
+  const total = filesCreated.length + filesModified.length;
+  return (
+    <div className="mt-2 mb-1 rounded-xl border border-zinc-800 bg-zinc-900/60 overflow-hidden">
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-zinc-800/60">
+        <svg className="w-3.5 h-3.5 text-indigo-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+        </svg>
+        <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
+          {total} file{total !== 1 ? 's' : ''} changed
+        </span>
+        {filesCreated.length > 0 && (
+          <span className="text-[10px] font-medium text-emerald-400 bg-emerald-400/10 border border-emerald-400/20 rounded-full px-1.5 py-0.5">
+            +{filesCreated.length} new
+          </span>
+        )}
+        {filesModified.length > 0 && (
+          <span className="text-[10px] font-medium text-sky-400 bg-sky-400/10 border border-sky-400/20 rounded-full px-1.5 py-0.5">
+            ~{filesModified.length} updated
+          </span>
+        )}
+      </div>
+      <div className="px-3 py-2.5 flex flex-wrap gap-1.5">
+        {filesCreated.map(f => (
+          <span key={f} className="inline-flex items-center gap-1 text-[11px] font-mono bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 rounded-md px-2 py-0.5">
+            <span className="text-[9px] font-bold text-emerald-400 uppercase">new</span>
+            {f.replace(/^(src\/|components\/|pages\/)/, '$1')}
+          </span>
+        ))}
+        {filesModified.map(f => (
+          <span key={f} className="inline-flex items-center gap-1 text-[11px] font-mono bg-sky-500/10 border border-sky-500/20 text-sky-300 rounded-md px-2 py-0.5">
+            <span className="text-[9px] font-bold text-sky-400 uppercase">upd</span>
+            {f.replace(/^(src\/|components\/|pages\/)/, '$1')}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function DoneBlock({ text }: { text: string }) {
   const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
   const summaryLine = lines.find((l) => l.startsWith('✅'));
@@ -1767,16 +1897,6 @@ function DoneBlock({ text }: { text: string }) {
   const summary = summaryLine?.replace(/^✅\s*Done!\s*/i, '').trim() ?? '';
   const worksText = worksLine?.replace(/^Works:\s*/i, '').trim() ?? '';
   const noteText = noteLine?.replace(/^Note:\s*/i, '').trim() ?? '';
-  const changedEntries = parseChangedEntries(lines);
-
-  const FILE_COLORS: Record<string, string> = {
-    tsx: 'bg-cyan-500/10 border-cyan-500/25 text-cyan-300',
-    ts: 'bg-blue-500/10 border-blue-500/25 text-blue-300',
-    jsx: 'bg-yellow-500/10 border-yellow-500/25 text-yellow-300',
-    js: 'bg-yellow-500/10 border-yellow-500/25 text-yellow-300',
-    css: 'bg-pink-500/10 border-pink-500/25 text-pink-300',
-    json: 'bg-orange-500/10 border-orange-500/25 text-orange-300',
-  };
 
   return (
     <div className="mt-2 rounded-xl border border-emerald-500/20 bg-emerald-500/5 overflow-hidden text-[13px]">
@@ -1787,39 +1907,9 @@ function DoneBlock({ text }: { text: string }) {
       </div>
 
       <div className="px-3 py-2.5 space-y-2.5">
-        {/* Changed files — each with description */}
-        {changedEntries.length > 0 && (
-          <div>
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500 block mb-1.5">Changed</span>
-            <div className="space-y-2">
-              {changedEntries.map((entry, i) => {
-                const ext = entry.file.split('.').pop() ?? '';
-                const short = entry.file.includes('/') ? entry.file.split('/').pop()! : entry.file;
-                const color = FILE_COLORS[ext] ?? 'bg-zinc-700/40 border-zinc-600/40 text-zinc-300';
-                return (
-                  <div key={i} className="flex flex-col gap-0.5">
-                    <span
-                      title={entry.file}
-                      className={`inline-flex items-center h-5 px-2 rounded-md border text-[11px] font-mono self-start ${color}`}
-                    >
-                      {short}
-                    </span>
-                    {entry.desc && (
-                      <span className="text-zinc-400 text-[12px] leading-relaxed pl-1">{entry.desc}</span>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
-
         {/* Works */}
         {worksText && (
-          <div>
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500 block mb-1">Works</span>
-            <p className="text-zinc-300 leading-relaxed">{worksText}</p>
-          </div>
+          <p className="text-zinc-300 leading-relaxed">{worksText}</p>
         )}
 
         {/* Note */}

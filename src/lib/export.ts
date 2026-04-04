@@ -348,6 +348,40 @@ function buildSupabasePackageJson(): string {
   );
 }
 
+/** Build the complete set of files for a deployable Vite+React project.
+ *  Returns a flat map of { filePath: content } for every file in the project. */
+export function buildProjectFiles(
+  files: FileSystem,
+  projectName = 'my-app',
+  storageMode: StorageMode = 'localstorage',
+  projectConfig: ProjectConfig | null = null
+): Record<string, string> {
+  const result: Record<string, string> = {};
+
+  const boilerplate = { ...BOILERPLATE };
+  if (storageMode === 'supabase') {
+    boilerplate['package.json'] = buildSupabasePackageJson();
+  }
+
+  for (const [path, content] of Object.entries(boilerplate)) {
+    result[path] = content;
+  }
+
+  if (storageMode === 'supabase') {
+    for (const [path, content] of Object.entries(buildSupabaseBoilerplate(projectConfig))) {
+      result[path] = content;
+    }
+  }
+
+  for (const [filename, content] of Object.entries(files)) {
+    if (filename.endsWith('.sql')) continue; // SQL files are server-side only
+    const dest = filename.startsWith('src/') ? filename : `src/${filename}`;
+    result[dest] = content;
+  }
+
+  return result;
+}
+
 export async function exportProjectZip(
   files: FileSystem,
   projectName = 'my-app',
@@ -357,29 +391,9 @@ export async function exportProjectZip(
   const zip = new JSZip();
   const root = zip.folder(projectName)!;
 
-  // Base boilerplate — use Supabase-aware package.json when needed
-  const boilerplate = { ...BOILERPLATE };
-  if (storageMode === 'supabase') {
-    boilerplate['package.json'] = buildSupabasePackageJson();
-  }
-
-  // Add boilerplate files
-  for (const [path, content] of Object.entries(boilerplate)) {
+  const projectFiles = buildProjectFiles(files, projectName, storageMode, projectConfig);
+  for (const [path, content] of Object.entries(projectFiles)) {
     root.file(path, content);
-  }
-
-  // Add integration-specific files
-  if (storageMode === 'supabase') {
-    const extras = buildSupabaseBoilerplate(projectConfig);
-    for (const [path, content] of Object.entries(extras)) {
-      root.file(path, content);
-    }
-  }
-
-  // Add generated app files into src/
-  for (const [filename, content] of Object.entries(files)) {
-    const dest = filename.startsWith('src/') ? filename : `src/${filename}`;
-    root.file(dest, content);
   }
 
   // Generate and trigger download

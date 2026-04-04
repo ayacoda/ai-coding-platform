@@ -50,12 +50,49 @@ CREATE TRIGGER projects_updated_at
   BEFORE UPDATE ON public.projects
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
--- Auto-create profile on signup
+-- ── Billing columns on profiles ──────────────────────────────────────────────
+ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS credits            INTEGER     NOT NULL DEFAULT 100;
+ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS plan               TEXT        NOT NULL DEFAULT 'free';
+ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
+ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;
+ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS credits_reset_at   TIMESTAMPTZ;
+
+-- Credit transactions log
+CREATE TABLE IF NOT EXISTS public.credit_transactions (
+  id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     UUID        REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
+  amount      INTEGER     NOT NULL,          -- positive = added, negative = deducted
+  type        TEXT        NOT NULL,          -- deduction|credit_purchase|subscription_grant|signup_grant
+  description TEXT,
+  metadata    JSONB       NOT NULL DEFAULT '{}',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE public.credit_transactions ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users can read own transactions" ON public.credit_transactions;
+CREATE POLICY "Users can read own transactions" ON public.credit_transactions
+  FOR SELECT USING (auth.uid() = user_id);
+
+-- Auto-create profile on signup (grants 100 signup credits + logs transaction)
 CREATE OR REPLACE FUNCTION public.handle_new_user()
 RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+  new_profile_id UUID;
 BEGIN
-  INSERT INTO public.profiles (id, email, name)
-  VALUES (NEW.id, NEW.email, COALESCE(NEW.raw_user_meta_data->>'name', split_part(NEW.email, '@', 1)));
+  INSERT INTO public.profiles (id, email, name, credits, plan)
+  VALUES (
+    NEW.id,
+    NEW.email,
+    COALESCE(NEW.raw_user_meta_data->>'name', split_part(NEW.email, '@', 1)),
+    100,
+    'free'
+  )
+  RETURNING id INTO new_profile_id;
+
+  INSERT INTO public.credit_transactions (user_id, amount, type, description)
+  VALUES (NEW.id, 100, 'signup_grant', 'Welcome credits — free tier');
+
   RETURN NEW;
 END;
 $$;
@@ -100,7 +137,11 @@ CREATE POLICY "Users can CRUD own versions" ON public.project_versions
   FOR ALL USING (auth.uid() = user_id);
 
 -- Grant schema + table access to Supabase roles (required in newer Supabase projects)
-GRANT USAGE ON SCHEMA public TO anon, authenticated;
-GRANT ALL ON public.profiles TO anon, authenticated;
-GRANT ALL ON public.projects TO anon, authenticated;
-GRANT ALL ON public.project_versions TO anon, authenticated;
+-- service_role is used by the server's admin client for billing queries — must be explicit
+GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON public.profiles TO anon, authenticated, service_role;
+GRANT ALL ON public.projects TO anon, authenticated, service_role;
+GRANT ALL ON public.project_versions TO anon, authenticated, service_role;
+GRANT ALL ON public.credit_transactions TO anon, authenticated, service_role;
+-- Sequence grants so INSERT with gen_random_uuid() works for all roles
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated, service_role;
