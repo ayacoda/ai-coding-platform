@@ -35,7 +35,7 @@ export interface PlanApproval {
 }
 
 export interface PipelineStageInfo {
-  name: 'routing' | 'planning' | 'generating' | 'polishing' | 'validating';
+  name: 'routing' | 'planning' | 'generating' | 'polishing' | 'validating' | 'verifying';
   status: 'running' | 'done';
   model?: string;
 }
@@ -88,6 +88,7 @@ export interface Message {
 export interface QueueItem {
   id: string;
   prompt: string;
+  attachments?: ChatAttachment[];
 }
 
 export type RightPanelTab = 'code' | 'preview';

@@ -10,7 +10,7 @@ import { saveVersion } from '../lib/versions';
 // Fix budget: max 3 identical consecutive errors before marking "stuck".
 const STUCK_THRESHOLD = 3;
 // Total repair cap — stop after this many total attempts regardless of error type.
-const MAX_REPAIRS = 6;
+const MAX_REPAIRS = 4;
 
 /** Normalize an error string so minor variations (line numbers) don't defeat stuck detection.
  *  IMPORTANT: keep the identifier in "X is not defined" errors so that fixing AppointmentsPage
@@ -20,6 +20,10 @@ function normalizeError(msg: string): string {
     .replace(/line\s+\d+/gi, 'line N')      // line 42 → line N
     .replace(/col(?:umn)?\s+\d+/gi, 'col N') // col 7 → col N
     .replace(/at\s+\S+:\d+:\d+/g, '')        // at file:1:2 → (removed)
+    // Collapse "Unexpected identifier 'X'" — different identifiers are the SAME class
+    // of error (TypeScript syntax in the eval sandbox). Without this, each attempt that
+    // introduces a different identifier escapes stuck detection and loops forever.
+    .replace(/Unexpected identifier ['"`]?\w+['"`]?/gi, 'Unexpected identifier')
     // Don't normalize quoted identifiers in "X is not defined" — each different missing name
     // is genuine progress, not a repeated error. Only collapse quoted values elsewhere.
     .replace(/(?<!not defined)'[^']{20,}'|(?<!not defined)"[^"]{20,}"/g, "'...'")
@@ -104,25 +108,25 @@ const PHASE_LABELS = [
 
 function FileRow({ file, accentClass }: { file: DetectedFile; accentClass: string }) {
   return (
-    <div className={`flex items-center gap-2.5 px-3 py-1.5 rounded-lg transition-all ${
+    <div className={`flex items-center gap-2.5 px-3 py-2 rounded-lg transition-all ${
       file.complete ? 'bg-transparent' : `bg-zinc-900 border border-${accentClass}-500/20`
     }`}>
       {file.complete ? (
-        <div className="w-4 h-4 rounded-full bg-emerald-500/15 border border-emerald-500/25 flex items-center justify-center flex-shrink-0">
-          <svg className="w-2.5 h-2.5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <div className="w-5 h-5 rounded-full bg-emerald-500/15 border border-emerald-500/25 flex items-center justify-center flex-shrink-0">
+          <svg className="w-3 h-3 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
           </svg>
         </div>
       ) : (
-        <div className="w-4 h-4 flex-shrink-0 relative">
-          <div className={`absolute inset-0 rounded-full border-[1.5px] border-transparent border-t-${accentClass}-500 animate-spin`} />
+        <div className="w-5 h-5 flex-shrink-0 relative">
+          <div className={`absolute inset-0 rounded-full border-2 border-transparent border-t-${accentClass}-500 animate-spin`} />
         </div>
       )}
-      <span className={`text-[11px] font-mono flex-1 truncate ${file.complete ? 'text-zinc-600' : 'text-zinc-200'}`}>
+      <span className={`text-[13px] font-mono flex-1 truncate ${file.complete ? 'text-zinc-500' : 'text-zinc-200'}`}>
         {file.name}
       </span>
       {file.lineCount > 0 && (
-        <span className={`text-[9px] font-mono flex-shrink-0 tabular-nums ${file.complete ? 'text-zinc-700' : `text-${accentClass}-400/60`}`}>
+        <span className={`text-[11px] font-mono flex-shrink-0 tabular-nums ${file.complete ? 'text-zinc-600' : `text-${accentClass}-400/60`}`}>
           {file.lineCount}L
         </span>
       )}
@@ -247,15 +251,15 @@ function GeneratingUpdateOverlay({ streamingContent }: { streamingContent: strin
 
       {/* File list card — slides up from bottom-right */}
       {detectedFiles.length > 0 && (
-        <div className="pointer-events-auto bg-zinc-900/95 border border-zinc-700/60 rounded-xl p-3 shadow-2xl backdrop-blur-sm w-[220px] space-y-2">
+        <div className="pointer-events-auto bg-zinc-900/95 border border-zinc-700/60 rounded-xl p-4 shadow-2xl backdrop-blur-sm w-[280px] space-y-3">
           <div className="flex justify-between items-center">
-            <span className="text-[10px] text-zinc-500 uppercase tracking-widest font-semibold">Updating</span>
-            <span className="text-[10px] text-zinc-600 font-mono tabular-nums">{completedCount}/{detectedFiles.length}</span>
+            <span className="text-[13px] text-zinc-400 uppercase tracking-widest font-semibold">Updating</span>
+            <span className="text-[13px] text-zinc-400 font-mono tabular-nums">{completedCount}/{detectedFiles.length}</span>
           </div>
-          <div className="space-y-0.5">
+          <div className="space-y-1">
             {detectedFiles.map((file, i) => <FileRow key={i} file={file} accentClass="indigo" />)}
           </div>
-          <div className="h-[2px] bg-zinc-800 rounded-full overflow-hidden">
+          <div className="h-[3px] bg-zinc-800 rounded-full overflow-hidden">
             <div className="h-full rounded-full transition-all duration-700 ease-out"
               style={{
                 width: `${Math.max(5, (completedCount / Math.max(detectedFiles.length, 1)) * 100)}%`,
@@ -267,20 +271,57 @@ function GeneratingUpdateOverlay({ streamingContent }: { streamingContent: strin
       )}
 
       {/* Status pill with timer */}
-      <div className="pointer-events-auto flex items-center gap-2 bg-zinc-900/95 border border-zinc-700/60 rounded-full px-3 py-1.5 shadow-xl backdrop-blur-sm">
-        <div className="relative w-3.5 h-3.5 flex-shrink-0">
-          <div className="absolute inset-0 rounded-full border-[1.5px] border-transparent border-t-indigo-500 animate-spin" style={{ animationDuration: '0.9s' }} />
+      <div className="pointer-events-auto flex items-center gap-2.5 bg-zinc-900/95 border border-zinc-700/60 rounded-full px-4 py-2 shadow-xl backdrop-blur-sm">
+        <div className="relative w-4 h-4 flex-shrink-0">
+          <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-indigo-500 animate-spin" style={{ animationDuration: '0.9s' }} />
         </div>
-        <p className="text-[11px] font-mono text-zinc-300 max-w-[140px] truncate">{statusLabel}</p>
+        <p className="text-[13px] font-mono text-zinc-300 max-w-[180px] truncate">{statusLabel}</p>
         <span className="flex-shrink-0 flex items-end gap-0.5 leading-none select-none ml-0.5">
           <span
-            className="text-[15px] font-black tabular-nums"
+            className="text-[19px] font-black tabular-nums"
             style={{ background: 'linear-gradient(135deg, #818cf8 0%, #a78bfa 50%, #e879f9 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text', filter: 'drop-shadow(0 0 6px rgba(129,140,248,0.5))' }}
           >
             {formatElapsed(elapsed)}
           </span>
-          {elapsed < 60000 && <span className="text-[9px] font-bold mb-0.5 text-violet-400/70">{formatElapsedUnit(elapsed)}</span>}
+          {elapsed < 60000 && <span className="text-[11px] font-bold mb-0.5 text-violet-400/70">{formatElapsedUnit(elapsed)}</span>}
         </span>
+      </div>
+    </div>
+  );
+}
+
+// ─── Reverted banner (non-blocking — preview stays visible) ──────────────────
+
+function RevertedBanner({ onRetry, onDismiss }: { onRetry: () => void; onDismiss: () => void }) {
+  return (
+    <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-3 px-4 py-2.5 rounded-xl bg-zinc-900/95 border border-emerald-500/30 shadow-xl backdrop-blur-sm text-sm max-w-sm w-full">
+      {/* Icon */}
+      <div className="shrink-0 w-7 h-7 rounded-lg bg-emerald-500/15 border border-emerald-500/25 flex items-center justify-center">
+        <svg className="w-3.5 h-3.5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 15L3 9m0 0l6-6M3 9h12a6 6 0 010 12h-3" />
+        </svg>
+      </div>
+      {/* Text */}
+      <div className="flex-1 min-w-0">
+        <p className="text-zinc-100 text-xs font-semibold leading-tight">Reverted to last working version</p>
+        <p className="text-zinc-500 text-[11px] mt-0.5 leading-tight">Fix attempts failed — previewing your last good state</p>
+      </div>
+      {/* Actions */}
+      <div className="flex items-center gap-1.5 shrink-0">
+        <button
+          onClick={onRetry}
+          className="px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-semibold transition-colors"
+        >
+          Try Again
+        </button>
+        <button
+          onClick={onDismiss}
+          className="p-1 rounded-lg hover:bg-zinc-800 text-zinc-500 hover:text-zinc-300 transition-colors"
+        >
+          <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </button>
       </div>
     </div>
   );
@@ -294,6 +335,7 @@ function ErrorOverlay({
   fixAttempt,
   isStuck,
   shouldRegenerate,
+  wasReverted,
   onRetry,
   onDismiss,
   isGenerating,
@@ -304,6 +346,7 @@ function ErrorOverlay({
   fixAttempt: number;
   isStuck: boolean;
   shouldRegenerate: boolean;
+  wasReverted: boolean;
   onRetry: () => void;
   onDismiss: () => void;
   isGenerating: boolean;
@@ -392,19 +435,23 @@ function ErrorOverlay({
   const firstLine = error?.split('\n')[0] ?? 'Unknown error';
   const hint = error?.split('\n\n').find((p) => p.startsWith('Hint:'));
 
-  // Determine title/subtitle based on state priority: regenerate > stuck > normal
-  const titleText = shouldRegenerate
+  // Determine title/subtitle based on state priority: reverted > regenerate > stuck > normal
+  const titleText = wasReverted
+    ? 'Reverted'
+    : shouldRegenerate
     ? 'Rebuild needed'
     : isStuck
     ? 'Auto-fix stopped'
     : 'Runtime Error';
-  const subtitleText = shouldRegenerate
+  const subtitleText = wasReverted
+    ? 'All fix attempts failed — reverted to your previous state. Describe what you want and I\'ll try again.'
+    : shouldRegenerate
     ? 'Too many fix attempts without success. Describe what you want in chat and I\'ll rebuild cleanly.'
     : isStuck
     ? 'Same error keeps repeating — click Try Again or describe the fix in chat'
     : 'Auto-fix will start shortly…';
-  const iconColorClass = shouldRegenerate ? 'text-orange-400' : 'text-red-400';
-  const iconBgClass = shouldRegenerate ? 'bg-orange-500/10 border-orange-500/20' : 'bg-red-500/10 border-red-500/20';
+  const iconColorClass = wasReverted ? 'text-emerald-400' : shouldRegenerate ? 'text-orange-400' : 'text-red-400';
+  const iconBgClass = wasReverted ? 'bg-emerald-500/10 border-emerald-500/20' : shouldRegenerate ? 'bg-orange-500/10 border-orange-500/20' : 'bg-red-500/10 border-red-500/20';
 
   return (
     <div className="absolute inset-0 flex items-center justify-center bg-zinc-950 z-10 p-6">
@@ -412,7 +459,11 @@ function ErrorOverlay({
         {/* Icon + title */}
         <div className="flex flex-col items-center gap-3 text-center">
           <div className={`w-12 h-12 rounded-2xl border flex items-center justify-center ${iconBgClass}`}>
-            {shouldRegenerate ? (
+            {wasReverted ? (
+              <svg className={`w-6 h-6 ${iconColorClass}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 15L3 9m0 0l6-6M3 9h12a6 6 0 010 12h-3" />
+              </svg>
+            ) : shouldRegenerate ? (
               <svg className={`w-6 h-6 ${iconColorClass}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
               </svg>
@@ -449,7 +500,7 @@ function ErrorOverlay({
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M13 10V3L4 14h7v7l9-11h-7z" />
             </svg>
-            {shouldRegenerate ? 'Try Anyway' : isStuck ? 'Try Again' : 'Fix Now'}
+            {wasReverted ? 'Try Again' : shouldRegenerate ? 'Try Anyway' : isStuck ? 'Try Again' : 'Fix Now'}
           </button>
           <button
             onClick={onDismiss}
@@ -784,6 +835,7 @@ export default function PreviewPanel() {
   const [fixAttempt, setFixAttempt] = useState(0); // shown in UI
   const [isStuck, setIsStuck] = useState(false);   // true when same error repeated too many times
   const [shouldRegenerate, setShouldRegenerate] = useState(false); // true when 3+ distinct errors hit
+  const [wasReverted, setWasReverted] = useState(false); // true after a failed repair caused an auto-revert
   const [viewportMode, setViewportMode] = useState<ViewportMode>('desktop');
 
   // Screenshot / region capture
@@ -799,8 +851,21 @@ export default function PreviewPanel() {
   const isGeneratingRef = useRef(isGenerating);
   const isStuckRef = useRef(false);
   const shouldRegenerateRef = useRef(false);
+  // Snapshot of the last files that rendered successfully (preview-ready fired).
+  // Used as the revert target when all repair attempts fail — restores the LAST KNOWN GOOD
+  // state, not the current broken AI output. Without this, reverting to a snapshot of
+  // broken files is useless (same content → srcDoc unchanged → blank screen).
+  const lastKnownGoodFilesRef = useRef<Record<string, string>>({});
+  // Last error seen before a revert — preserved so "Try Again" on the revert banner can re-trigger a fix.
+  const lastErrorBeforeRevertRef = useRef<string>('');
+  // Snapshot of files captured at the START of the first repair attempt.
+  // Used to revert when all repair attempts fail — so repairs can never permanently break the app.
+  const preRepairFilesRef = useRef<Record<string, string> | null>(null);
   // Track last N error fingerprints for same-error stuck detection
   const recentErrors = useRef<string[]>([]);
+  // Accumulate all distinct errors that fired during the debounce window so
+  // doFix can address ALL of them in a single repair pass (parallel fix).
+  const pendingErrors = useRef<string[]>([]);
   const autoFixTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Timer to debounce globalRepairCount reset after preview-ready.
   // The count is only cleared after 5s of stable preview — if preview-error fires
@@ -919,20 +984,22 @@ export default function PreviewPanel() {
       autoFixTimer.current = null;
     }
     if (fileChangeFromRepair.current) {
-      // Files changed because a repair ran — keep the global count and recentErrors so stuck
-      // detection can accumulate across attempts (each error = one entry in recentErrors).
-      // Clearing recentErrors here would reset the STUCK_THRESHOLD counter every time,
-      // causing the auto-fixer to loop indefinitely instead of stopping after N identical errors.
+      // Files changed because a repair ran (or a revert) — keep the global count and recentErrors
+      // so stuck detection can accumulate across attempts. Do NOT clear preRepairFilesRef here
+      // because it holds the snapshot we may need to revert to.
       fileChangeFromRepair.current = false;
     } else {
       // Genuine new build — fully reset ALL repair state including stuck detection history
       recentErrors.current = [];
+      pendingErrors.current = [];
       globalRepairCount.current = 0;
+      preRepairFilesRef.current = null;   // new generation = new baseline
       setFixAttempt(0);
       setIsStuck(false);
       isStuckRef.current = false;
       setShouldRegenerate(false);
       shouldRegenerateRef.current = false;
+      setWasReverted(false);
     }
   }, [files]);
 
@@ -975,11 +1042,15 @@ export default function PreviewPanel() {
       // "new Date toISOString()" — space instead of dot. The most common AI variant.
       // Produces SyntaxError "Unexpected identifier 'toISOString'" which kills the entire eval.
       c = c.replace(/\bnew\s+Date\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
-      // "new Date() toISOString()" — has parens but missing dot before method call.
-      c = c.replace(/\bnew\s+Date\s*\(\s*\)\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
-      // Generic fallback: any expression char (including ] " ') + space + toISOString( without a dot.
-      // Extended beyond \w|\) to catch: dates[0] toISOString(), "str" toISOString(), etc.
+      // "new Date() toISOString()" — has parens but missing dot (zero or more whitespace).
+      // \s* catches both "new Date() toISOString()" and "new Date()toISOString()" (zero-space).
+      c = c.replace(/\bnew\s+Date\s*\(\s*\)\s*toISOString\s*\(/g, 'new Date().toISOString(');
+      // Generic fallback: any expression char + space + toISOString( without a dot.
       c = c.replace(/([^\s.])[ \t]+toISOString\s*\(/g, '$1.toISOString(');
+      // Zero-space variant: ) or ] directly followed by toISOString without dot.
+      c = c.replace(/([)\]])toISOString\s*\(/g, '$1.toISOString(');
+      // Cross-line: expression ending in ) ] or word char + newline + toISOString without dot.
+      c = c.replace(/([)\]\w])([ \t]*\r?\n[ \t]*)toISOString\s*\(/g, '$1$2.toISOString(');
 
       // Supabase createClient import — stripped by sandbox, crashes with "createClient is not defined".
       // window.db is pre-loaded; no import needed.
@@ -1015,7 +1086,48 @@ export default function PreviewPanel() {
     return anyChanged ? result : null;
   }
 
-  function doFix(error: string) {
+  /**
+   * Revert to the pre-repair snapshot captured before the first fix attempt.
+   * Prevents failed repairs from permanently breaking the app.
+   * Returns true if a revert was performed.
+   */
+  function revertToPreRepairState(error?: string): boolean {
+    if (!preRepairFilesRef.current) return false;
+    const snapshot = preRepairFilesRef.current;
+    console.log('[repair] reverting to pre-repair snapshot — repairs exhausted without success');
+    // Preserve the error so "Try Again" on the revert banner can re-trigger a targeted fix.
+    if (error) lastErrorBeforeRevertRef.current = error;
+    // Mark as repair-triggered so the files useEffect doesn't reset repair state.
+    fileChangeFromRepair.current = true;
+    // Block further auto-fix using isStuck — this is the only mechanism whose ref stays in sync
+    // with its state via useEffect. shouldRegenerateRef would be immediately overwritten by
+    // useEffect([shouldRegenerate]) when we call setShouldRegenerate(false), undoing the block.
+    setIsStuck(true);
+    isStuckRef.current = true;
+    // Reset counts so future user-initiated retries start fresh.
+    recentErrors.current = [];
+    pendingErrors.current = [];
+    globalRepairCount.current = 0;
+    preRepairFilesRef.current = null;
+    // Restore the last known good state.
+    setFiles(snapshot);
+    setWasReverted(true);
+    setIsFixing(false);
+    isFixingRef.current = false;
+    setShouldRegenerate(false);
+    shouldRegenerateRef.current = false;
+    // Force a full iframe reload — critical when the snapshot has the same content as
+    // the current broken files (srcDoc wouldn't change → effect wouldn't re-run → blank screen).
+    iframeInitialized.current = false;
+    setIframeSrcDoc(srcDocRef.current);
+    setKey((k) => k + 1);
+    return true;
+  }
+
+  function doFix(error: string, additionalErrors: string[] = []) {
+    // Deduplicate so we never send the same error twice
+    const allErrors = [error, ...additionalErrors.filter(e => normalizeError(e) !== normalizeError(error))];
+    const isMultiError = allErrors.length > 1;
     if (isFixingRef.current || isGeneratingRef.current) return;
     // Don't attempt fixes if we've already determined regeneration is needed
     if (shouldRegenerateRef.current) return;
@@ -1036,25 +1148,62 @@ export default function PreviewPanel() {
       return;
     }
 
+    // ── Capture pre-repair snapshot on very first attempt ──────────────────
+    // Use the LAST KNOWN GOOD files (from the most recent successful preview-ready),
+    // NOT the current broken files. This ensures revert actually restores a working
+    // state, instead of reverting to the same broken content (→ blank screen loop).
+    if (globalRepairCount.current === 0 && !preRepairFilesRef.current) {
+      const goodFiles = lastKnownGoodFilesRef.current;
+      // Fall back to current files only if we have no known-good snapshot yet
+      // (e.g., first-ever generation that crashed before preview-ready).
+      preRepairFilesRef.current = Object.keys(goodFiles).length > 0
+        ? { ...goodFiles }
+        : { ...filesRef.current };
+      console.log('[repair] captured pre-repair snapshot for potential rollback, source:',
+        Object.keys(goodFiles).length > 0 ? 'last-known-good' : 'current-files');
+    }
+
     // ── Instant programmatic fix — no AI, no network call ──────────────────
     // For known crash patterns (SQL type casts, UUID functions, CSS vars), apply
     // the fix directly to the files. If it works, the preview will re-render clean.
-    // This runs BEFORE the AI repair cycle and doesn't count toward the repair budget.
+    // Counts toward the global repair budget to prevent infinite loops where
+    // the AI reintroduces a pattern and the programmatic fix keeps removing it.
     const programmaticResult = tryProgrammaticFix(error, filesRef.current);
     if (programmaticResult) {
-      console.log('[repair] instant programmatic fix applied — skipping AI call');
-      fileChangeFromRepair.current = true;
-      setFiles(programmaticResult);
-      return;
+      globalRepairCount.current += 1;
+      // Accumulate error fingerprint for stuck detection (same error recurring)
+      const pfp = normalizeError(error);
+      recentErrors.current = [...recentErrors.current.slice(-(STUCK_THRESHOLD - 1)), pfp];
+      const pfpStuck = recentErrors.current.length >= STUCK_THRESHOLD && recentErrors.current.every((e) => e === pfp);
+      // Hit global cap — revert to pre-repair state instead of leaving broken code
+      if (globalRepairCount.current > MAX_REPAIRS) {
+        if (!revertToPreRepairState(error)) {
+          setShouldRegenerate(true);
+          shouldRegenerateRef.current = true;
+        }
+        return;
+      }
+      // Programmatic fix is recurring (same error N times) — escalate to AI instead
+      if (!pfpStuck) {
+        console.log('[repair] instant programmatic fix applied — skipping AI call');
+        fileChangeFromRepair.current = true;
+        setFiles(programmaticResult);
+        return;
+      }
+      console.log('[repair] programmatic fix stuck after', STUCK_THRESHOLD, 'attempts — escalating to AI');
+      // Fall through to AI repair
     }
 
     globalRepairCount.current += 1;
     const attemptNumber = globalRepairCount.current;
 
-    // Global cap — after MAX_REPAIRS total attempts, give up to avoid infinite loops.
+    // Global cap — all repair attempts exhausted. Revert to pre-repair state so the
+    // app is never left in a worse state than before repairs started.
     if (globalRepairCount.current > MAX_REPAIRS) {
-      setShouldRegenerate(true);
-      shouldRegenerateRef.current = true;
+      if (!revertToPreRepairState(error)) {
+        setShouldRegenerate(true);
+        shouldRegenerateRef.current = true;
+      }
       return;
     }
 
@@ -1067,8 +1216,12 @@ export default function PreviewPanel() {
       recentErrors.current.length >= STUCK_THRESHOLD &&
       recentErrors.current.every((e) => e === fingerprint)
     ) {
-      setIsStuck(true);
-      isStuckRef.current = true;
+      // Stuck on the same error — revert to last known good state instead of looping.
+      // This restores a working preview so the user can see what they had before.
+      if (!revertToPreRepairState(error)) {
+        setIsStuck(true);
+        isStuckRef.current = true;
+      }
       return;
     }
 
@@ -1179,8 +1332,8 @@ export default function PreviewPanel() {
       ? Object.values(currentFiles).some((code) => code.includes(errorSymbol))
       : true;
 
-    // Attempt 2+: always escalate to ALL files for broader context.
-    const needsAllFiles = isInterfaceAsComponentCrash || isSupabaseCrash || isWindowDbCrash ||
+    // Attempt 2+, or multiple errors at once: always escalate to ALL files for broader context.
+    const needsAllFiles = isMultiError || isInterfaceAsComponentCrash || isSupabaseCrash || isWindowDbCrash ||
       isIllegalReturnCrash || isInvalidLhsCrash || isSchemaNameCrash || isKeywordVariableCrash || isPostgresUuidCrash || isEmptyUuidCrash || isNewCallSyntaxCrash || attemptNumber >= 2 ||
       !symbolFoundInFiles;
     const allFilesLabel = isInterfaceAsComponentCrash ? 'interface-as-component rename'
@@ -1194,6 +1347,7 @@ export default function PreviewPanel() {
       : isEmptyUuidCrash ? 'empty UUID — user_id inserted as "" — must add null guard in all mutation files'
       : isAuthUndefinedCrash ? 'Auth context parse error — TypeScript `as undefined` pattern, must fix ALL auth files'
       : isNewCallSyntaxCrash ? 'Unexpected identifier — parse error, must scan ALL files'
+      : isMultiError ? `${allErrors.length} simultaneous errors — full context required`
       : !symbolFoundInFiles ? `${errorSymbol} not found in any file — async error, full context`
       : `attempt ${attemptNumber} — full context`;
     // Pre-scan which files actually contain the problematic pattern so we only
@@ -1228,13 +1382,27 @@ export default function PreviewPanel() {
         }
       }
       if (isNewCallSyntaxCrash) {
-        // Mark ALL files editable — "Unexpected identifier" can originate from any file.
-        // Also prioritize files containing any toISOString-related patterns.
-        for (const fname of Object.keys(currentFiles)) result.add(fname);
+        // On attempt 1: only mark files that contain the specific unexpected identifier.
+        // On attempt 2+: mark ALL files (broader context in case identifier moved).
+        const unexpectedId = error.match(/Unexpected identifier ['"`]?(\w+)['"`]?/i)?.[1];
+        if (unexpectedId && unexpectedId !== 'undefined' && attemptNumber <= 1) {
+          for (const [fname, code] of Object.entries(currentFiles)) {
+            if (code.includes(unexpectedId)) result.add(fname);
+          }
+          // Always include App.tsx as the main entry point
+          result.add('App.tsx');
+        } else {
+          // Broad scan: ALL files
+          for (const fname of Object.keys(currentFiles)) result.add(fname);
+        }
       }
       return result;
     }
     const patternFiles = needsAllFiles ? getPatternFiles() : suspectFiles;
+
+    // On attempt 1, cap read-only files to a short stub to reduce context size.
+    // On attempt 2+, include full read-only content so the AI has all context.
+    const readOnlySnippetLen = attemptNumber <= 1 ? 300 : Infinity;
 
     const filesSummary = needsAllFiles
       ? `### SCAN CONTEXT — ${allFilesLabel}\n` +
@@ -1245,8 +1413,9 @@ export default function PreviewPanel() {
           if (patternFiles.has(name)) {
             return `[EDITABLE]\n\`\`\`tsx ${name}\n${code}\n\`\`\``;
           }
-          // Present as plain text (not a code block) so AI reads it but doesn't re-output it
-          return `[READ-ONLY — do NOT output this file]\n${name}:\n${code}`;
+          // On attempt 1: short stub to keep context lean. Attempt 2+: full content.
+          const snippet = readOnlySnippetLen === Infinity ? code : code.slice(0, readOnlySnippetLen) + (code.length > readOnlySnippetLen ? '\n// …(truncated)' : '');
+          return `[READ-ONLY — do NOT output this file]\n${name}:\n${snippet}`;
         }).join('\n\n')
       : `### READ-ONLY CONTEXT — only these files are relevant\nDO NOT re-output files you did not change. Only output the specific files where you made edits.\n\n` +
         Object.entries(currentFiles).map(([name, code]) => {
@@ -1262,8 +1431,11 @@ export default function PreviewPanel() {
     // Mark that the next file change will come from this repair, not a new user build
     fileChangeFromRepair.current = true;
 
-    // Sonnet for attempts 1-2 (fast, avoids ECONNRESET timeouts), Opus only for 3+
-    const overrideModel = attemptNumber >= 3 ? 'claude-opus-4-6' : 'claude-sonnet-4-6';
+    // Haiku for attempt 1 (fast — simple fixes done in seconds), Sonnet for attempt 2,
+    // Opus for 3+ (most capable for stubborn errors).
+    const overrideModel = attemptNumber >= 3 ? 'claude-opus-4-6'
+      : attemptNumber === 2 ? 'claude-sonnet-4-6'
+      : 'claude-haiku-4-5-20251001';
 
     // Escalation context — injected when this is not the first attempt.
     // Since we use isolatedContext:true, the model has no memory. We inject history manually.
@@ -1568,21 +1740,37 @@ export default function PreviewPanel() {
         `✅ Output ONLY the single file containing the fix as a code block: \`\`\`tsx filename.tsx\n// fixed code\n\`\`\`\n` +
         `✅ Never guess — verify the root cause in the file before changing anything.`;
 
+    // Build the error section — list all errors when there are multiple.
+    const errorSection = isMultiError
+      ? `ERRORS — FIX ALL ${allErrors.length} SIMULTANEOUSLY (one repair pass, all fixed at once):\n` +
+        allErrors.map((e, i) => `${i + 1}. \`\`\`\n${e}\n\`\`\``).join('\n')
+      : `ERROR:\n\`\`\`\n${error}\n\`\`\``;
+
+    const multiFixSuffix = isMultiError
+      ? `\n\n⚠️ MULTI-ERROR MODE: There are ${allErrors.length} separate errors above. Fix ALL of them in this single response. Do not stop after fixing just one. Each error may require changes to different files — output every file you changed.`
+      : '';
+
     sendChatMessage(
-      `You are in STRICT REPAIR MODE. Fix the runtime error below.` +
+      `You are in STRICT REPAIR MODE. Fix the runtime error${isMultiError ? 's' : ''} below.` +
       escalationContext + `\n\n` +
-      `ERROR:\n\`\`\`\n${error}\n\`\`\`\n\n` +
+      errorSection + `\n\n` +
       `${filesSummary}\n\n` +
       fixInstruction +
-      extraHint,
+      extraHint +
+      multiFixSuffix,
       {
         isolatedContext: true,
-        displayContent: `🔧 Auto-fixing: ${error.split('\n')[0]}`,
+        displayContent: isMultiError
+          ? `🔧 Auto-fixing ${allErrors.length} issues: ${error.split('\n')[0]}`
+          : `🔧 Auto-fixing: ${error.split('\n')[0]}`,
         ...(overrideModel ? { overrideModel } : {}),
       }
     ).finally(() => {
       setIsFixing(false);
       isFixingRef.current = false;
+      // If the repair returned no files, setFiles was never called so useEffect([files])
+      // never cleared the flag. Clear it now so future builds reset repair state correctly.
+      fileChangeFromRepair.current = false;
     });
   }
 
@@ -1633,11 +1821,18 @@ export default function PreviewPanel() {
 
         if (autoFixTimer.current) clearTimeout(autoFixTimer.current);
 
-        // Schedule fix only if not stuck and not in regeneration-needed state.
+        // Accumulate distinct errors during the debounce window so doFix can
+        // address them all in one repair pass instead of N sequential passes.
         if (!isStuckRef.current && !shouldRegenerateRef.current) {
+          const normalised = normalizeError(msg);
+          if (!pendingErrors.current.some(e => normalizeError(e) === normalised)) {
+            pendingErrors.current.push(msg);
+          }
           autoFixTimer.current = setTimeout(() => {
             if (!isFixingRef.current && !isGeneratingRef.current) {
-              doFix(msg);
+              const [primary, ...rest] = pendingErrors.current;
+              pendingErrors.current = [];
+              if (primary) doFix(primary, rest);
             }
           }, 1500);
         }
@@ -1650,11 +1845,24 @@ export default function PreviewPanel() {
       } else if (e.data?.type === 'preview-ready') {
         // Mark the iframe as initialized so future file changes use hot updates
         iframeInitialized.current = true;
+        // Capture the current files as the "last known good" snapshot.
+        // This is used as the revert target when future repairs exhaust all attempts —
+        // ensuring we revert to a state that actually rendered, not to broken AI output.
+        lastKnownGoodFilesRef.current = { ...filesRef.current };
+        // Cancel any pending auto-fix timer — the preview just rendered successfully.
+        // This prevents spurious doFix() calls when hot-update-failed fires preview-error
+        // but the fallback full reload succeeds (preview-ready fires while timer is pending).
+        if (autoFixTimer.current) {
+          clearTimeout(autoFixTimer.current);
+          autoFixTimer.current = null;
+        }
         // Preview rendered — only clear the visible error. DO NOT reset stuck detection
         // history (recentErrors) yet — an async error often fires immediately after render,
         // and resetting here defeats the STUCK_THRESHOLD accumulation.
         // Full state reset only happens after 5s of confirmed stable rendering.
         setPreviewError(null);
+        // If we were in a reverted state and the preview now works, clear it immediately.
+        setWasReverted(false);
 
         // Debounced FULL reset — only runs if no preview-error fires within 5s.
         // preview-error handler cancels this timer when it fires, preserving the
@@ -1663,12 +1871,15 @@ export default function PreviewPanel() {
         previewStableTimer.current = setTimeout(() => {
           // Confirmed stable — reset everything
           recentErrors.current = [];
+          pendingErrors.current = [];
           globalRepairCount.current = 0;
+          preRepairFilesRef.current = null;
           setFixAttempt(0);
           setIsStuck(false);
           isStuckRef.current = false;
           setShouldRegenerate(false);
           shouldRegenerateRef.current = false;
+          setWasReverted(false);
           previewStableTimer.current = null;
         }, 5000);
 
@@ -1707,16 +1918,25 @@ export default function PreviewPanel() {
   }
 
   function handleManualRetry() {
-    if (previewError) {
-      // Cancel any in-progress generation so the fix can proceed immediately.
+    // After a revert, previewError is cleared (files useEffect resets it).
+    // Use the preserved last error so the retry can still target the right fix.
+    const errorToFix = previewError || lastErrorBeforeRevertRef.current;
+    if (errorToFix) {
       cancelGeneration(false);
       recentErrors.current = [];
+      pendingErrors.current = [];
       globalRepairCount.current = 0;
+      lastErrorBeforeRevertRef.current = '';
+      // If retrying from a reverted state, re-capture the current (good) files as the new snapshot.
+      if (wasReverted) {
+        preRepairFilesRef.current = { ...filesRef.current };
+        setWasReverted(false);
+      }
       setIsStuck(false);
       isStuckRef.current = false;
       setShouldRegenerate(false);
       shouldRegenerateRef.current = false;
-      doFix(previewError);
+      doFix(errorToFix);
     }
   }
 
@@ -1794,7 +2014,21 @@ export default function PreviewPanel() {
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-zinc-950">
       {/* Toolbar */}
-      <div className="flex items-center justify-between gap-2 px-4 h-10 border-b border-zinc-800 bg-zinc-900/30 flex-shrink-0">
+      <div className="relative flex items-center justify-between gap-2 px-4 h-10 border-b border-zinc-800 bg-zinc-900/30 flex-shrink-0">
+        {/* Sweep line on bottom edge of toolbar — always visible over dark toolbar bg, even on light-mode previews */}
+        {(isGenerating || isFixing) && (
+          <div className="absolute bottom-0 left-0 right-0 h-[2px] overflow-hidden z-20">
+            <div
+              className="gen-sweep absolute left-0 top-0"
+              style={{
+                background: isFixing
+                  ? 'linear-gradient(90deg, transparent 0%, #f59e0b 35%, #fbbf24 50%, #fb923c 65%, transparent 100%)'
+                  : 'linear-gradient(90deg, transparent 0%, #6366f1 35%, #a855f7 50%, #e879f9 65%, transparent 100%)',
+                filter: 'drop-shadow(0 0 4px ' + (isFixing ? 'rgba(245,158,11,0.9)' : 'rgba(99,102,241,0.9)') + ')',
+              }}
+            />
+          </div>
+        )}
         <div className="flex items-center gap-2">
           <div className="flex gap-1.5">
             <div className="w-2.5 h-2.5 rounded-full bg-zinc-700" />
@@ -1873,12 +2107,17 @@ export default function PreviewPanel() {
         </div>
       </div>
 
-      {/* Generating progress line — sits between toolbar and preview area */}
-      <div className="relative h-0.5 flex-shrink-0 overflow-hidden" style={{ background: (isGenerating || isFixing) ? 'rgba(99,102,241,0.12)' : 'transparent' }}>
+      {/* Generating progress line — top edge of preview area (secondary indicator) */}
+      <div className="relative h-[3px] flex-shrink-0 overflow-hidden bg-transparent">
         {(isGenerating || isFixing) && (
           <div
             className="gen-sweep absolute left-0 top-0"
-            style={{ background: isFixing ? 'linear-gradient(90deg, transparent 0%, #f59e0b 40%, #fbbf24 60%, transparent 100%)' : undefined }}
+            style={{
+              background: isFixing
+                ? 'linear-gradient(90deg, transparent 0%, #f59e0b 40%, #fbbf24 60%, transparent 100%)'
+                : 'linear-gradient(90deg, transparent 0%, #6366f1 40%, #a855f7 60%, transparent 100%)',
+              filter: 'drop-shadow(0 0 3px ' + (isFixing ? 'rgba(245,158,11,0.8)' : 'rgba(99,102,241,0.8)') + ')',
+            }}
           />
         )}
       </div>
@@ -1897,17 +2136,27 @@ export default function PreviewPanel() {
         )}
 
         {/* Error / fixing overlay — replaces the white iframe when broken */}
-        {(previewError || isFixing || shouldRegenerate) && !showGeneratingOverlay && (
+        {/* Hidden during any active generation (showUpdateOverlay) — the progress overlay takes priority */}
+        {(previewError || isFixing || shouldRegenerate) && !showGeneratingOverlay && !showUpdateOverlay && (
           <ErrorOverlay
             error={previewError}
             isFixing={isFixing}
             fixAttempt={fixAttempt}
             isStuck={isStuck}
             shouldRegenerate={shouldRegenerate}
+            wasReverted={false}
             onRetry={handleManualRetry}
-            onDismiss={() => { setPreviewError(null); setShouldRegenerate(false); shouldRegenerateRef.current = false; }}
+            onDismiss={() => { setPreviewError(null); setShouldRegenerate(false); shouldRegenerateRef.current = false; setWasReverted(false); }}
             isGenerating={isGenerating}
             streamingContent={streamingContent}
+          />
+        )}
+
+        {/* Revert banner — non-blocking, sits on top of the restored preview */}
+        {wasReverted && !showGeneratingOverlay && !showUpdateOverlay && !(previewError || isFixing || shouldRegenerate) && (
+          <RevertedBanner
+            onRetry={handleManualRetry}
+            onDismiss={() => setWasReverted(false)}
           />
         )}
 

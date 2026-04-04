@@ -48,15 +48,70 @@ async function processImageFile(file: File): Promise<ChatAttachment> {
   });
 }
 
+// Max chars to send for any text file (~50k chars ≈ ~15k tokens — well within limits).
+const MAX_FILE_CHARS = 50_000;
+
+/**
+ * Summarize a large JSON payload so the AI understands the structure without
+ * the full dataset (which would blow the token limit).
+ */
+function summarizeJson(raw: string): string {
+  try {
+    const parsed = JSON.parse(raw);
+
+    if (Array.isArray(parsed)) {
+      const total = parsed.length;
+      const sampleSize = Math.min(5, total);
+      const sample = parsed.slice(0, sampleSize);
+      // Infer schema from first item
+      const schemaDesc = parsed.length > 0 && typeof parsed[0] === 'object' && parsed[0] !== null
+        ? `Fields: ${Object.keys(parsed[0]).join(', ')}`
+        : '';
+      const header = `Array of ${total} items.${schemaDesc ? ' ' + schemaDesc : ''}\n\nFirst ${sampleSize} items (sample):`;
+      const sampleJson = JSON.stringify(sample, null, 2);
+      const summary = `${header}\n${sampleJson}`;
+      // Still truncate if even the summary is huge
+      return summary.length > MAX_FILE_CHARS ? summary.slice(0, MAX_FILE_CHARS) + '\n... (truncated)' : summary;
+    }
+
+    if (typeof parsed === 'object' && parsed !== null) {
+      const keys = Object.keys(parsed);
+      const truncated: Record<string, unknown> = {};
+      for (const k of keys.slice(0, 30)) {
+        const v = parsed[k];
+        if (Array.isArray(v)) {
+          truncated[k] = `[Array of ${v.length} items${v.length > 0 ? `, first item: ${JSON.stringify(v[0]).slice(0, 200)}` : ''}]`;
+        } else if (typeof v === 'string' && v.length > 300) {
+          truncated[k] = v.slice(0, 300) + '...';
+        } else {
+          truncated[k] = v;
+        }
+      }
+      const summary = `Object with ${keys.length} keys.\n${JSON.stringify(truncated, null, 2)}`;
+      return summary.length > MAX_FILE_CHARS ? summary.slice(0, MAX_FILE_CHARS) + '\n... (truncated)' : summary;
+    }
+  } catch {
+    // Not valid JSON — fall through to plain truncation
+  }
+  return raw.slice(0, MAX_FILE_CHARS) + (raw.length > MAX_FILE_CHARS ? '\n... (truncated)' : '');
+}
+
 async function processTextFile(file: File): Promise<ChatAttachment> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
+      const raw = e.target!.result as string;
+      const isJson = file.name.endsWith('.json') || file.type === 'application/json';
+      const textContent = (isJson && raw.length > MAX_FILE_CHARS)
+        ? summarizeJson(raw)
+        : raw.length > MAX_FILE_CHARS
+          ? raw.slice(0, MAX_FILE_CHARS) + '\n... (file truncated — showing first 50,000 characters)'
+          : raw;
       resolve({
         id: genAttachId(),
         type: 'file',
         name: file.name,
-        textContent: e.target!.result as string,
+        textContent,
       });
     };
     reader.onerror = reject;
@@ -466,7 +521,7 @@ export default function ChatPanel() {
       const next = current[0];
       processingQueueItemRef.current = next; // save before removing — restored on user abort
       remove(next.id);
-      sendChatMessage(next.prompt);
+      sendChatMessage(next.prompt, next.attachments?.length ? { attachments: next.attachments } : undefined);
     }, 400);
     return () => clearTimeout(timer);
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -495,7 +550,7 @@ export default function ChatPanel() {
       return;
     }
     if (isGenerating) {
-      if (message) addToQueue(message);
+      if (message || atts.length > 0) addToQueue(message, atts.length > 0 ? atts : undefined);
     } else {
       await sendChatMessage(message, { attachments: atts });
     }
@@ -961,7 +1016,29 @@ export default function ChatPanel() {
                     ) : (
                       /* Normal mode */
                       <>
-                        <span className="flex-1 text-xs text-zinc-400 truncate mt-0.5">{item.prompt}</span>
+                        <div className="flex-1 min-w-0">
+                          <span className="text-xs text-zinc-400 truncate block mt-0.5">{item.prompt || <span className="italic text-zinc-600">No text</span>}</span>
+                          {item.attachments && item.attachments.length > 0 && (
+                            <div className="flex items-center gap-1 mt-1 flex-wrap">
+                              {item.attachments.map((att) =>
+                                att.type === 'image' && att.dataUrl ? (
+                                  <img
+                                    key={att.id}
+                                    src={att.dataUrl}
+                                    alt={att.name}
+                                    title={att.name}
+                                    className="h-8 w-8 object-cover rounded border border-zinc-700 flex-shrink-0"
+                                  />
+                                ) : (
+                                  <span key={att.id} className="inline-flex items-center gap-0.5 text-[10px] text-zinc-500 bg-zinc-800 border border-zinc-700 rounded px-1 py-0.5 max-w-[80px] truncate" title={att.name}>
+                                    <svg className="w-2.5 h-2.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
+                                    {att.name}
+                                  </span>
+                                )
+                              )}
+                            </div>
+                          )}
+                        </div>
                         <div className="flex items-center gap-0.5 flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
                           {/* Edit button */}
                           <button
@@ -1223,6 +1300,18 @@ export default function ChatPanel() {
             rows={1}
             className="flex-1 bg-transparent text-zinc-100 placeholder-zinc-500 text-sm resize-none outline-none leading-relaxed max-h-40 overflow-y-auto"
           />
+          {/* Clear input button — shown when there's text in the input */}
+          {input.trim() && (
+            <button
+              onClick={() => { setInput(''); textareaRef.current?.focus(); }}
+              title="Clear text"
+              className="flex-shrink-0 w-7 h-7 rounded-md flex items-center justify-center transition-all duration-150 mb-0.5 text-zinc-600 hover:text-zinc-300 hover:bg-zinc-700/60"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          )}
           {/* Rewrite prompt button — shown when there's text in the input */}
           {input.trim() && (
             <button
@@ -1634,6 +1723,7 @@ function MessageBubble({ message, onRePrompt, onFix, onImplement, onBuildFromAsk
                 hideCode={!message.isStreaming || !!message.pipeline || !!message.isRepairMessage}
                 hideText={!!message.pipeline || !!message.isRepairMessage}
                 noChips={!!message.isAskResponse}
+                doneSummary={message.pipeline?.plan?.description}
               />
             )}
             {/* Build this button — shown on Ask-mode responses once streaming is done */}
@@ -1713,11 +1803,22 @@ function parseContent(text: string): Segment[] {
 
 // ─── Markdown Renderer ────────────────────────────────────────────────────────
 
-function MarkdownContent({ content, isStreaming, onImplement, hideCode, hideText, noChips }: { content: string; isStreaming: boolean; onImplement?: (text: string) => void; hideCode?: boolean; hideText?: boolean; noChips?: boolean }) {
+function MarkdownContent({ content, isStreaming, onImplement, hideCode, hideText, noChips, doneSummary }: { content: string; isStreaming: boolean; onImplement?: (text: string) => void; hideCode?: boolean; hideText?: boolean; noChips?: boolean; doneSummary?: string }) {
   const segments = parseContent(content);
 
   // When code is hidden, collect all code segments to show as file chips
   const codeSegments = hideCode ? segments.filter((s): s is CodeSegment => s.type === 'code' && !!s.filename) : [];
+
+  // Check whether there's any trailing text after the last code block (for fallback Done! card).
+  // Exclude trailing text that looks like raw leaked code (not a real Done! summary).
+  const lastCodeIdx = segments.map((s, i) => s.type === 'code' ? i : -1).filter(i => i >= 0).pop() ?? -1;
+  const hasTrailingText = !isStreaming && hideText && lastCodeIdx >= 0 &&
+    segments.slice(lastCodeIdx + 1).some(s => {
+      if (s.type !== 'text' || !(s as TextSegment).content.trim()) return false;
+      const fl = (s as TextSegment).content.trim().split('\n')[0].trim();
+      const looksLikeRawCode = /^(import\s|export\s|export default|interface\s|const\s|let\s|var\s|function\s|class\s|type\s+\w+\s*[=<{(]|\/\/|\/\*)/.test(fl);
+      return !looksLikeRawCode;
+    });
 
   return (
     <div className="space-y-1">
@@ -1738,13 +1839,16 @@ function MarkdownContent({ content, isStreaming, onImplement, hideCode, hideText
         if (hideText) {
           // During streaming: hide ALL text to prevent intermediate text (between code blocks)
           // from flashing visible before the next code fence arrives.
-          // After streaming: show only the final text segment if it comes after code blocks
-          // (this is the ✅ Done! summary block).
+          // After streaming: show any text segment that comes after all code blocks (Done! summary).
           if (isStreaming) return null;
           const hasCodeBefore = segments.slice(0, i).some((s) => s.type === 'code');
           const hasCodeAfter = segments.slice(i + 1).some((s) => s.type === 'code');
           const isLastText = !segments.slice(i + 1).some((s) => s.type === 'text');
-          if (hasCodeBefore && isLastText && !hasCodeAfter && /✅\s*Done!/i.test(seg.content)) {
+          // Guard: don't show trailing text that looks like raw leaked code (unfenced output).
+          // This happens when AI streams code without proper fences after the last code block.
+          const firstLine = seg.content.trim().split('\n')[0].trim();
+          const looksLikeRawCode = /^(import\s|export\s|export default|interface\s|const\s|let\s|var\s|function\s|class\s|type\s+\w+\s*[=<{(]|\/\/|\/\*)/.test(firstLine);
+          if (hasCodeBefore && isLastText && !hasCodeAfter && seg.content.trim() && !looksLikeRawCode) {
             return <TextBlock key={i} text={seg.content} onImplement={onImplement} />;
           }
           return null;
@@ -1778,6 +1882,19 @@ function MarkdownContent({ content, isStreaming, onImplement, hideCode, hideText
               </span>
             );
           })}
+        </div>
+      )}
+      {/* Fallback Done! card — shown when AI generated files but provided no summary text */}
+      {hideText && !isStreaming && !hasTrailingText && codeSegments.length > 0 && (
+        <div className="mt-2 rounded-xl border border-emerald-500/20 bg-emerald-500/5 overflow-hidden">
+          <div className="flex items-start gap-2.5 px-3 py-2.5">
+            <span className="text-sm leading-none mt-0.5 flex-shrink-0">✅</span>
+            <span className="text-[13px] font-semibold text-emerald-300 leading-snug">
+              {doneSummary
+                ? doneSummary.replace(/^I'll\b/i, "I've").replace(/^I will\b/i, "I've")
+                : `Done — ${codeSegments.length} file${codeSegments.length !== 1 ? 's' : ''} written`}
+            </span>
+          </div>
         </div>
       )}
       {/* Blinking cursor at the end while streaming text (not when inside a code block) */}
@@ -2194,6 +2311,7 @@ const STAGE_DISPLAY: Record<string, string> = {
   generating:     'Generator',
   polishing:      'Polish',
   validating:     'Validator',
+  verifying:      'Verifying',
 };
 
 const MODEL_SHORT: Record<string, string> = {

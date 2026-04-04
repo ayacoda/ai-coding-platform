@@ -31,15 +31,15 @@ async function getAuthHeaders(): Promise<Record<string, string>> {
  *     TypeScript interfaces are erased at runtime. Auto-renames the JSX usages to ProjectCard.
  *  2. Ensures no two component files export the same function name (shadow guard).
  */
-export function sanitizeGeneratedFiles(
-  files: Record<string, string>,
-  contextFiles: Record<string, string> = {}
-): Record<string, string> {
-  // ── 0. Auto-fix known AI-generated crash patterns before preview/storage ────────
-  // Applied to every .tsx/.ts file. Skips .sql files.
-  const autoFixed: Record<string, string> = {};
+/**
+ * Apply known AI-generated crash-pattern fixes to a set of files.
+ * Safe to run on repairs (no interface renaming, no cascade issues).
+ * Also called as step 0 inside sanitizeGeneratedFiles.
+ */
+export function applyAutoCrashFixes(files: Record<string, string>): Record<string, string> {
+  const result: Record<string, string> = {};
   for (const [fname, code] of Object.entries(files)) {
-    if (fname.endsWith('.sql')) { autoFixed[fname] = code; continue; }
+    if (fname.endsWith('.sql')) { result[fname] = code; continue; }
     let c = code;
     const orig = c;
 
@@ -55,17 +55,35 @@ export function sanitizeGeneratedFiles(
     //    This is parsed as "new (Date.toISOString)()" → crashes with "not a constructor".
     c = c.replace(/\bnew\s+Date\.toISOString\s*\(\)/g, 'new Date().toISOString()');
 
-    // ④ PostgreSQL UUID functions called in frontend JS — they only exist in SQL.
+    // ④ "new Date toISOString()" — missing dot + parens (any whitespace including newlines).
+    c = c.replace(/\bnew\s+Date\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
+
+    // ⑤ "new Date() toISOString()" — has parens but missing dot (zero or more whitespace).
+    //    \s* (not \s+) catches the zero-space variant: new Date()toISOString()
+    c = c.replace(/\bnew\s+Date\s*\(\s*\)\s*toISOString\s*\(/g, 'new Date().toISOString(');
+
+    // ⑥ Same-line: any expression char + spaces/tabs + toISOString( without preceding dot.
+    c = c.replace(/([^\s.])[ \t]+toISOString\s*\(/g, '$1.toISOString(');
+
+    // ⑥b Zero-space variant: closing ) or ] directly followed by toISOString without dot.
+    //    Safe to use \s*=0 here because ) and ] can never be part of an identifier.
+    c = c.replace(/([)\]])toISOString\s*\(/g, '$1.toISOString(');
+
+    // ⑦ Cross-line: expression ending in ) ] or word + newline + toISOString without dot.
+    //    Most common AI miss: someDate\n  toISOString() inside object literals / map callbacks.
+    c = c.replace(/([)\]\w])([ \t]*\r?\n[ \t]*)toISOString\s*\(/g, '$1$2.toISOString(');
+
+    // PostgreSQL UUID functions called in frontend JS — they only exist in SQL.
     //    Causes "gen_random_uuid is not a function" / "uuid_generate_v4 is not a function".
     c = c.replace(/\bgen_random_uuid\s*\(\)/g, 'crypto.randomUUID()');
     c = c.replace(/\buuid_generate_v4\s*\(\)/g, 'crypto.randomUUID()');
 
-    // ⑤ Supabase createClient import — stripped by the sandbox, crashes with "createClient is not defined".
+    // Supabase createClient import — stripped by the sandbox, crashes with "createClient is not defined".
     //    window.db is pre-loaded; no import needed.
     c = c.replace(/^[ \t]*import\s+\{[^}]*createClient[^}]*\}\s+from\s+['"]@supabase\/supabase-js['"][^\n]*\n?/gm, '');
     c = c.replace(/^[ \t]*import\s+createClient\s+from\s+['"]@supabase\/supabase-js['"][^\n]*\n?/gm, '');
 
-    // ⑥ Bare "db.from(" / "supabase.from(" without window. prefix — crashes with "db is not defined".
+    // Bare "db.from(" / "supabase.from(" without window. prefix — crashes with "db is not defined".
     //    Only rewrites standalone identifiers (preceded by = ( , { [ ; or start of expression).
     c = c.replace(/(^|[=(,{[\s;!&|?:])(?:db|supabase)\.from\s*\(/gm, '$1window.db.from(');
     c = c.replace(/(^|[=(,{[\s;!&|?:])(?:db|supabase)\.auth\b/gm, '$1window.db.auth');
@@ -74,9 +92,17 @@ export function sanitizeGeneratedFiles(
     if (c !== orig) {
       console.log(`[sanitize] auto-fixed crash patterns in ${fname}`);
     }
-    autoFixed[fname] = c;
+    result[fname] = c;
   }
-  files = autoFixed;
+  return result;
+}
+
+export function sanitizeGeneratedFiles(
+  files: Record<string, string>,
+  contextFiles: Record<string, string> = {}
+): Record<string, string> {
+  // ── 0. Auto-fix known AI-generated crash patterns before preview/storage ────────
+  files = applyAutoCrashFixes(files);
 
   // Use full context (existing + new files) for collision detection.
   // For surgical fixes, 'files' may only be 1-2 changed files while
@@ -168,6 +194,109 @@ export function sanitizeGeneratedFiles(
 }
 
 /** Extract the app name from generated files (sidebar brand text or APP_NAME constant). */
+
+// ── Auto-patch missing Supabase tables ────────────────────────────────────────
+// Scans generated code for window.db.from('tableName') references.
+// Any table not defined in schema.sql gets an auto-generated CREATE TABLE appended.
+export function patchMissingTables(
+  files: Record<string, string>,
+  projectId: string,
+): Record<string, string> {
+  if (!files['schema.sql'] || !projectId) return files;
+
+  // Collect all non-SQL code
+  const allCode = Object.entries(files)
+    .filter(([name]) => !name.endsWith('.sql'))
+    .map(([, c]) => c)
+    .join('\n');
+
+  // Step 1 — extract table names referenced via window.db.from('name')
+  const referencedTables = new Set<string>();
+  const refRe = /window\.db\.from\s*\(\s*['"](\w+)['"]\s*\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = refRe.exec(allCode)) !== null) {
+    referencedTables.add(m[1]);
+  }
+  if (referencedTables.size === 0) return files;
+
+  // Step 2 — extract table names already defined in schema.sql
+  const schemaSql = files['schema.sql'];
+  const definedTables = new Set<string>();
+  const defRe = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:"?[\w]+"?\.)?"?(\w+)"?/gi;
+  while ((m = defRe.exec(schemaSql)) !== null) {
+    definedTables.add(m[1].toLowerCase());
+  }
+
+  // Step 3 — identify missing tables
+  const missing = [...referencedTables].filter(t => !definedTables.has(t.toLowerCase()));
+  if (missing.length === 0) return files;
+
+  console.log('[patchMissingTables] auto-creating missing tables:', missing);
+
+  // Step 4 — generate CREATE TABLE for each missing table
+  function guessType(col: string): string {
+    const c = col.toLowerCase();
+    if (/(_at|date|time|timestamp)$/.test(c)) return 'TIMESTAMPTZ';
+    if (/^(is_|has_|can_|enabled|active|deleted|visible|published|completed|done|verified)/.test(c) || /_(enabled|active|deleted|visible|published|completed|done)$/.test(c)) return 'BOOLEAN DEFAULT false';
+    if (/(price|amount|cost|total|balance|salary|fee|rate|weight|height|width|quantity|qty|count|num|score|rating|age|order_num|position|sort)/.test(c)) return 'NUMERIC';
+    if (/_id$/.test(c)) return 'UUID';
+    return 'TEXT';
+  }
+
+  function inferColumns(tableName: string): { name: string; type: string }[] {
+    const cols = new Map<string, string>();
+
+    // Scan .insert({ ... }) and .update({ ... }) for this table
+    const mutRe = new RegExp(
+      `window\\.db\\.from\\s*\\(\\s*['"]${tableName}['"]\\s*\\)\\s*\\.(?:insert|update)\\s*\\(\\s*(\\{[^}]{0,400}\\})`,
+      'g',
+    );
+    while ((m = mutRe.exec(allCode)) !== null) {
+      const obj = m[1];
+      const keyRe = /(\w+)\s*:/g;
+      let km: RegExpExecArray | null;
+      while ((km = keyRe.exec(obj)) !== null) {
+        const k = km[1];
+        if (k === 'id' || k === 'created_at' || k === 'updated_at') continue;
+        if (!cols.has(k)) cols.set(k, guessType(k));
+      }
+    }
+
+    // Scan .select('col1, col2, ...')
+    const selRe = new RegExp(
+      `window\\.db\\.from\\s*\\(\\s*['"]${tableName}['"]\\s*\\)\\s*\\.select\\s*\\(\\s*['"]([^'"]{0,300})['"]`,
+      'g',
+    );
+    while ((m = selRe.exec(allCode)) !== null) {
+      for (const rawCol of m[1].split(',')) {
+        const col = rawCol.trim().split(/\s+/)[0].trim();
+        if (!col || col === '*' || col === 'id' || col === 'created_at' || col === 'updated_at') continue;
+        if (!cols.has(col)) cols.set(col, guessType(col));
+      }
+    }
+
+    return [...cols.entries()].map(([name, type]) => ({ name, type }));
+  }
+
+  const additionalSql = missing.map(tableName => {
+    const cols = inferColumns(tableName);
+    const colDefs = cols.map(c => `  ${c.name} ${c.type}`).join(',\n');
+    return `
+-- Auto-generated: "${tableName}" was referenced in code but missing from schema
+CREATE TABLE IF NOT EXISTS "${projectId}"."${tableName}" (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+${colDefs ? colDefs + ',\n' : ''}  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE "${projectId}"."${tableName}" ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Enable all access" ON "${projectId}"."${tableName}"
+  FOR ALL USING (true) WITH CHECK (true);
+GRANT ALL ON "${projectId}"."${tableName}" TO anon, authenticated;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA "${projectId}" TO anon, authenticated;
+`;
+  }).join('');
+
+  return { ...files, 'schema.sql': schemaSql + additionalSql };
+}
 
 // Module-level abort controller — one generation at a time
 let currentAbortController: AbortController | null = null;
@@ -412,7 +541,10 @@ async function triggerPageCompletion(
     const completedFiles = parseFilesFromResponse(fullContent);
     console.log('[chat] page completion result:', Object.keys(completedFiles));
     if (Object.keys(completedFiles).length > 0) {
-      setFiles(completedFiles);
+      // Sanitize page completion files — /api/chat doesn't run applyProgrammaticFixes,
+      // so crash patterns (toISOString, etc.) must be cleaned on the client side.
+      const sanitizedCompleted = sanitizeGeneratedFiles(completedFiles, useStore.getState().files);
+      setFiles(sanitizedCompleted);
     }
   } catch (e) {
     console.warn('[chat] page completion failed:', e);
@@ -442,6 +574,7 @@ export async function sendAskMessage(userInput: string, attachments?: ChatAttach
     setHasApiKey,
     selectedModel,
     removeLastMessages,
+    triggerCreditRefresh,
   } = store;
 
   const imageAttachments = (attachments ?? []).filter((a) => a.type === 'image' && a.dataUrl);
@@ -541,6 +674,7 @@ export async function sendAskMessage(userInput: string, attachments?: ChatAttach
   } finally {
     currentAbortController = null;
     setIsGenerating(false);
+    triggerCreditRefresh(); // keep header credit count fresh after every build
   }
 }
 
@@ -578,6 +712,7 @@ export async function sendChatMessage(
     removeLastMessages,
     setPendingVersionSave,
     updateLastAssistantSummary,
+    triggerCreditRefresh,
   } = store;
 
   // Snapshot files before generation so we can revert on cancel
@@ -591,13 +726,20 @@ export async function sendChatMessage(
   const imageAttachments = attachments.filter((a) => a.type === 'image' && a.base64Data);
   const fileAttachments = attachments.filter((a) => a.type === 'file' && a.textContent);
 
-  // Append text file contents to the user message
+  // Append text file contents to the user message.
+  // Hard cap at 50k chars per file — a safety net in case large content slips through.
+  const FILE_CHAR_LIMIT = 50_000;
   let userContent = userInput;
   if (fileAttachments.length > 0) {
     userContent +=
       '\n\n' +
       fileAttachments
-        .map((f) => `**Attached file: ${f.name}**\n\`\`\`\n${f.textContent}\n\`\`\``)
+        .map((f) => {
+          const content = (f.textContent ?? '').length > FILE_CHAR_LIMIT
+            ? f.textContent!.slice(0, FILE_CHAR_LIMIT) + '\n... (truncated)'
+            : f.textContent ?? '';
+          return `**Attached file: ${f.name}**\n\`\`\`\n${content}\n\`\`\``;
+        })
         .join('\n\n');
   }
 
@@ -777,6 +919,7 @@ export async function sendChatMessage(
         setHasApiKey(false);
       }
       if (response.status === 402) {
+        triggerCreditRefresh(); // force header to re-fetch the real balance from DB
         const credErr = `${err.error || 'Insufficient credits'} [${err.creditsAvailable ?? 0} available, ${err.creditsRequired ?? '?'} required]`;
         throw new Error(credErr);
       }
@@ -897,6 +1040,17 @@ export async function sendChatMessage(
                 updateStage('validating', 'done');
                 break;
               }
+              case 'verifying': {
+                updateStage('verifying', 'running');
+                break;
+              }
+              case 'verification_fixing':
+              case 'verification_fixed':
+                break;
+              case 'verification_clean': {
+                updateStage('verifying', 'done');
+                break;
+              }
               case 'manifest': {
                 // Server-derived list of files the generator must produce.
                 // Stored so we can detect truncation after the stream ends.
@@ -924,11 +1078,64 @@ export async function sendChatMessage(
 
     const rawFiles = parseFilesFromResponse(fullContent);
     const existingFiles = useStore.getState().files;
-    // Sanitize only for initial generation — never for repairs.
-    // Repairs are surgical: the original generation already ran sanitize.
-    // Re-running sanitize on repairs causes cascading renames:
-    //   AppPage → AppPageData (repair 1) → AppPageDataData (repair 2) → AppPageDataDataData (repair 3).
-    const newFiles = isRepair ? rawFiles : sanitizeGeneratedFiles(rawFiles, existingFiles);
+
+    // ── Surgical-edit guard: filter re-outputted context files ──────────────
+    // For feature_add / bug_fix, the AI sometimes outputs ALL files even though
+    // only 1-2 changed. Files that are IDENTICAL to the existing version are
+    // pure context re-outputs — applying them would silently overwrite the
+    // user's working code with no benefit.
+    // Skip this filter for new_app / redesign (no existing files to compare).
+    // Skip for repairs (isRepair) — they always need their output applied.
+    const requestType = pipelineState?.requestType;
+    let filteredRawFiles = rawFiles;
+    if (!isRepair && Object.keys(existingFiles).length > 0 &&
+        (requestType === 'feature_add' || requestType === 'bug_fix')) {
+      const skipped: string[] = [];
+      filteredRawFiles = {};
+      for (const [fname, code] of Object.entries(rawFiles)) {
+        const existing = existingFiles[fname];
+        if (existing === undefined) {
+          // New file — always include
+          filteredRawFiles[fname] = code;
+          continue;
+        }
+        // Unchanged file — skip (AI re-outputted context without changing it)
+        if (code === existing) {
+          skipped.push(fname);
+          continue;
+        }
+        // ── Regression guards ────────────────────────────────────────────────
+        // Guard 1: Truncation — AI output is significantly shorter than existing.
+        // A feature_add/bug_fix should never produce a SHORTER version of a file
+        // (other than cosmetic removals). If > 30% of lines vanished, the AI likely
+        // omitted existing functions, causing a crash.
+        const existingLines = existing.split('\n').length;
+        const newLines = code.split('\n').length;
+        if (existingLines > 40 && newLines < existingLines * 0.70) {
+          console.warn(`[chat] ${requestType}: TRUNCATION GUARD — rejecting ${fname} (${newLines} lines vs ${existingLines} original). Keeping existing.`);
+          skipped.push(`${fname} (truncation rejected: ${newLines}/${existingLines} lines)`);
+          continue;
+        }
+        // Guard 2: Export-default removal — if the existing file had an export default
+        // and the new version lost it, the app will crash on import.
+        if (/export\s+default\b/m.test(existing) && !/export\s+default\b/m.test(code)) {
+          console.warn(`[chat] ${requestType}: EXPORT GUARD — rejecting ${fname} (lost export default). Keeping existing.`);
+          skipped.push(`${fname} (lost export default — rejected)`);
+          continue;
+        }
+        filteredRawFiles[fname] = code;
+      }
+      if (skipped.length > 0) {
+        console.log(`[chat] ${requestType}: filtered ${skipped.length} file(s):`, skipped.join(', '));
+      }
+    }
+
+    // Full sanitize only for initial generation — repairs skip the interface-rename step
+    // (which causes cascading renames: AppPage → AppPageData → AppPageDataData → …).
+    // Repairs DO get crash-pattern fixes (toISOString, gen_random_uuid, etc.) applied.
+    let newFiles = isRepair
+      ? applyAutoCrashFixes(filteredRawFiles)
+      : sanitizeGeneratedFiles(filteredRawFiles, existingFiles);
     console.log('[chat] parsed files:', Object.keys(newFiles), '| content length:', fullContent.length);
 
     // If repair returned NO code blocks, treat it as a failed attempt — signal via error so
@@ -965,6 +1172,10 @@ export async function sendChatMessage(
         await triggerPageCompletion(toCompleteAfterCont, allFilesAfterCont);
       }
     } else if (Object.keys(newFiles).length > 0) {
+      // Patch missing tables — auto-create any table referenced in code but absent from schema.sql
+      if (storageMode === 'supabase' && projectConfig?.id) {
+        newFiles = patchMissingTables(newFiles, projectConfig.id);
+      }
       // Apply schema BEFORE rendering so tables exist when the preview queries them
       if (storageMode === 'supabase' && newFiles['schema.sql']) {
         try {
@@ -1115,6 +1326,7 @@ export async function sendChatMessage(
     _clearJamWatchdog();
     currentAbortController = null;
     setIsGenerating(false);
+    triggerCreditRefresh();
   }
 
   // Jam restart — fires after finally, re-sends the same message if retry budget remains
@@ -1153,6 +1365,7 @@ export async function approvePlan(messageId: string) {
     setSelectedModel,
     setPendingVersionSave,
     updateLastAssistantSummary,
+    triggerCreditRefresh,
   } = useStore.getState();
 
   const msg = messages.find(m => m.id === messageId);
@@ -1207,6 +1420,7 @@ export async function approvePlan(messageId: string) {
         setHasApiKey(false);
       }
       if (response.status === 402) {
+        triggerCreditRefresh(); // force header to re-fetch the real balance from DB
         const credErr = `${err.error || 'Insufficient credits'} [${err.creditsAvailable ?? 0} available, ${err.creditsRequired ?? '?'} required]`;
         throw new Error(credErr);
       }
@@ -1299,6 +1513,15 @@ export async function approvePlan(messageId: string) {
               case 'validation_clean':
                 updateStage('validating', 'done');
                 break;
+              case 'verifying':
+                updateStage('verifying', 'running');
+                break;
+              case 'verification_fixing':
+              case 'verification_fixed':
+                break;
+              case 'verification_clean':
+                updateStage('verifying', 'done');
+                break;
               case 'manifest':
                 capturedManifest = parsed.files as string[];
                 break;
@@ -1318,7 +1541,49 @@ export async function approvePlan(messageId: string) {
     }
 
     const rawFiles = parseFilesFromResponse(fullContent);
-    const newFiles = sanitizeGeneratedFiles(rawFiles, existingFiles);
+
+    // ── Surgical-edit guard: filter re-outputted context files ──────────────
+    // Mirrors the same logic in sendChatMessage — removes files the AI re-outputted
+    // unchanged (context copies), so they don't silently overwrite working code.
+    // Also includes truncation and export-default regression guards.
+    const approveRequestType = pipelineState?.requestType;
+    let filteredRawFiles = rawFiles;
+    if (Object.keys(existingFiles).length > 0 &&
+        (approveRequestType === 'feature_add' || approveRequestType === 'bug_fix')) {
+      filteredRawFiles = {};
+      const skipped: string[] = [];
+      for (const [fname, code] of Object.entries(rawFiles)) {
+        const existing = existingFiles[fname];
+        if (existing === undefined) {
+          filteredRawFiles[fname] = code;
+          continue;
+        }
+        if (code === existing) {
+          skipped.push(fname);
+          continue;
+        }
+        // Truncation guard
+        const existingLines = existing.split('\n').length;
+        const newLines = code.split('\n').length;
+        if (existingLines > 40 && newLines < existingLines * 0.70) {
+          console.warn(`[chat] approvePlan ${approveRequestType}: TRUNCATION GUARD — rejecting ${fname} (${newLines} lines vs ${existingLines} original). Keeping existing.`);
+          skipped.push(`${fname} (truncation rejected: ${newLines}/${existingLines} lines)`);
+          continue;
+        }
+        // Export-default removal guard
+        if (/export\s+default\b/m.test(existing) && !/export\s+default\b/m.test(code)) {
+          console.warn(`[chat] approvePlan ${approveRequestType}: EXPORT GUARD — rejecting ${fname} (lost export default). Keeping existing.`);
+          skipped.push(`${fname} (lost export default — rejected)`);
+          continue;
+        }
+        filteredRawFiles[fname] = code;
+      }
+      if (skipped.length > 0) {
+        console.log(`[chat] approvePlan ${approveRequestType}: filtered ${skipped.length} file(s):`, skipped.join(', '));
+      }
+    }
+
+    let newFiles = sanitizeGeneratedFiles(filteredRawFiles, existingFiles);
     console.log('[chat] approvePlan files:', Object.keys(newFiles), '| content length:', fullContent.length);
 
     const isNewApp = pipelineState?.requestType === 'new_app';
@@ -1340,6 +1605,10 @@ export async function approvePlan(messageId: string) {
       const toComplete = [...new Set([...stubsAfterCont, ...missingPagesAfterCont])];
       if (toComplete.length > 0) await triggerPageCompletion(toComplete, allFilesAfterCont);
     } else if (Object.keys(newFiles).length > 0) {
+      // Patch missing tables — auto-create any table referenced in code but absent from schema.sql
+      if (storageMode === 'supabase' && projectConfig?.id) {
+        newFiles = patchMissingTables(newFiles, projectConfig.id);
+      }
       // Apply schema BEFORE rendering so tables exist when the preview queries them
       if (storageMode === 'supabase' && newFiles['schema.sql']) {
         try {
@@ -1417,6 +1686,7 @@ export async function approvePlan(messageId: string) {
     _clearJamWatchdog();
     currentAbortController = null;
     setIsGenerating(false);
+    triggerCreditRefresh();
   }
 
   // Jam restart for approvePlan — re-approve the same plan

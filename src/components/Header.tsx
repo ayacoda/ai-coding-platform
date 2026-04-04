@@ -17,7 +17,7 @@ interface HeaderProps {
 }
 
 export default function Header({ projectName, projectId, onToggleHistory, historyActive }: HeaderProps) {
-  const { files, clearFiles, clearMessages, storageMode, projectConfig, setCurrentProjectName, isGenerating, isPlanPending } = useStore();
+  const { files, clearFiles, clearMessages, storageMode, projectConfig, setCurrentProjectName, isGenerating, isPlanPending, creditRefreshSignal } = useStore();
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
   const [showDialog, setShowDialog] = useState(false);
@@ -82,6 +82,11 @@ export default function Header({ projectName, projectId, onToggleHistory, histor
     }, 5000);
     return () => clearInterval(retryInterval);
   }, [refreshCredits]);
+
+  // Refresh credits whenever a build completes or a 402 error fires
+  useEffect(() => {
+    if (creditRefreshSignal > 0) refreshCredits();
+  }, [creditRefreshSignal, refreshCredits]);
 
   // Realtime subscription — instantly reflect credit changes from DB
   useEffect(() => {

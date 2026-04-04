@@ -333,7 +333,7 @@ Step 1 — INTERPRET (Product Architect):
 Step 2 — REDUCE SCOPE (Systems Architect):
   Strip everything that is not needed for a first working slice.
   Exclude from first build UNLESS explicitly required:
-    ✗ Authentication / login (show mock user instead)
+    ✗ Authentication / login (only add if explicitly requested — NO mock users, NO fake auth)
     ✗ Payments / billing
     ✗ Admin panels
     ✗ Email / notifications
@@ -375,8 +375,8 @@ Step 6 — VALIDATE (Validator):
 BUILD ORDER — generate in this EXACT sequence:
   1. types.ts         (pure type declarations — no dependencies)
   2. App.tsx          (REQUIRED second — prevents token-truncation loss of entry point)
-  3. data.ts          (depends on types)
-  4. components/*.tsx (depends on types + data)
+  3. hooks.ts         (useLocalStorage hook + any shared utilities — no deps on other app files)
+  4. components/*.tsx (depends on types + hooks)
   5. pages/*.tsx      (depends on components)
 
 For feature_add/bug_fix: Output ONLY changed files. Every file you output REPLACES the current version.
@@ -393,10 +393,13 @@ STRUCTURE AND STYLE PRESERVATION — NON-NEGOTIABLE:
   ❌ DO NOT change the design system, color palette, or visual language of any section
   ❌ DO NOT add new dependencies, imports, or abstractions unless required by the feature
   ❌ DO NOT "clean up" or "improve" code while implementing the change — that's a separate request
+  ❌ DO NOT remove existing functions, hooks, state, or handlers that aren't directly part of the change
+  ❌ DO NOT simplify or shorten existing logic — a shorter file almost always means missing functionality
   ✅ Copy every existing className and style EXACTLY when you must re-output a modified file
   ✅ Add the requested feature as the SMALLEST possible insertion into the existing code
   ✅ Treat the existing code as ground truth — do not second-guess or "fix" anything that isn't broken
   ✅ If a file has 200 lines and you need to add 5, output those same 200 lines + 5 new lines exactly
+  ✅ COMPLETENESS CHECK: before outputting a file, verify it contains ALL the same functions/hooks as the original
 
 MINIMUM CHANGE RULE:
   • Inspect what already works before changing anything
@@ -482,21 +485,58 @@ Checklist: for every interface X in types.ts, confirm no JSX <X /> exists anywhe
 
 【RULE 3 — NO AUTH IN DEFAULT APPS (unless explicitly asked)】
 Do NOT add login screens or auth gates unless the user explicitly requests authentication.
-For non-auth apps:
-   ✅ Use a DEMO_USER constant at the top of App.tsx: const DEMO_USER = { id: 'user_01', name: 'Demo User', email: 'demo@example.com', role: 'admin', avatar_url: '' };
-   ✅ Pass user as props to components that need it
-   ❌ NEVER call useAuth()/useUser()/useSession()/useContext(AuthContext) in a non-auth app — crashes on .name access
+For non-auth apps (no login needed):
+   ✅ Show a generic placeholder user in the sidebar/header — pull their name from localStorage or just show 'User'
+   ✅ Example: const userName = localStorage.getItem('app_user_name') || 'User';
+   ✅ Pass user info as props to components that need it
+   ❌ NEVER hardcode a fake user object like { name: 'Demo User', email: 'demo@example.com' } — this is mock auth and is banned
 
 When the user DOES ask for authentication (login/signup/protected routes):
-   ✅ Use the full Supabase auth pattern with window.db.auth.* — the sandbox supports real stateful auth
-   ✅ onAuthStateChange, getSession, getUser all work correctly in the sandbox
-   ✅ Auth starts UNAUTHENTICATED — login screen shows first, protected pages redirect to login
-   ✅ Use AuthProvider pattern in App.tsx with useAuth() hook for clean auth state management
+
+  ── SUPABASE MODE ──
+   ✅ Use window.db.auth.* — real Supabase Auth, fully supported in the sandbox
+   ✅ onAuthStateChange, getSession, signUp, signInWithPassword, signOut all work
+   ✅ 🚨 NO EMAIL VERIFICATION — signUp() immediately logs the user in. NEVER show "check your email".
+      NEVER add email confirmation steps. Treat signUp exactly like signIn (user is instantly authenticated).
+   ✅ Auth starts UNAUTHENTICATED — login/signup screen shows first, main app renders after login
+   ✅ Define AuthProvider in App.tsx with state: const [user, setUser] = useState(null);
+      Use window.db.auth.onAuthStateChange to keep state in sync.
+      Pass user + signOut as props to child components — do NOT use useAuth() hook.
+
+  ── LOCAL STORAGE MODE (no Supabase) ──
+   ✅ Implement auth entirely in App.tsx using localStorage — no external provider needed
+   ✅ Use this exact local auth pattern:
+      // In App.tsx — full working auth with localStorage
+      const [user, setUser] = React.useState<{id:string;name:string;email:string}|null>(() => {
+        try { const s = localStorage.getItem('app_current_user'); return s ? JSON.parse(s) : null; } catch { return null; }
+      });
+      const signUp = async (email: string, password: string, name: string) => {
+        const users: any[] = JSON.parse(localStorage.getItem('app_users') || '[]');
+        if (users.find((u:any) => u.email === email)) throw new Error('Email already registered');
+        const u = { id: crypto.randomUUID(), email, password, name };
+        users.push(u);
+        localStorage.setItem('app_users', JSON.stringify(users));
+        const session = { id: u.id, email, name };
+        localStorage.setItem('app_current_user', JSON.stringify(session));
+        setUser(session);
+      };
+      const signIn = async (email: string, password: string) => {
+        const users: any[] = JSON.parse(localStorage.getItem('app_users') || '[]');
+        const u = users.find((u:any) => u.email === email && u.password === password);
+        if (!u) throw new Error('Invalid credentials');
+        const session = { id: u.id, email: u.email, name: u.name };
+        localStorage.setItem('app_current_user', JSON.stringify(session));
+        setUser(session);
+      };
+      const signOut = () => { localStorage.removeItem('app_current_user'); setUser(null); };
+   ✅ Pass { user, signIn, signUp, signOut } as props — do NOT define a useAuth() hook
+   ✅ No email verification needed — signUp = instant login
 
 【RULE 4 — FORBIDDEN PATTERNS】
    ❌ React Router / routing libs → use useState for page navigation
-   ❌ fetch / axios / HTTP calls → NON-SUPABASE: use static data arrays in data.ts. SUPABASE: use window.db + initialize useState with SEED data (not []).
-   ❌ localStorage / sessionStorage → use useState
+   ❌ fetch / axios / HTTP calls → NON-SUPABASE: use localStorage for persistence. SUPABASE: use window.db + initialize useState with SEED data (not []).
+   ❌ sessionStorage → data lost on tab close, does not persist. Use localStorage instead.
+   ✅ localStorage → ALLOWED and REQUIRED for local-mode apps. ALL persistent data MUST be stored in localStorage. Prefix all keys with a short app namespace (e.g., 'todo_', 'crm_') to avoid conflicts.
    ❌ require() / module.exports → CRASH: "exports is not defined"
    ❌ npm packages NOT listed below — they crash (axios, lodash, @mui, antd, zustand, etc.)
    ✅ lucide-react — PRE-LOADED. Use freely: import { Home, Settings, User } from 'lucide-react'
@@ -511,10 +551,12 @@ When the user DOES ask for authentication (login/signup/protected routes):
    ❌ new Date toISOString()     → missing dot and parens — same crash
    ❌ Date.now().toISOString()   → Date.now() returns a NUMBER, not a Date — .toISOString() crashes
    ❌ new Date.toISOString()     → missing () after Date — "not a constructor" crash
+   ❌ someDate\n  toISOString()  → toISOString on a NEW LINE without a dot — SAME CRASH
    ✅ new Date().toISOString()   → ALWAYS use this. Note: () after Date, then DOT, then toISOString().
    ✅ someDate.toISOString()     → only when someDate is already a Date object (e.g. from new Date())
    ✅ new Date(isoString)        → parse an ISO string into a Date object
    ✅ Date.now()                 → milliseconds since epoch (number) — NOT a Date, cannot call .toISOString() on it
+   ⚠️  THE DOT RULE: toISOString() MUST be on the SAME TOKEN as the date — NEVER on a new line without a dot.
    ❌ Top-level async / await outside useEffect or handlers
       ✅ CORRECT: useEffect(() => { const load = async () => { const res = await ...; }; load(); }, [])
       ❌ WRONG:   const data = await fetch(...)  ← top-level await crashes in sandbox eval
@@ -620,10 +662,32 @@ MUTATION RULES (non-negotiable):
    • ALWAYS display dbError in the JSX — user MUST see when a DB operation fails
    • Reason: optimistic updates make the UI LIE — the user sees success but DB was never updated
 
-SAFE DATA PATTERN for localStorage/static apps (DEFAULT — use this unless DATABASE section appears below):
-   // In data.ts — ALL data as static arrays, no async, no window.db
-   export const TICKETS: Ticket[] = [{ id: '1', ... }, { id: '2', ... }];
-   // In component — use the static array directly, zero crash risk
+SAFE DATA PATTERN for local-mode apps (DEFAULT — use this unless DATABASE section appears below):
+   🚨 NEVER use static in-memory arrays for app data — they reset on every page refresh and are useless.
+   ALL data MUST be stored in localStorage so it persists across reloads.
+   Use this useLocalStorage hook — define it in hooks.ts and import where needed:
+
+   // hooks.ts
+   function useLocalStorage<T>(key: string, defaultValue: T): [T, (val: T | ((prev: T) => T)) => void] {
+     const [value, setValue] = React.useState<T>(() => {
+       try { const s = localStorage.getItem(key); return s ? JSON.parse(s) : defaultValue; } catch { return defaultValue; }
+     });
+     const set = (val: T | ((prev: T) => T)) => {
+       setValue(prev => {
+         const next = typeof val === 'function' ? (val as (prev: T) => T)(prev) : val;
+         try { localStorage.setItem(key, JSON.stringify(next)); } catch {}
+         return next;
+       });
+     };
+     return [value, set];
+   }
+
+   // In component — replaces useState with persistent storage
+   const [items, setItems] = useLocalStorage<Todo[]>('app_items', []);
+   // Adding: setItems(prev => [...prev, newItem])
+   // Updating: setItems(prev => prev.map(i => i.id === id ? { ...i, ...changes } : i))
+   // Deleting: setItems(prev => prev.filter(i => i.id !== id))
+   // All changes persist across page reloads — no database required
 
 FILE UPLOADS (available in ALL modes):
    ✅ window.uploadFile(file)  — always available, returns a public URL string
@@ -656,7 +720,7 @@ The sandbox evaluates all files as a single merged script. Complex patterns brea
    ✅ In Supabase mode: ALWAYS initialize useState with inline SEED data (not []). DB fetch replaces seed only when rows exist.
    ❌ In Supabase mode: NEVER initialize state as useState([]) and expect DB to populate it — DB may be empty or RLS-blocked.
    ❌ In Supabase mode: NEVER use window.db.insert() to seed demo data at runtime — RLS blocks anonymous inserts silently.
-   ❌ NON-SUPABASE MODE ONLY: use a static data array in data.ts exported as a constant.
+   ✅ NON-SUPABASE MODE: use useLocalStorage hook (defined in hooks.ts) for ALL persistent data. NEVER use static data.ts arrays — data must survive page reloads.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🎨 PHASE 5 — UI QUALITY STANDARDS
@@ -961,7 +1025,7 @@ CRASH PREVENTION:
   □ No top-level async, no require(), no npm packages
   □ No two components with the same export name
   □ No reserved React global names used as local variables (Fragment, memo, Children, etc.)
-  □ All Date usage correct: new Date().toISOString() ✅ | new toISOString() ❌ | Date.now().toISOString() ❌ | new Date.toISOString() ❌ | new Date toISOString() ❌ | new Date() toISOString() ❌ — MUST have a DOT before toISOString: new Date().toISOString()
+  □ All Date usage correct: new Date().toISOString() ✅ | new toISOString() ❌ | Date.now().toISOString() ❌ | new Date.toISOString() ❌ | new Date toISOString() ❌ | new Date() toISOString() ❌ | someDate\n  toISOString() ❌ (newline without dot = CRASH) — RULE: toISOString() MUST always be immediately preceded by a dot on the same token: someDate.toISOString()
   □ All UUID generation uses crypto.randomUUID() — NOT gen_random_uuid() or uuid_generate_v4() (those are SQL only)
   □ No Supabase createClient import — window.db is pre-loaded, no import needed
   □ NEVER add "readiness" guards on window.db — it is ALWAYS available the moment any component runs. No isDbReady, isWorkspaceReady, supabaseReady, dbReady, isReady, or any other loading gate on window.db. Never show "Not ready — please wait" or similar messages. Call window.db.from(...) directly, always.
@@ -1555,20 +1619,13 @@ function validateGeneratedFiles(files) {
     if (/\b(?:const|let|var)\s+(?:db|supabase)\s*=/.test(content)) {
       fileErrors.push(`BANNED: 'const db = ...' or 'const supabase = ...' creates a local variable that shadows nothing useful. Use window.db directly — no local alias needed.`);
     }
-    // Auth context patterns — crash because there's no Provider wrapping the app
-    if (/\b(?:useAuth|useUser|useSupabaseUser|useSession)\s*\(\s*\)/.test(content)) {
-      fileErrors.push(`BANNED: useAuth()/useUser()/useSession() hooks are not defined in the sandbox. Define a DEMO_USER constant inside the App function and pass as props instead.`);
+    // sessionStorage — still banned (data lost on tab close, no value for persisting data)
+    if (/\bsessionStorage\s*\.(?:setItem|getItem|removeItem|clear)\s*\(/.test(content)) {
+      fileErrors.push(`BANNED: sessionStorage loses data on tab close. Use localStorage instead for all persistent state.`);
     }
-    if (/useContext\s*\(\s*[A-Z]\w*(?:Auth|User|Session)\w*Context/.test(content)) {
-      fileErrors.push(`BANNED: useContext(AuthContext) crashes because no Provider wraps the app. Use a DEMO_USER constant in App.tsx and pass as props.`);
-    }
-    // localStorage/sessionStorage — banned per RULE 4
-    if (/\b(?:localStorage|sessionStorage)\s*\.(?:setItem|getItem|removeItem|clear)\s*\(/.test(content)) {
-      fileErrors.push(`BANNED: localStorage/sessionStorage is not available in the sandbox. Use useState for all state.`);
-    }
-    // fetch() calls — banned per RULE 4 (use static data arrays in data.ts instead)
+    // fetch() calls — banned per RULE 4 (use localStorage for local-mode, window.db for Supabase)
     if (/(?<![.\w])fetch\s*\(/.test(content)) {
-      fileErrors.push(`BANNED: fetch() HTTP calls are not available in the sandbox. Use static mock data arrays in data.ts, or window.db for Supabase projects.`);
+      fileErrors.push(`BANNED: fetch() HTTP calls are not available in the sandbox. Use localStorage (via useLocalStorage hook) for local-mode apps, or window.db for Supabase projects.`);
     }
     // Direct Supabase Storage uploads — always crash with "row violates row-level security policy"
     if (/\.storage\s*\.\s*from\s*\([^)]+\)\s*\.\s*upload\s*\(/.test(content)) {
@@ -1601,6 +1658,20 @@ function validateGeneratedFiles(files) {
       if (new RegExp(`\\b(?:const|let|var|function|class)\\s+${g}\\b`).test(content)) {
         fileErrors.push(`BANNED: "${g}" is a React global injected by the sandbox — declaring a local variable/function with the same name shadows it and crashes. Rename your identifier.`);
       }
+    }
+    // Bad Date.toISOString() patterns — cause "Unexpected identifier 'toISOString'" parse error
+    // Check for ALL known bad patterns: missing dot, missing parens, space instead of dot, etc.
+    if (
+      /\bnew\s+toISOString\s*\(\)/.test(content) ||          // new toISOString()
+      /\bnew\s+Date\.toISOString\s*\(\)/.test(content) ||    // new Date.toISOString()
+      /\bDate\.now\(\)\.toISOString\(\)/.test(content) ||    // Date.now().toISOString()
+      /\bnew\s+Date\s+toISOString\s*\(\)/.test(content) ||   // new Date toISOString()
+      /\bnew\s+Date\s*\(\s*\)\s*toISOString\s*\(/.test(content) || // new Date()toISOString() or new Date() toISOString()
+      /([^\s.])[ \t]+toISOString\s*\(/.test(content) ||      // expr toISOString() — same-line missing dot
+      /([)\]])toISOString\s*\(/.test(content) ||             // )toISOString( — zero-space missing dot
+      /([)\]\w])[ \t]*\r?\n[ \t]*toISOString\s*\(/.test(content) // cross-line without dot
+    ) {
+      fileErrors.push(`CRASH: Bad Date.toISOString() call pattern. CORRECT form: new Date().toISOString() — must have () after Date AND a dot before toISOString. Bad patterns: "new toISOString()" / "new Date.toISOString()" / "Date.now().toISOString()" / "new Date toISOString()" / "new Date() toISOString()" / "someExpr toISOString()". Fix ALL occurrences to: new Date().toISOString()`);
     }
     // Top-level await outside async function — crashes in non-module eval
     if (/^(?!.*(?:async\s+function|async\s*\().*)\bawait\b/m.test(content)) {
@@ -1680,11 +1751,9 @@ function applyProgrammaticFixes(files) {
     const c7 = c.replace(bannedPkgs, '');
     if (c7 !== c) { applied.push('removed banned external package import(s)'); c = c7; }
 
-    // 8. Remove localStorage/sessionStorage usage — BANNED per RULE 4
-    // Replace direct .setItem calls with no-ops, .getItem with null
-    const c8a = c.replace(/\blocalStorage\.setItem\s*\([^)]*\)\s*;?/g, '/* localStorage removed */');
-    const c8b = c8a.replace(/\bsessionStorage\.setItem\s*\([^)]*\)\s*;?/g, '/* sessionStorage removed */');
-    if (c8b !== c) { applied.push('removed localStorage/sessionStorage usage'); c = c8b; }
+    // 8. Remove sessionStorage usage — use localStorage instead (sessionStorage loses data on tab close)
+    const c8b = c.replace(/\bsessionStorage\s*\.\s*(setItem|getItem|removeItem|clear)\s*\(/g, 'localStorage.$1(');
+    if (c8b !== c) { applied.push('replaced sessionStorage with localStorage'); c = c8b; }
 
     // 9. onAuthStateChange is now supported by the stateful sandbox auth shim — keep as-is
     const c9 = c; // no-op
@@ -1787,6 +1856,28 @@ function applyProgrammaticFixes(files) {
       .replace(/\bgen_random_uuid\s*\(\s*\)/g, '(crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2))')
       .replace(/\buuid_generate_v4\s*\(\s*\)/g, '(crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2))');
     if (c21 !== c) { applied.push('replaced gen_random_uuid()/uuid_generate_v4() with crypto.randomUUID()'); c = c21; }
+
+    // 22a. Fix bad Date.toISOString() call patterns — these produce "Unexpected identifier 'toISOString'"
+    // parse errors or runtime crashes. Must run BEFORE reaching the preview sandbox.
+    // Pattern 1: new toISOString() — "Unexpected identifier" parse error
+    let cDate = c;
+    cDate = cDate.replace(/\bnew\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
+    // Pattern 2: new Date.toISOString() — "Date is not a constructor" (missing () after Date)
+    cDate = cDate.replace(/\bnew\s+Date\.toISOString\s*\(\)/g, 'new Date().toISOString()');
+    // Pattern 3: Date.now().toISOString() — Date.now() returns a Number, not a Date
+    cDate = cDate.replace(/\bDate\.now\(\)\.toISOString\(\)/g, 'new Date().toISOString()');
+    // Pattern 4: new Date toISOString() — missing dot + parens
+    cDate = cDate.replace(/\bnew\s+Date\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
+    // Pattern 5: new Date() toISOString() — has parens but missing dot
+    cDate = cDate.replace(/\bnew\s+Date\s*\(\s*\)\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
+    // Pattern 6: Generic same-line — any expression char + spaces/tabs + toISOString( (without a dot)
+    // Catches: someDate toISOString(), result toISOString(), etc.
+    cDate = cDate.replace(/([^\s.])[ \t]+toISOString\s*\(/g, '$1.toISOString(');
+    // Pattern 7: Cross-line — expression ending in ) ] or word char + newline + toISOString without dot.
+    // Catches: someDate\n  toISOString() and result)\ntoISOString() — the most common AI miss.
+    // Uses [ \t]* (horizontal only) before/after newline to avoid crossing multiple statements.
+    cDate = cDate.replace(/([)\]\w])([ \t]*\r?\n[ \t]*)toISOString\s*\(/g, '$1$2.toISOString(');
+    if (cDate !== c) { applied.push('fixed bad toISOString() call pattern(s)'); c = cDate; }
 
     // 22. Remove SQL type cast calls — AI writes NUMERIC(10.5), VARCHAR('text'), INTEGER(3) in JS.
     // These are PostgreSQL type constructors that don't exist in JavaScript.
@@ -2009,11 +2100,16 @@ app.post('/api/build', async (req, res) => {
 
     // ── Step 2: Plan (new_app and redesign only) ────────────────────────────────
     let planContext = '';
+    // activePlan tracks the plan across the entire pipeline for use in Step 5 (verification).
+    // For feature_add/bug_fix, preMadePlan is the plan approved via /api/plan-only.
+    // For new_app/redesign, it's updated below once the plan is known.
+    let activePlan = preMadePlan;
     if (requestType === 'new_app' || requestType === 'redesign') {
       let plan;
       if (preMadePlan) {
         // Plan was already approved by the user — skip the planner entirely
         plan = preMadePlan;
+        activePlan = plan;
         send({ stage: 'plan', plan });
       } else {
         send({ stage: 'planning' });
@@ -2028,6 +2124,7 @@ app.post('/api/build', async (req, res) => {
           let planText = planMsg.content[0]?.type === 'text' ? planMsg.content[0].text : '{}';
           planText = planText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
           plan = JSON.parse(planText);
+          activePlan = plan;
           plan.requestType = requestType;
           if (plan.description) {
             plan.description = plan.description
@@ -2102,6 +2199,21 @@ app.post('/api/build', async (req, res) => {
       } // end if (plan)
     } // end if (requestType === 'new_app' || 'redesign')
 
+    // For feature_add/bug_fix with an approved plan, inject the specific change instructions
+    // so the generator knows exactly what to modify — not just the raw user message.
+    if ((requestType === 'feature_add' || requestType === 'bug_fix') && activePlan) {
+      const scope = (activePlan.firstBuildScope || []);
+      planContext = [
+        '\n\n[APPROVED CHANGE PLAN — FOLLOW EXACTLY]',
+        `Task: ${activePlan.description || 'Apply the requested change'}`,
+        scope.length > 0
+          ? `Specific changes to make:\n${scope.map(f => `   • ${f}`).join('\n')}`
+          : '',
+        'Output ONLY the files you actually changed. Do NOT re-output context files.',
+        '[/APPROVED CHANGE PLAN]',
+      ].filter(Boolean).join('\n');
+    }
+
     // ── Step 3: Generate ──────────────────────────────────────────────────────
     const generatorModel = pickGeneratorModel(requestType, preferredModel, isAutoMode);
     const maxTok = MAX_TOKENS_BY_TYPE[requestType] ?? 20000;
@@ -2155,28 +2267,66 @@ app.post('/api/build', async (req, res) => {
       const header =
         `[CURRENT APP — ${fileCount} files for context]\n` +
         `All files: ${existingFilesList}\n\n` +
-        `🛑 MODIFICATION RULES — read carefully:\n` +
+        `🚨 SURGICAL MODIFICATION RULES — violations break the user's app:\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `• The files below use <<<FILE: name>>> delimiters — they are READ-ONLY CONTEXT.\n` +
-        `• When you output changed files, use the normal code block format: \`\`\`tsx filename.tsx\n` +
-        `• Output ONLY files you actually changed. A typical change = 1-2 files.\n` +
-        `• If you find yourself outputting ALL ${fileCount} files, STOP — you're rebuilding, not modifying.\n` +
-        `• Unchanged files are preserved automatically. Re-outputting them OVERWRITES the user's code.\n` +
+        `• The files below use <<<FILE: name>>> delimiters — they are READ-ONLY CONTEXT, not your output.\n` +
+        `• ONLY output files using code block format: \`\`\`tsx filename.tsx\n` +
+        `• Output ONLY the specific file(s) you changed. For a simple feature: 1-2 files max.\n` +
+        `• If you output a file you didn't change, it OVERWRITES the user's working code with your version.\n` +
+        `• Ask yourself: "Did I change this file?" If the answer is No, DO NOT output it.\n` +
+        `• NEVER output files just because you read them for context — reading ≠ outputting.\n` +
+        `• ❌ If you output ALL ${fileCount} files → you're rebuilding the entire app, NOT making a targeted edit.\n` +
+        `• ❌ Re-outputting unchanged files destroys the user's customizations and triggers unwanted changes.\n` +
+        `\n` +
+        `🔴 COMPLETENESS REQUIREMENT — when you do output a file, it MUST be complete:\n` +
+        `• NEVER shorten or truncate a file you re-output. If the original has 200 lines, your output must have ≥200 lines.\n` +
+        `• NEVER remove existing functions, useEffect hooks, handlers, or state that aren't part of your change.\n` +
+        `• NEVER remove existing imports, exports, or components — removing them crashes the app.\n` +
+        `• If you can only change 5 lines in a 200-line file, output all 200 lines with those 5 changed.\n` +
+        `• A file with missing functions is WORSE than not outputting it at all.\n` +
         (truncationNote ? `\n${truncationNote}\n` : '') +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
 
       filesContext = `\n\n${header}\n\n${fileEntries.join('\n\n')}\n[/CURRENT APP]`;
     }
 
+    // ── Trim conversation history to avoid context-limit errors ──────────────
+    // Each AI response contains full code blocks (20–50K tokens each). After many
+    // exchanges the accumulated history exceeds the model's 1M-token context limit.
+    // Strategy: keep the first 2 messages (original project context) + the last 12
+    // messages (6 recent exchanges) + always the current message, subject to a hard
+    // character budget. This preserves enough context for any feature/bug request.
+    const MAX_HISTORY_CHARS = 500_000; // ~150K tokens — leaves room for sys prompt + files + output
+    let trimmedMessages = messages;
+    if (messages.length > 14) {
+      const head = messages.slice(0, 2);           // original context
+      const tail = messages.slice(-12);            // recent exchanges (incl. current)
+      // Deduplicate in case head and tail overlap
+      const combined = [...head];
+      for (const m of tail) {
+        if (!combined.includes(m)) combined.push(m);
+      }
+      trimmedMessages = combined;
+    }
+    // Hard char budget — drop oldest non-current messages until we're under limit
+    let historyChars = trimmedMessages.reduce((s, m) => s + (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content).length), 0);
+    while (historyChars > MAX_HISTORY_CHARS && trimmedMessages.length > 3) {
+      const removed = trimmedMessages.splice(1, 1)[0]; // remove 2nd message (keep first + last)
+      historyChars -= (typeof removed.content === 'string' ? removed.content.length : JSON.stringify(removed.content).length);
+    }
+    if (trimmedMessages.length < messages.length) {
+      console.log(`[build] trimmed history: ${messages.length} → ${trimmedMessages.length} messages (${Math.round(historyChars/1000)}K chars)`);
+    }
+
     // Inject plan context + file context into the last user message
     const lastExtra = planContext + filesContext;
     const augmented = lastExtra
-      ? messages.map((m, i) =>
-          i === messages.length - 1
+      ? trimmedMessages.map((m, i) =>
+          i === trimmedMessages.length - 1
             ? { ...m, content: m.content + lastExtra }
             : m
         )
-      : messages;
+      : trimmedMessages;
 
     // Accumulate generated text so we can validate it after streaming
     let accumulatedText = '';
@@ -2342,6 +2492,103 @@ app.post('/api/build', async (req, res) => {
       if (finalCheck.length === 0) validationClean = true;
     }
     send({ stage: 'validation_clean' });
+
+    // ── Step 5: Self-verification ─────────────────────────────────────────────
+    // After generation, use Haiku to verify that the requested scope items were
+    // actually implemented. If any are missing, Sonnet corrects them before Done.
+    const verificationItems = activePlan?.firstBuildScope;
+    if (verificationItems?.length > 0 && Object.keys(latestFiles).length > 0) {
+      send({ stage: 'verifying' });
+      try {
+        // Build a compact code snapshot for Haiku to review (budget: 25K chars)
+        const CODE_BUDGET = 25000;
+        let snapshot = '';
+        const snapshotEntries = Object.entries(latestFiles)
+          .filter(([f]) => f.endsWith('.tsx') || f.endsWith('.ts'))
+          .sort(([a], [b]) => (a === 'App.tsx' ? -1 : b === 'App.tsx' ? 1 : 0));
+        for (const [name, content] of snapshotEntries) {
+          const preview = content.length > 4000 ? content.slice(0, 4000) + '\n// ...(truncated)' : content;
+          const entry = `### ${name}\n${preview}\n\n`;
+          if (snapshot.length + entry.length > CODE_BUDGET) break;
+          snapshot += entry;
+        }
+
+        const verifyPrompt =
+          `You are verifying that a code change correctly implemented all requested items.\n\n` +
+          `Requested items:\n` +
+          verificationItems.map((item, i) => `${i + 1}. ${item}`).join('\n') +
+          `\n\nGenerated/modified code:\n${snapshot}\n` +
+          `For each item, check for clear evidence it is implemented in the code.\n` +
+          `Be generous — partial or reasonable implementation counts as YES.\n` +
+          `Output ONLY valid JSON, no other text:\n` +
+          `{"items":[{"item":"...","implemented":true,"note":"brief evidence or reason"}]}`;
+
+        const verifyMsg = await anthropicClient.messages.create({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 700,
+          messages: [{ role: 'user', content: verifyPrompt }],
+        });
+
+        let verifyText = verifyMsg.content[0]?.type === 'text' ? verifyMsg.content[0].text : '{}';
+        const verifyJsonMatch = verifyText.match(/\{[\s\S]*\}/);
+        if (verifyJsonMatch) verifyText = verifyJsonMatch[0];
+        const verifyResult = JSON.parse(verifyText);
+
+        const missingItems = (verifyResult.items || []).filter(i => !i.implemented);
+
+        if (missingItems.length > 0) {
+          console.log(`[build] verification: ${missingItems.length} item(s) missing — fixing`);
+          send({ stage: 'verification_fixing', missing: missingItems.map(i => i.item) });
+
+          // Build full file context for the correction
+          const vfFileBlocks = Object.entries(latestFiles)
+            .sort(([a], [b]) => (a === 'App.tsx' ? -1 : b === 'App.tsx' ? 1 : 0))
+            .map(([name, content]) => {
+              const lang = name.endsWith('.tsx') ? 'tsx' : name.endsWith('.sql') ? 'sql' : 'ts';
+              return `\`\`\`${lang} ${name}\n${content}\n\`\`\``;
+            })
+            .join('\n\n');
+
+          const missingDesc = missingItems
+            .map(i => `• ${i.item}${i.note ? ` — ${i.note}` : ''}`)
+            .join('\n');
+          const vfPrompt =
+            `These requested features were NOT found in the generated code:\n\n${missingDesc}\n\n` +
+            `Current code:\n${vfFileBlocks}\n\n` +
+            `Implement ONLY the missing features listed above. Output ONLY the files you changed.`;
+
+          let vfText = '';
+          const vfStream = anthropicClient.messages.stream({
+            model: 'claude-sonnet-4-6',
+            max_tokens: 14000,
+            system: SYSTEM_PROMPT,
+            messages: [{ role: 'user', content: vfPrompt }],
+          });
+          vfStream.on('text', (t) => { send({ text: t }); vfText += t; });
+          await vfStream.finalMessage();
+
+          const vfParsed = parseFilesFromText(vfText);
+          if (Object.keys(vfParsed).length > 0) {
+            const { files: vfFixed, fixes: vfFixes } = applyProgrammaticFixes(vfParsed);
+            for (const [file, content] of Object.entries(vfFixed)) {
+              latestFiles[file] = content;
+            }
+            for (const { file } of vfFixes) {
+              const fixed = vfFixed[file];
+              if (!fixed) continue;
+              const lang = file.endsWith('.tsx') ? 'tsx' : file.endsWith('.sql') ? 'sql' : 'ts';
+              send({ text: `\n\`\`\`${lang} ${file}\n${fixed}\n\`\`\`` });
+            }
+          }
+          send({ stage: 'verification_fixed' });
+        } else {
+          console.log('[build] verification: all scope items implemented ✓');
+        }
+      } catch (verifyErr) {
+        console.error('[build] verification failed (non-blocking):', verifyErr.message);
+      }
+      send({ stage: 'verification_clean' });
+    }
 
   } catch (error) {
     console.error('[build] Pipeline error:', error);
@@ -2574,9 +2821,15 @@ app.post('/api/chat', async (req, res) => {
 
     } else {
       // ── Anthropic Claude (uses whatever model was requested, default: Opus) ──
+      // Tiered max_tokens for repair mode — repairs fix 1-2 files so they need far fewer tokens.
+      // Full builds keep 32k to handle large initial generations.
+      const repairMaxTokens = model.includes('haiku') ? 6000
+        : model.includes('sonnet') ? 12000
+        : 16000; // opus
+      const resolvedMaxTokens = isRepairMode ? repairMaxTokens : 32000;
       const stream = anthropicClient.messages.stream({
         model: model,
-        max_tokens: 32000,
+        max_tokens: resolvedMaxTokens,
         system: chatSystemPrompt,
         messages: messages.map((m) => ({ role: m.role, content: toAnthropicContent(m) })),
       });

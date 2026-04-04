@@ -67,6 +67,10 @@ interface AppStore {
   hasApiKey: boolean;
   setHasApiKey: (v: boolean) => void;
 
+  // Credit refresh signal — increment to tell Header to re-fetch the balance
+  creditRefreshSignal: number;
+  triggerCreditRefresh: () => void;
+
   // Model selection
   selectedModel: ModelId;
   setSelectedModel: (model: ModelId) => void;
@@ -76,7 +80,7 @@ interface AppStore {
   // Prompt queue
   promptQueue: QueueItem[];
   queuePaused: boolean;
-  addToQueue: (prompt: string) => void;
+  addToQueue: (prompt: string, attachments?: import('../types').ChatAttachment[]) => void;
   addToQueueFront: (item: QueueItem) => void;
   removeFromQueue: (id: string) => void;
   updateQueueItem: (id: string, prompt: string) => void;
@@ -233,6 +237,9 @@ export const useStore = create<AppStore>()(
       hasApiKey: true,
       setHasApiKey: (v) => set({ hasApiKey: v }),
 
+      creditRefreshSignal: 0,
+      triggerCreditRefresh: () => set((s) => ({ creditRefreshSignal: s.creditRefreshSignal + 1 })),
+
       selectedModel: 'gpt-4o',
       setSelectedModel: (model) => set({ selectedModel: model }),
       isAutoMode: true,
@@ -240,11 +247,11 @@ export const useStore = create<AppStore>()(
 
       promptQueue: [],
       queuePaused: false,
-      addToQueue: (prompt) =>
+      addToQueue: (prompt, attachments) =>
         set((state) => ({
           promptQueue: [
             ...state.promptQueue,
-            { id: `q_${Date.now()}_${Math.random().toString(36).slice(2)}`, prompt },
+            { id: `q_${Date.now()}_${Math.random().toString(36).slice(2)}`, prompt, ...(attachments?.length ? { attachments } : {}) },
           ],
         })),
       addToQueueFront: (item) =>

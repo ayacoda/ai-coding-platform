@@ -19,12 +19,13 @@ function transformCode(code: string): string {
   // "new Date toISOString()" — space instead of dot/parens. This is the most common AI mistake:
   // it produces SyntaxError "Unexpected identifier 'toISOString'" which crashes the whole eval.
   code = code.replace(/\bnew\s+Date\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
-  // "new Date() toISOString()" — instantiation with parens but missing dot before method.
-  code = code.replace(/\bnew\s+Date\s*\(\s*\)\s+toISOString\s*\(\)/g, 'new Date().toISOString()');
+  // "new Date() toISOString()" — missing dot (zero or more whitespace between them).
+  // \s* catches "new Date() toISOString()" AND "new Date()toISOString()" (no space).
+  code = code.replace(/\bnew\s+Date\s*\(\s*\)\s*toISOString\s*\(/g, 'new Date().toISOString(');
   // Generic: any expression ending in a non-dot, non-whitespace char + space(s) + toISOString(
-  // Extends beyond \w|\) to also cover ] " ' ` and other chars that can end an expression.
-  // This catches: dates[0] toISOString()  "dateStr" toISOString()  etc.
   code = code.replace(/([^\s.])[ \t]+toISOString\s*\(/g, '$1.toISOString(');
+  // Zero-space variant: ) or ] directly followed by toISOString — safe since ) ] can't be in an identifier.
+  code = code.replace(/([)\]])toISOString\s*\(/g, '$1.toISOString(');
   // PostgreSQL UUID functions → crypto.randomUUID()
   code = code.replace(/\bgen_random_uuid\s*\(\)/g, 'crypto.randomUUID()');
   code = code.replace(/\buuid_generate_v4\s*\(\)/g, 'crypto.randomUUID()');
